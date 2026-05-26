@@ -283,7 +283,7 @@ impl Session {
 
     /// List of backend names the loaded CrispASR library was compiled with.
     pub fn available_backends() -> Vec<String> {
-        let mut buf = [0i8; 256];
+        let mut buf = [0i8; 1024];
         let n = unsafe {
             crispasr_sys::crispasr_session_available_backends(buf.as_mut_ptr(), buf.len() as i32)
         };
@@ -590,6 +590,31 @@ impl Session {
             -3 => Err("backend has no preset speakers; use set_voice() instead".to_string()),
             _ => Err(format!("set_speaker_name failed (rc={})", rc)),
         }
+    }
+
+    /// Set natural-language voice description for instruct-tuned TTS (Qwen3-TTS VoiceDesign).
+    pub fn set_instruct(&self, instruct: &str) -> Result<(), String> {
+        let cinstruct = CString::new(instruct).map_err(|e| e.to_string())?;
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_instruct(self.handle, cinstruct.as_ptr())
+        };
+        match rc {
+            0 => Ok(()),
+            -3 => Err("backend has no instruct voice design contract".to_string()),
+            _ => Err(format!("set_instruct failed (rc={})", rc)),
+        }
+    }
+
+    /// Check if the loaded model supports custom voices (baked speaker names).
+    pub fn is_custom_voice(&self) -> bool {
+        let rc = unsafe { crispasr_sys::crispasr_session_is_custom_voice(self.handle) };
+        rc != 0
+    }
+
+    /// Check if the loaded model supports voice design (instruct prompts).
+    pub fn is_voice_design(&self) -> bool {
+        let rc = unsafe { crispasr_sys::crispasr_session_is_voice_design(self.handle) };
+        rc != 0
     }
 
     /// Return the list of preset speaker names for the active backend.

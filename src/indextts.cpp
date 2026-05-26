@@ -2239,6 +2239,7 @@ extern "C" struct indextts_context_params indextts_context_default_params(void) 
 
 extern "C" struct indextts_context* indextts_init_from_file(const char* path_model,
                                                             struct indextts_context_params params) {
+    fprintf(stderr, "indextts: entering indextts_init_from_file for path '%s'\n", path_model);
     auto* c = new indextts_context();
     c->params = params;
     c->n_threads = params.n_threads > 0 ? params.n_threads : 4;
@@ -2249,6 +2250,7 @@ extern "C" struct indextts_context* indextts_init_from_file(const char* path_mod
     {
         gguf_context* g = core_gguf::open_metadata(path_model);
         if (!g) {
+            fprintf(stderr, "indextts: failed to open metadata from '%s'\n", path_model);
             delete c;
             return nullptr;
         }
@@ -2283,6 +2285,7 @@ extern "C" struct indextts_context* indextts_init_from_file(const char* path_mod
     {
         core_gguf::WeightLoad wl;
         if (!core_gguf::load_weights(path_model, c->backend, "indextts", wl)) {
+            fprintf(stderr, "indextts: failed to load weights from '%s'\n", path_model);
             delete c;
             return nullptr;
         }
@@ -2307,9 +2310,15 @@ extern "C" struct indextts_context* indextts_init_from_file(const char* path_mod
             backends[n_be++] = c->backend_cpu;
         }
         c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        if (!c->sched) {
+            fprintf(stderr, "indextts: failed to create compute scheduler\n");
+            delete c;
+            return nullptr;
+        }
         c->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
+    fprintf(stderr, "indextts: successfully loaded indextts model!\n");
     return c;
 }
 

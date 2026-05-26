@@ -35,6 +35,8 @@
 #include "core/beam_decode.h"        // Shared autoregressive beam-search decode helper
 #include "core/greedy_decode.h"      // Shared autoregressive greedy decode helper
 #include "grammar-parser.h"          // GBNF parser for grammar-constrained sampling
+#include "core/audio_resample.h"
+#include "core/wav_reader.h"
 // Non-Whisper backend headers. Each of these lives in `src/` and is built as
 // its own shared library — we link them into libwhisper privately so Dart
 // only has to open one library to reach every backend. Any missing header
@@ -87,6 +89,10 @@
 #include "qwen3_tts.h"
 #define CA_HAVE_QWEN3_TTS 1
 #endif
+#include "voxcpm2_tts.h"
+#define CA_HAVE_VOXCPM2 1
+#include "indextts.h"
+#define CA_HAVE_INDEXTTS 1
 #if __has_include("kokoro.h")
 #include "kokoro.h"
 #define CA_HAVE_KOKORO 1
@@ -993,7 +999,7 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "wav2vec2";
     else if (strcmp(arch, "vibevoice-asr") == 0 || strcmp(arch, "vibevoice") == 0 || strcmp(arch, "vibevoice-tts") == 0)
         backend = "vibevoice";
-    else if (strcmp(arch, "qwen3-tts") == 0 || strcmp(arch, "qwen3_tts") == 0)
+    else if (strcmp(arch, "qwen3-tts") == 0 || strcmp(arch, "qwen3_tts") == 0 || strcmp(arch, "qwen3tts") == 0)
         backend = "qwen3-tts";
     else if (strcmp(arch, "orpheus") == 0)
         backend = "orpheus";
@@ -1002,6 +1008,12 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "chatterbox";
     else if (strcmp(arch, "m2m100") == 0)
         backend = "m2m100";
+    else if (strcmp(arch, "kokoro") == 0 || strcmp(arch, "kokoro-tts") == 0)
+        backend = "kokoro";
+    else if (strcmp(arch, "voxcpm2") == 0 || strcmp(arch, "voxcpm2-tts") == 0)
+        backend = "voxcpm2";
+    else if (strcmp(arch, "indextts") == 0 || strcmp(arch, "indextts-tts") == 0 || strcmp(arch, "indextts.gpt") == 0)
+        backend = "indextts";
 
     std::strncpy(out_name, backend, out_cap - 1);
     out_name[out_cap - 1] = '\0';
@@ -1238,6 +1250,17 @@ struct crispasr_session {
 #ifdef CA_HAVE_MIMO_ASR
     mimo_asr_context* mimo_asr_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_VOXCPM2
+    voxcpm2_context* voxcpm2_ctx = nullptr;
+    bool voxcpm2_voice_loaded = false;
+#endif
+#ifdef CA_HAVE_INDEXTTS
+    indextts_context* indextts_ctx = nullptr;
+    bool indextts_vocoder_loaded = false;
+    bool indextts_voice_loaded = false;
+#endif
+    std::string voice_path;
+    std::vector<float> voice_pcm;
 };
 
 struct crispasr_session_seg {
@@ -1805,6 +1828,37 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_VOXCPM2
+    if (s->backend == "voxcpm2" || s->backend == "voxcpm2-tts") {
+        s->backend = "voxcpm2";
+        voxcpm2_context_params p = voxcpm2_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->voxcpm2_ctx = voxcpm2_init_from_file(model_path, p);
+        if (!s->voxcpm2_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_INDEXTTS
+    if (s->backend == "indextts" || s->backend == "indextts-tts" || s->backend == "indextts.gpt") {
+        s->backend = "indextts";
+        indextts_context_params p = indextts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->indextts_ctx = indextts_init_from_file(model_path, p);
+        if (!s->indextts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 
     // Unknown or unsupported-in-this-build backend.
     delete s;
@@ -2013,6 +2067,12 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_MIMO_ASR
     list += ",mimo-asr";
+#endif
+#ifdef CA_HAVE_VOXCPM2
+    list += ",voxcpm2,voxcpm2-tts";
+#endif
+#ifdef CA_HAVE_INDEXTTS
+    list += ",indextts,indextts-tts";
 #endif
     std::strncpy(out_csv, list.c_str(), out_cap - 1);
     out_csv[out_cap - 1] = '\0';
@@ -4133,6 +4193,14 @@ CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* p
     if (s->chatterbox_ctx)
         return chatterbox_set_s3gen_path(s->chatterbox_ctx, path);
 #endif
+#ifdef CA_HAVE_INDEXTTS
+    if (s->indextts_ctx) {
+        int rc = indextts_set_vocoder_path(s->indextts_ctx, path);
+        if (rc == 0)
+            s->indextts_vocoder_loaded = true;
+        return rc;
+    }
+#endif
     return 0; // not applicable
 }
 
@@ -4147,6 +4215,44 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return (tail[0] == '.' && (tail[1] == 'w' || tail[1] == 'W') && (tail[2] == 'a' || tail[2] == 'A') &&
                 (tail[3] == 'v' || tail[3] == 'V'));
     };
+#ifdef CA_HAVE_VOXCPM2
+    if (s->voxcpm2_ctx) {
+        if (ends_with_wav(path)) {
+            int sr = 0;
+            std::vector<float> pcm;
+            if (crispasr::core::read_wav_mono_pcm16(path, pcm, sr)) {
+                if (sr != 16000 && sr > 0) {
+                    pcm = core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, 16000);
+                }
+                s->voice_path = path;
+                s->voice_pcm = std::move(pcm);
+                s->voxcpm2_voice_loaded = true;
+                return 0;
+            }
+            return -1;
+        }
+        return -3;
+    }
+#endif
+#ifdef CA_HAVE_INDEXTTS
+    if (s->indextts_ctx) {
+        if (ends_with_wav(path)) {
+            int sr = 0;
+            std::vector<float> pcm;
+            if (crispasr::core::read_wav_mono_pcm16(path, pcm, sr)) {
+                if (sr != 24000 && sr > 0) {
+                    pcm = core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, 24000);
+                }
+                s->voice_path = path;
+                s->voice_pcm = std::move(pcm);
+                s->indextts_voice_loaded = true;
+                return 0;
+            }
+            return -1;
+        }
+        return -3;
+    }
+#endif
 #ifdef CA_HAVE_VIBEVOICE
     if (s->vibevoice_ctx) {
         if (ends_with_wav(path)) {
@@ -4302,6 +4408,30 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         *out_n_samples = 0;
     if (!s || !text)
         return nullptr;
+#ifdef CA_HAVE_VOXCPM2
+    if (s->voxcpm2_ctx) {
+        if (s->voxcpm2_voice_loaded && !s->voice_pcm.empty()) {
+            return voxcpm2_synthesize_clone(s->voxcpm2_ctx, text, s->voice_pcm.data(), (int)s->voice_pcm.size(), out_n_samples);
+        } else {
+            return voxcpm2_synthesize(s->voxcpm2_ctx, text, out_n_samples);
+        }
+    }
+#endif
+#ifdef CA_HAVE_INDEXTTS
+    if (s->indextts_ctx) {
+        if (!s->indextts_vocoder_loaded) {
+            fprintf(stderr, "indextts: vocoder not loaded. Set BigVGAN path first.\n");
+            return nullptr;
+        }
+        const float* ref_pcm = nullptr;
+        int ref_n_samples = 0;
+        if (s->indextts_voice_loaded && !s->voice_pcm.empty()) {
+            ref_pcm = s->voice_pcm.data();
+            ref_n_samples = (int)s->voice_pcm.size();
+        }
+        return indextts_synthesize(s->indextts_ctx, text, ref_pcm, ref_n_samples, out_n_samples);
+    }
+#endif
 #ifdef CA_HAVE_VIBEVOICE
     if (s->vibevoice_ctx) {
         return vibevoice_synthesize(s->vibevoice_ctx, text, out_n_samples);
@@ -4487,6 +4617,14 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->wav2vec2_ctx) {
         delete s->wav2vec2_ctx;
     }
+#endif
+#ifdef CA_HAVE_VOXCPM2
+    if (s->voxcpm2_ctx)
+        voxcpm2_free(s->voxcpm2_ctx);
+#endif
+#ifdef CA_HAVE_INDEXTTS
+    if (s->indextts_ctx)
+        indextts_free(s->indextts_ctx);
 #endif
 #ifdef CA_HAVE_VIBEVOICE
     if (s->vibevoice_ctx)

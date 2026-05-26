@@ -1,4 +1,5 @@
 // Build (or locate) `libcrispasr` for the FFI shim.
+// Trigger rebuild: 2026-05-24
 //
 // Decision tree (first match wins):
 //

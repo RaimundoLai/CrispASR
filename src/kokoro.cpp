@@ -2952,6 +2952,18 @@ bool phonemize_espeak_lib(const std::string& lang, const std::string& text, std:
 bool phonemize_popen(const std::string& lang, const std::string& text, std::string& out) {
     std::string cmd = "espeak-ng -q --ipa=3 -v ";
     cmd += lang;
+#ifdef _WIN32
+    cmd += " \"";
+    for (char c : text) {
+        if (c == '"')
+            cmd += "\\\"";
+        else if (c == '\n' || c == '\r')
+            cmd += ' ';
+        else
+            cmd += c;
+    }
+    cmd += "\"";
+#else
     cmd += " '";
     for (char c : text) {
         if (c == '\'')
@@ -2960,6 +2972,7 @@ bool phonemize_popen(const std::string& lang, const std::string& text, std::stri
             cmd += c;
     }
     cmd += "'";
+#endif
 #ifdef _WIN32
 #define CRISPASR_POPEN _popen
 #define CRISPASR_PCLOSE _pclose
