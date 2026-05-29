@@ -65,7 +65,12 @@ static std::vector<float> build_filter(int L, int M, int num_zeros, float kaiser
 }
 
 static int gcd(int a, int b) {
-    return std::gcd(a, b);
+    while (b != 0) {
+        int t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
 }
 
 } // namespace

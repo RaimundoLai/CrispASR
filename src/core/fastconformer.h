@@ -228,7 +228,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     ggml_tensor* inpL = cur;
 
     // ---- FFN1 (macaron half) ----
-    ggml_tensor* x = ggml_norm_affine(ctx0, cur, e.norm_ff1_w, e.norm_ff1_b, eps);
+    ggml_tensor* x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_ff1_w), e.norm_ff1_b);
     x = mm_bias(e.ff1_l1_w, x, e.ff1_l1_b);
     x = ggml_silu(ctx0, x);
     x = mm_bias(e.ff1_l2_w, x, e.ff1_l2_b);
@@ -237,7 +237,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     ggml_tensor* inpAttn = cur;
 
     // ---- Self-Attention (rel_pos with untied biases) ----
-    x = ggml_norm_affine(ctx0, cur, e.norm_attn_w, e.norm_attn_b, eps);
+    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_attn_w), e.norm_attn_b);
 
     ggml_tensor* Q = mm_bias(e.attn_q_w, x, e.attn_q_b);
     ggml_tensor* K_ = mm_bias(e.attn_k_w, x, e.attn_k_b);
@@ -281,13 +281,20 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
 
     // ---- Conformer convolution module ----
     ggml_tensor* inpConv = cur;
-    x = ggml_norm_affine(ctx0, cur, e.norm_conv_w, e.norm_conv_b, eps);
+    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_conv_w), e.norm_conv_b);
 
     // pw1: (d → 2d), then sigmoid GLU — fused into one op, avoids strided-view
     // CUDA fallback that plagued the manual sigmoid path (see issue #81 PR #05).
     ggml_tensor* pw1_w = ggml_reshape_2d(ctx0, e.conv_pw1_w, d, 2 * d);
     ggml_tensor* cnv = mm_bias(pw1_w, x, e.conv_pw1_b);
-    cnv = ggml_siglu_swapped(ctx0, cnv);
+    {
+        int64_t d_conv = cnv->ne[0] / 2;
+        int64_t T_conv = cnv->ne[1];
+        size_t nb1_conv = cnv->nb[1];
+        ggml_tensor* cnv1 = ggml_view_2d(ctx0, cnv, d_conv, T_conv, nb1_conv, 0);
+        ggml_tensor* cnv2 = ggml_view_2d(ctx0, cnv, d_conv, T_conv, nb1_conv, d_conv * ggml_element_size(cnv));
+        cnv = ggml_mul(ctx0, ggml_sigmoid(ctx0, cnv2), cnv1);
+    }
 
     // dw conv (kernel K, padding K/2). BN was folded into conv_dw_w/b at load.
     ggml_tensor* dw_w_f32 = ggml_cast(ctx0, e.conv_dw_w, GGML_TYPE_F32);
@@ -308,14 +315,14 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
 
     // ---- FFN2 (macaron half) ----
     ggml_tensor* inpFF2 = cur;
-    x = ggml_norm_affine(ctx0, cur, e.norm_ff2_w, e.norm_ff2_b, eps);
+    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_ff2_w), e.norm_ff2_b);
     x = mm_bias(e.ff2_l1_w, x, e.ff2_l1_b);
     x = ggml_silu(ctx0, x);
     x = mm_bias(e.ff2_l2_w, x, e.ff2_l2_b);
     cur = ggml_add(ctx0, inpFF2, ggml_scale(ctx0, x, 0.5f));
 
     // ---- Block final LN ----
-    cur = ggml_norm_affine(ctx0, cur, e.norm_out_w, e.norm_out_b, eps);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_out_w), e.norm_out_b);
 
     return cur;
 }

@@ -516,6 +516,18 @@ static ggml_tensor* aa_snake_beta_native(ggml_context* ctx, ggml_tensor* x, ggml
     return ggml_reshape_2d(ctx, down3, T, C);
 }
 
+static ggml_tensor* ggml_aa_snake_beta(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    ggml_tensor* log_alpha,
+    ggml_tensor* log_beta,
+    ggml_tensor* us_filter,
+    ggml_tensor* ds_filter) {
+    (void)ctx; (void)x; (void)log_alpha; (void)log_beta; (void)us_filter; (void)ds_filter;
+    fprintf(stderr, "ggml_aa_snake_beta: error: custom ggml operator not supported in this ggml version\n");
+    return nullptr;
+}
+
 // Dispatch by env: INDEXTTS_AA_BACKEND=native picks the ggml-native path;
 // INDEXTTS_AA_BACKEND=op (or =metal) picks the new fused `ggml_aa_snake_beta`
 // op (Step C-2); anything else (or unset) stays on the proven CPU custom-op
