@@ -387,11 +387,11 @@ static ggml_cgraph* sensevoice_build_graph(sensevoice_context* ctx, int T_lfr, i
         cur = maybe_snap(ctx0, gf, cur, nm);
 
         if (i == n_base - 1) {
-            cur = ggml_norm_affine(ctx0, cur, ctx->model.enc.after_norm_w, ctx->model.enc.after_norm_b, hp.enc_ln_eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, hp.enc_ln_eps), ctx->model.enc.after_norm_w), ctx->model.enc.after_norm_b);
             cur = maybe_snap(ctx0, gf, cur, "encoder_main_out");
         }
     }
-    cur = ggml_norm_affine(ctx0, cur, ctx->model.enc.tp_norm_w, ctx->model.enc.tp_norm_b, hp.enc_ln_eps);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, hp.enc_ln_eps), ctx->model.enc.tp_norm_w), ctx->model.enc.tp_norm_b);
     cur = maybe_snap(ctx0, gf, cur, "encoder_output");
 
     // CTC head: logits = ctc_w @ enc_out + ctc_b. Result (vocab, T_total).

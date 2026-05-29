@@ -112,7 +112,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, int
 
     // ---- norm1 + fused QKV ----
     ggml_tensor* residual = cur;
-    ggml_tensor* x = ggml_norm_affine(ctx0, cur, w.norm1_w, w.norm1_b, eps);
+    ggml_tensor* x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), w.norm1_w), w.norm1_b);
     ggml_tensor* qkv = mm_bias(w.attn_qkv_w, x, w.attn_qkv_b); // (3*n_feat, T)
 
     // Strided views into qkv — the row stride is `3*n_feat` floats so each
@@ -179,7 +179,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, int
 
     // ---- FFN branch (always with residual) ----
     ggml_tensor* res2 = cur;
-    ggml_tensor* y = ggml_norm_affine(ctx0, cur, w.norm2_w, w.norm2_b, eps);
+    ggml_tensor* y = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), w.norm2_w), w.norm2_b);
     y = mm_bias(w.ffn_l1_w, y, w.ffn_l1_b);
     y = ggml_relu(ctx0, y);
     y = mm_bias(w.ffn_l2_w, y, w.ffn_l2_b);

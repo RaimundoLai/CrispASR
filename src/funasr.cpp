@@ -618,12 +618,12 @@ static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr) 
         // After the last base block, apply after_norm — matches
         // SenseVoiceEncoderSmall.forward.
         if (i == n_base - 1) {
-            cur = ggml_norm_affine(ctx0, cur, ctx->model.enc.after_norm_w, ctx->model.enc.after_norm_b, hp.enc_ln_eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, hp.enc_ln_eps), ctx->model.enc.after_norm_w), ctx->model.enc.after_norm_b);
             cur = maybe_snap(ctx0, gf, cur, ctx->requested_stage, "encoder_main_out");
         }
     }
     // Final tp_norm.
-    cur = ggml_norm_affine(ctx0, cur, ctx->model.enc.tp_norm_w, ctx->model.enc.tp_norm_b, hp.enc_ln_eps);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, hp.enc_ln_eps), ctx->model.enc.tp_norm_w), ctx->model.enc.tp_norm_b);
     cur = maybe_snap(ctx0, gf, cur, ctx->requested_stage, "encoder_output");
 
     // ---- audio_adaptor prelude: linear1 + ReLU + linear2 ----
@@ -646,7 +646,7 @@ static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr) 
 
         // pre-norm self-attention
         ggml_tensor* residual = cur;
-        ggml_tensor* x = ggml_norm_affine(ctx0, cur, b.norm1_w, b.norm1_b, hp.ada_ln_eps);
+        ggml_tensor* x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, hp.ada_ln_eps), b.norm1_w), b.norm1_b);
 
         ggml_tensor* Q = mm_bias(b.q_w, x, b.q_b);
         ggml_tensor* K_ = mm_bias(b.k_w, x, b.k_b);
@@ -678,7 +678,7 @@ static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr) 
 
         // pre-norm FFN
         ggml_tensor* res2 = cur;
-        x = ggml_norm_affine(ctx0, cur, b.norm2_w, b.norm2_b, hp.ada_ln_eps);
+        x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, hp.ada_ln_eps), b.norm2_w), b.norm2_b);
         x = mm_bias(b.ffn_l1_w, x, b.ffn_l1_b);
         x = ggml_relu(ctx0, x);
         x = mm_bias(b.ffn_l2_w, x, b.ffn_l2_b);

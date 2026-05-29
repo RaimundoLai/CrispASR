@@ -423,17 +423,17 @@ static ggml_tensor* build_decoder_block(ggml_context* ctx0, ggml_tensor* cur, gg
 
     // 1. FFN: norm1 → w_1 → relu → internal LN → w_2
     ggml_tensor* residual = cur;
-    ggml_tensor* x = ggml_norm_affine(ctx0, cur, b.norm1_w, b.norm1_b, eps);
+    ggml_tensor* x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), b.norm1_w), b.norm1_b);
     x = mm_bias(ctx0, b.ffn_l1_w, x, b.ffn_l1_b); // (ffn_dim, N)
     x = ggml_relu(ctx0, x);
-    x = ggml_norm_affine(ctx0, x, b.ffn_norm_w, b.ffn_norm_b, eps); // internal LN after activation
+    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, x, eps), b.ffn_norm_w), b.ffn_norm_b); // internal LN after activation
     x = ggml_mul_mat(ctx0, b.ffn_l2_w, x);                          // no bias on w_2
     // No residual addition here — residual spans FFN + FSMN together.
 
     // 2. FSMN self-attention: norm2 → depthwise conv + internal residual → add original input
     ggml_tensor* ffn_out = x;
     {
-        ggml_tensor* normed = ggml_norm_affine(ctx0, ffn_out, b.norm2_w, b.norm2_b, eps);
+        ggml_tensor* normed = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, ffn_out, eps), b.norm2_w), b.norm2_b);
 
         const int K = (int)b.fsmn_w->ne[0]; // kernel width; ne = (K, D)
         ggml_tensor* w4 = ggml_cast(ctx0, b.fsmn_w, GGML_TYPE_F32);
@@ -450,7 +450,7 @@ static ggml_tensor* build_decoder_block(ggml_context* ctx0, ggml_tensor* cur, gg
 
     // 3. Cross-attention: norm3 → Q from decoder, K+V from encoder
     residual = cur;
-    x = ggml_norm_affine(ctx0, cur, b.norm3_w, b.norm3_b, eps);
+    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), b.norm3_w), b.norm3_b);
 
     {
         // Q = linear_q(decoder_hidden): (D, N) → (D, N)
@@ -495,10 +495,10 @@ static ggml_tensor* build_decoder_block(ggml_context* ctx0, ggml_tensor* cur, gg
 // Upstream: self_attn=None, src_attn=None, so no residual addition.
 static ggml_tensor* build_decoder_post(ggml_context* ctx0, ggml_tensor* cur, const paraformer_decoder_post& b,
                                        float eps) {
-    ggml_tensor* x = ggml_norm_affine(ctx0, cur, b.norm1_w, b.norm1_b, eps);
+    ggml_tensor* x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), b.norm1_w), b.norm1_b);
     x = mm_bias(ctx0, b.ffn_l1_w, x, b.ffn_l1_b);
     x = ggml_relu(ctx0, x);
-    x = ggml_norm_affine(ctx0, x, b.ffn_norm_w, b.ffn_norm_b, eps); // LN after activation
+    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, x, eps), b.ffn_norm_w), b.ffn_norm_b); // LN after activation
     x = ggml_mul_mat(ctx0, b.ffn_l2_w, x);
     return x; // no residual — upstream decoders3 has no self_attn so residual is never added
 }
@@ -576,7 +576,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     }
 
     // Encoder: after_norm
-    cur = ggml_norm_affine(ctx0, cur, ctx->model.enc_after_norm_w, ctx->model.enc_after_norm_b, hp.ln_eps);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, hp.ln_eps), ctx->model.enc_after_norm_w), ctx->model.enc_after_norm_b);
     // Mark the output so the allocator doesn't reuse the buffer.
     ggml_set_name(cur, "encoder_output");
     ggml_set_output(cur);
@@ -708,7 +708,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     }
 
     // after_norm → output_layer
-    cur = ggml_norm_affine(ctx0, cur, ctx->model.dec_after_norm_w, ctx->model.dec_after_norm_b, hp.ln_eps);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, hp.ln_eps), ctx->model.dec_after_norm_w), ctx->model.dec_after_norm_b);
     if (stage) {
         ggml_set_name(cur, "decoder_output");
         ggml_set_output(cur);
