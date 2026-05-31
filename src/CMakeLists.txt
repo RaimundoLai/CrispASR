@@ -275,9 +275,9 @@ else()
     target_link_libraries(crispasr-lib PUBLIC crispasr_c2pa_native)
 endif()
 
-set(CRISPASR_LIB_CXX_STANDARD cxx_std_11)
+set(CRISPASR_LIB_CXX_STANDARD cxx_std_20)
 if (GGML_CUDA AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
-    set(CRISPASR_LIB_CXX_STANDARD cxx_std_17)
+    set(CRISPASR_LIB_CXX_STANDARD cxx_std_20)
 endif()
 target_compile_features   (crispasr-lib PUBLIC ${CRISPASR_LIB_CXX_STANDARD}) # don't bump
 
@@ -979,7 +979,7 @@ endif()
 # header lives in ggml/src/ rather than ggml/include/, so we expose it
 # here as a private include path for this target only.
 target_include_directories(crispasr-core PRIVATE ../ggml/src)
-target_compile_features   (crispasr-core PUBLIC cxx_std_17)
+target_compile_features   (crispasr-core PUBLIC cxx_std_20)
 # ${CMAKE_DL_LIBS} for phonemizer.cpp's espeak_dlopen.h (dlopen/dlsym). It was
 # never listed while the file lived in kokoro because every executable happened
 # to pull -ldl in via crispasr-lib; crispasr-core is linked by targets that do

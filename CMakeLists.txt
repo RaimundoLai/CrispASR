@@ -68,7 +68,7 @@ endif()
 if (EMSCRIPTEN)
     set(BUILD_SHARED_LIBS_DEFAULT OFF)
 
-    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD 20)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
     option(CRISPASR_WASM            "crispasr: build WASM/JS target (Emscripten)"              ON)
