@@ -34,6 +34,21 @@
 #ifndef ARCH_H
 #define ARCH_H
 
+#if defined(_MSC_VER)
+#include <malloc.h>
+#define VAR_ARRAYS 1
+#define ALLOC(name, size, type) type* name = (type*)_alloca(sizeof(type) * (size))
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+#include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#else
+#define ALLOC(name, size, type) type name[size]
+#endif
+
 #include "opus_types.h"
 #include "common.h"
 

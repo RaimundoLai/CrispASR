@@ -8441,7 +8441,7 @@ float whisper_full_get_token_p(struct whisper_context* ctx, int i_segment, int i
 // Top-N alternative token candidates: bounds-check both axes (segment +
 // token + alt index) and return safe defaults — alts are an optional
 // signal so missing data isn't an error condition.
-int whisper_full_get_token_n_alts_from_state(struct whisper_state* state, int i_segment, int i_token) {
+CRISPASR_API int whisper_full_get_token_n_alts_from_state(struct whisper_state* state, int i_segment, int i_token) {
     if (!state || i_segment < 0 || i_segment >= (int)state->result_all.size()) {
         return 0;
     }
@@ -8452,11 +8452,11 @@ int whisper_full_get_token_n_alts_from_state(struct whisper_state* state, int i_
     return (int)seg.alts[i_token].size();
 }
 
-int whisper_full_get_token_n_alts(struct whisper_context* ctx, int i_segment, int i_token) {
+CRISPASR_API int whisper_full_get_token_n_alts(struct whisper_context* ctx, int i_segment, int i_token) {
     return ctx ? whisper_full_get_token_n_alts_from_state(ctx->state, i_segment, i_token) : 0;
 }
 
-whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state* state, int i_segment, int i_token,
+CRISPASR_API whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state* state, int i_segment, int i_token,
                                                        int i_alt) {
     if (!state || i_segment < 0 || i_segment >= (int)state->result_all.size()) {
         return 0;
@@ -8472,11 +8472,11 @@ whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state* sta
     return a[i_alt].id;
 }
 
-whisper_token whisper_full_get_token_alt_id(struct whisper_context* ctx, int i_segment, int i_token, int i_alt) {
+CRISPASR_API whisper_token whisper_full_get_token_alt_id(struct whisper_context* ctx, int i_segment, int i_token, int i_alt) {
     return ctx ? whisper_full_get_token_alt_id_from_state(ctx->state, i_segment, i_token, i_alt) : 0;
 }
 
-float whisper_full_get_token_alt_p_from_state(struct whisper_state* state, int i_segment, int i_token, int i_alt) {
+CRISPASR_API float whisper_full_get_token_alt_p_from_state(struct whisper_state* state, int i_segment, int i_token, int i_alt) {
     if (!state || i_segment < 0 || i_segment >= (int)state->result_all.size()) {
         return 0.0f;
     }
@@ -8491,7 +8491,7 @@ float whisper_full_get_token_alt_p_from_state(struct whisper_state* state, int i
     return a[i_alt].p;
 }
 
-float whisper_full_get_token_alt_p(struct whisper_context* ctx, int i_segment, int i_token, int i_alt) {
+CRISPASR_API float whisper_full_get_token_alt_p(struct whisper_context* ctx, int i_segment, int i_token, int i_alt) {
     return ctx ? whisper_full_get_token_alt_p_from_state(ctx->state, i_segment, i_token, i_alt) : 0.0f;
 }
 

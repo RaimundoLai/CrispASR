@@ -206,6 +206,10 @@ static void idct(float *out, const float *in) {
 }
 #endif
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 static void forward_transform(kiss_fft_cpx* out, const float* in) {
     int i;
     kiss_fft_cpx x[WINDOW_SIZE];
@@ -235,9 +239,9 @@ static void inverse_transform(float* out, const kiss_fft_cpx* in) {
     }
     rnn_fft(common.kfft, x, y, 0);
     /* output in reverse order for IFFT. */
-    out[0] = WINDOW_SIZE * y[0].r;
+    out[0] = (float)WINDOW_SIZE * y[0].r;
     for (i = 1; i < WINDOW_SIZE; i++) {
-        out[i] = WINDOW_SIZE * y[WINDOW_SIZE - i].r;
+        out[i] = (float)WINDOW_SIZE * y[WINDOW_SIZE - i].r;
     }
 }
 

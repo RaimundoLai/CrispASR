@@ -2194,9 +2194,9 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
                         if (!c.sattn_w_vs_b.empty())
                             for (int i = 0; i < d; i++)
                                 V_cur[i] += c.sattn_w_vs_b[i];
-                        if (!beams[bi].sa_k[li].unique())
+                        if (beams[bi].sa_k[li].use_count() != 1)
                             beams[bi].sa_k[li] = std::make_shared<std::vector<float>>(*beams[bi].sa_k[li]);
-                        if (!beams[bi].sa_v[li].unique())
+                        if (beams[bi].sa_v[li].use_count() != 1)
                             beams[bi].sa_v[li] = std::make_shared<std::vector<float>>(*beams[bi].sa_v[li]);
                         auto& sa_k_hist = *beams[bi].sa_k[li];
                         auto& sa_v_hist = *beams[bi].sa_v[li];

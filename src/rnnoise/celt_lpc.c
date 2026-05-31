@@ -91,7 +91,7 @@ int rnn_autocorr(const opus_val16* x, /*  in: [0...n-1] samples x   */
     int fastN = n - lag;
     int shift;
     const opus_val16* xptr;
-    opus_val16 xx[n];
+    ALLOC(xx, n, opus_val16);
     celt_assert(n > 0);
     celt_assert(overlap >= 0);
     if (overlap == 0) {
