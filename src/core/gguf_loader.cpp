@@ -338,18 +338,38 @@ static const ggml_backend_buffer_i mmap_buffer_iface = {
 struct gpu_mmap_handle {
     void* base = nullptr;
     size_t size = 0;
+    void (*orig_free_buffer)(ggml_backend_buffer_t buffer) = nullptr;
 };
 static std::mutex g_gpu_mmap_mu;
 static std::map<ggml_backend_buffer_t, gpu_mmap_handle> g_gpu_mmap;
 
+static void gpu_mmap_free_buffer_wrapper(ggml_backend_buffer_t buffer);
+
 static void register_gpu_mmap(ggml_backend_buffer_t buf, void* base, size_t size) {
     std::lock_guard<std::mutex> lk(g_gpu_mmap_mu);
-    g_gpu_mmap[buf] = {base, size};
+    g_gpu_mmap[buf] = {base, size, buf->iface.free_buffer};
+    buf->iface.free_buffer = gpu_mmap_free_buffer_wrapper;
 }
 static gpu_mmap_handle lookup_gpu_mmap(ggml_backend_buffer_t buf) {
     std::lock_guard<std::mutex> lk(g_gpu_mmap_mu);
     auto it = g_gpu_mmap.find(buf);
     return it != g_gpu_mmap.end() ? it->second : gpu_mmap_handle{};
+}
+
+static void gpu_mmap_free_buffer_wrapper(ggml_backend_buffer_t buffer) {
+    gpu_mmap_handle h = lookup_gpu_mmap(buffer);
+    if (h.orig_free_buffer) {
+        h.orig_free_buffer(buffer);
+    }
+    if (h.base && h.size > 0) {
+#if defined(_WIN32)
+        UnmapViewOfFile(h.base);
+#else
+        ::munmap(h.base, h.size);
+#endif
+        std::lock_guard<std::mutex> lk(g_gpu_mmap_mu);
+        g_gpu_mmap.erase(buffer);
+    }
 }
 
 // Issue #94 (chatterbox-turbo segfault during init on macOS / Apple
