@@ -1790,6 +1790,13 @@ static bool backend_is_vulkan(ggml_backend_t b) {
     return name && std::strncmp(name, "Vulkan", 6) == 0;
 }
 
+static bool backend_is_cuda(ggml_backend_t b) {
+    if (!b)
+        return false;
+    const char* name = ggml_backend_name(b);
+    return name && std::strncmp(name, "CUDA", 4) == 0;
+}
+
 // Issue #52 (geneing): some Vulkan devices have lower
 // `maxComputeWorkGroupCount` limits than the σ-VAE decoder's largest
 // dispatches need (the 6-stage transposed-conv stack with 3200x
@@ -1835,7 +1842,7 @@ static bool vibevoice_vae_should_use_cpu(ggml_backend_t backend, ggml_backend_t 
         return false;
     // auto / unset: fallback for backends with known issues running the
     // 7-stage σ-VAE decoder graph as a single command buffer.
-    return backend_is_metal(backend) || backend_is_vulkan_intel_igpu(backend);
+    return backend_is_metal(backend) || backend_is_vulkan_intel_igpu(backend) || backend_is_cuda(backend);
 }
 
 // Vulkan hits the same `GGML_ASSERT(src_backend_id != -1)` failure as Metal

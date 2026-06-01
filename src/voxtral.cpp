@@ -223,6 +223,13 @@ static ggml_tensor* require(voxtral_model& m, const char* name) {
 // Model loading
 // ===========================================================================
 
+static bool backend_is_cuda(ggml_backend_t b) {
+    if (!b)
+        return false;
+    const char* name = ggml_backend_name(b);
+    return name && std::strncmp(name, "CUDA", 4) == 0;
+}
+
 static bool voxtral_load_model(voxtral_model& model, voxtral_vocab& vocab, const char* path, ggml_backend_t backend,
                                ggml_backend_t backend_cpu) {
     // ---- pass 1: read hparams + vocab via metadata-only context ----
@@ -796,6 +803,9 @@ extern "C" voxtral_context* voxtral_init_from_file(const char* path, voxtral_con
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
     ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    if (backend_is_cuda(ctx->backend)) {
+        ctx->params.flash_attn = false;
+    }
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -1012,7 +1022,7 @@ static ggml_cgraph* voxtral_build_graph_llm_kv(voxtral_context* ctx, int n_past,
         /*rope_beta_slow*/ 1.0f,
         /*attn_scale*/ attn_scale,
         /*qk_norm_eps*/ 0.0f, // voxtral has no Q/K norm
-        /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
+        /*gqa_mode*/ backend_is_cuda(ctx->backend) ? core_attn::GQA_NATIVE : core_attn::GQA_MANUAL_CONT,
     };
 
     for (uint32_t il = 0; il < hp.llm_n_layers; il++) {
