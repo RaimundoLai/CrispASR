@@ -28,8 +28,8 @@ cmake --build build -j$(nproc)
 ls build/bin/crispasr-quantize    # confirm it exists
 ```
 
-> If you previously built with `--target crispasr` (which only builds
-> the main binary), re-run **without** `--target` or with
+> If you previously built with `--target crispasr-lib` (which only builds
+> the main library), re-run **without** `--target` or with
 > `--target crispasr-quantize` to produce the quantize tool.
 
 The `scripts/dev-build.sh` wrapper accepts `--target` directly:
@@ -118,6 +118,12 @@ ASR backends.
 | firered-asr         | ✓     | ✓     | ✓     | ✓     |                                                                          |
 | moonshine           | ✓     | ✓     | ✓     | ✓     |                                                                          |
 | wav2vec2 / fc-ctc   | ✓     | ✓     | ✓     | ✓     | CTC heads are small; Q4_K barely changes WER.                            |
+| nemotron            | ✓     | ✓     | ✓     | ✓     | F16 + Q4_K produce identical text. Streaming works on all quants.         |
+| paraformer           | ✓     | ✓     | ✓     | ✓     | Q4_K is the shipped default.                                             |
+| lfm2-audio          | ✓     | ✓     | ✓     | —     | **Q4_K produces 0 tokens** — hybrid backbone too sensitive. Q5_K minimum. |
+| dia (TTS)           | ✓     | ✓     | ✓     | ✓     | Q4_K validated.                                                          |
+| outetts (TTS)       | ✓     | ✓     | ✓     | ✓     | WavTokenizer decoder always F16.                                         |
+| audioseal           | ✓     | ✓     | ✓     | ✓     | Small model; quant gains minimal.                                        |
 | kokoro (TTS)        | ✓     | ✓     | —     | —     | Q5_K and below break the German backbone — ship F16 + Q8_0 only.         |
 | qwen3-tts           | ✓     | ✓     | ✓     | ✓     |                                                                          |
 | vibevoice (TTS)     | ✓     | ✓     | ✓     | ✓     | F16 + Q4_K shipped.                                                      |

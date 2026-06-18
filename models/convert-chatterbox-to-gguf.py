@@ -39,6 +39,8 @@ from pathlib import Path
 
 import numpy as np
 
+from chatterbox_paths import select_chatterbox_t3_checkpoint
+
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
 except ImportError:
@@ -461,9 +463,25 @@ def write_t3_gguf(
 ):
     print(f"\n=== Writing T3 GGUF: {output_path} ===")
 
+    # ── Pre-load T3 to infer vocab size before writing hparams ──
+    t3_path = select_chatterbox_t3_checkpoint(model_dir)
+    if not t3_path.exists():
+        sys.exit(f"Missing T3 weights (tried t3_mtl*.safetensors and t3_cfg.safetensors in {model_dir})")
+    print(f"  T3 weights: {t3_path.name}")
+    t3_tensors = load_safetensors(t3_path)
+
+    # Infer text_vocab_size from the actual embedding (#170).
+    for emb_key in ["text_emb.weight", "text_embedding.weight"]:
+        if emb_key in t3_tensors:
+            actual_vocab = t3_tensors[emb_key].shape[0]
+            if actual_vocab != T3_HPARAMS["text_vocab_size"]:
+                print(f"  text_vocab_size: {T3_HPARAMS['text_vocab_size']} -> {actual_vocab} (from {emb_key})")
+                T3_HPARAMS["text_vocab_size"] = actual_vocab
+            break
+
     writer = GGUFWriter(str(output_path), "chatterbox")
 
-    # ── Hyperparameters ──
+    # ── Hyperparameters (after vocab inference) ──
     for k, v in T3_HPARAMS.items():
         key = f"chatterbox.t3.{k}"
         if isinstance(v, int):
@@ -483,7 +501,7 @@ def write_t3_gguf(
 
     # ── Load and write base Chatterbox tokenizer ──
     if tokenizer_path and tokenizer_path.exists():
-        with open(tokenizer_path, 'r') as f:
+        with open(tokenizer_path, "r", encoding="utf-8") as f:
             tok_data = json.load(f)
         model = tok_data.get('model', {})
         vocab = model.get('vocab')
@@ -512,7 +530,7 @@ def write_t3_gguf(
 
     # ── Load and write precomputed conditioning ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
 
@@ -547,11 +565,7 @@ def write_t3_gguf(
                               raw_dtype=GGMLQuantizationType.F32)
         print(f"  Precomputed conds loaded")
 
-    # ── Load T3 weights ──
-    t3_path = model_dir / "t3_cfg.safetensors"
-    if not t3_path.exists():
-        sys.exit(f"Missing {t3_path}")
-    t3_tensors = load_safetensors(t3_path)
+    # T3 tensors already loaded above (pre-hparams vocab inference)
     n_t3 = 0
     for hf_name, tensor in sorted(t3_tensors.items()):
         gguf_name = map_t3_name(hf_name)
@@ -618,7 +632,7 @@ def write_turbo_t3_gguf(
     merges_path = model_dir / "merges.txt"
     if vocab_path.exists():
         import json as _json
-        with open(vocab_path) as f:
+        with open(vocab_path, encoding="utf-8") as f:
             vocab = _json.load(f)
         max_id = max(vocab.values())
         tokens = [""] * (max_id + 1)
@@ -629,7 +643,7 @@ def write_turbo_t3_gguf(
 
         if merges_path.exists():
             merges = []
-            with open(merges_path) as f:
+            with open(merges_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#'):
@@ -664,7 +678,7 @@ def write_turbo_t3_gguf(
 
     # ── Precomputed conditioning ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
 
@@ -835,7 +849,7 @@ def write_kartoffelbox_t3_gguf(
 
     # ── Precomputed conditioning (shared with turbo base) ──
     if conds_path and conds_path.exists():
-        conds = torch.load(conds_path, map_location='cpu', weights_only=True)
+        conds = torch.load(conds_path, map_location='cpu', weights_only=False)
         t3_cond = conds['t3']
         gen_cond = conds['gen']
         if t3_cond.get('speaker_emb') is not None:
@@ -986,7 +1000,11 @@ def main():
         return
 
     conds_path = model_dir / "conds.pt"
-    tokenizer_path = model_dir / "tokenizer.json"
+    # Prefer multilingual tokenizer (mtl_tokenizer.json) over base
+    # tokenizer.json — the mtl variant has language tags ([ar], [de], etc.)
+    # and extended Unicode graphemes needed for non-English TTS (#170).
+    mtl_tokenizer_path = model_dir / "mtl_tokenizer.json"
+    tokenizer_path = mtl_tokenizer_path if mtl_tokenizer_path.exists() else model_dir / "tokenizer.json"
 
     if not args.s3gen_only:
         write_t3_gguf(

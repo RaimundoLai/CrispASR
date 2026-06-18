@@ -33,6 +33,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include "core/attention.h"
+#include "core/beam_decode.h"
 #include "core/crispasr_lcs.h"
 #include "core/fastconformer.h"
 
@@ -205,6 +206,9 @@ struct canary_context {
     // softmax sampling. Set via canary_set_temperature().
     float decode_temperature = 0.0f;
     uint64_t decode_seed = 0;
+
+    // §90 beam-search width. 1 = greedy (default).
+    int beam_size = 1;
 };
 
 // ===========================================================================
@@ -1349,6 +1353,12 @@ extern "C" void canary_set_temperature(struct canary_context* ctx, float tempera
     ctx->decode_seed = seed;
 }
 
+extern "C" void canary_set_beam_size(struct canary_context* ctx, int n) {
+    if (!ctx)
+        return;
+    ctx->beam_size = n > 0 ? n : 1;
+}
+
 extern "C" int canary_n_vocab(struct canary_context* ctx) {
     return (int)ctx->model.hparams.vocab_size;
 }
@@ -1720,6 +1730,70 @@ static canary_result* canary_finish_from_encoder(canary_context* ctx, const floa
     if (logits.empty())
         return nullptr;
     offset = (int)prompt.size();
+
+    // §90 beam search — run_with_probs_branched when beam_size > 1.
+    // Cross-attention KV (cross_k/v) is shared across beams; only self-attention
+    // KV (kv_k/kv_v) is snapshotted per beam.
+    if (ctx->beam_size > 1) {
+        // GH #161: snapshot/restore self-attention KV on-device via a recycled
+        // buffer pool (no PCIe round-trip + sync per beam per step).
+        core_attn::kv_snapshot_pool kv_pool(ctx->kv_k, ctx->kv_v);
+
+        auto save_fn = [&kv_pool](canary_context*) -> core_attn::kv_snapshot* { return kv_pool.save(); };
+
+        auto restore_fn = [&kv_pool](canary_context*, core_attn::kv_snapshot* s) { kv_pool.restore(s); };
+
+        auto snap_free_fn = [&kv_pool](core_attn::kv_snapshot* s) { kv_pool.release(s); };
+
+        auto step_fn = [](canary_context* c, int32_t tok, int n_past) -> float* {
+            auto lg = canary_decode_step(c, &tok, 1, n_past);
+            if (lg.empty())
+                return nullptr;
+            float* out = (float*)std::malloc(lg.size() * sizeof(float));
+            std::memcpy(out, lg.data(), lg.size() * sizeof(float));
+            return out;
+        };
+
+        const int vocab = (int)logits.size();
+        core_beam_decode::Config bcfg;
+        bcfg.max_new_tokens = max_steps;
+        bcfg.eos_id = eos;
+        bcfg.vocab_size = vocab;
+        bcfg.beam_size = ctx->beam_size;
+        bcfg.prompt_len = (int)prompt.size();
+
+        auto br = core_beam_decode::run_with_probs_branched(ctx, logits.data(), save_fn, restore_fn, snap_free_fn,
+                                                            step_fn, bcfg);
+
+        // Build result from beam output (skip EOS if present at the end)
+        int n_beam = (int)br.tokens.size();
+        if (n_beam > 0 && br.tokens.back() == eos)
+            n_beam--;
+
+        auto* r = (canary_result*)calloc(1, sizeof(canary_result));
+        if (!r)
+            return nullptr;
+
+        r->n_tokens = n_beam;
+        r->tokens = (canary_token_data*)calloc((size_t)n_beam, sizeof(canary_token_data));
+        std::string full_text;
+        for (int i = 0; i < n_beam; i++) {
+            r->tokens[i].id = br.tokens[i];
+            r->tokens[i].p = br.probs[i];
+            r->tokens[i].t0 = 0;
+            r->tokens[i].t1 = 0;
+            const char* txt = canary_token_to_str(ctx, br.tokens[i]);
+            if (txt) {
+                std::string vis = spiece_to_text(txt);
+                snprintf(r->tokens[i].text, sizeof(r->tokens[i].text), "%s", vis.c_str());
+                full_text += vis;
+            }
+        }
+        r->text = strdup(full_text.c_str());
+        r->n_words = 0;
+        r->words = nullptr;
+        return r;
+    }
 
     // PLAN #114 P3 polish — degenerate-loop guard. The AED has no
     // repetition penalty; on out-of-distribution audio (or a chunk

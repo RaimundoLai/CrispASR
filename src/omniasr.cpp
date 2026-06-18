@@ -887,8 +887,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
             for (int i = 1; i < V_dbg; i++)
                 if (frame0[i] > frame0[best])
                     best = i;
-            fprintf(stderr, "  logits frame 0: argmax=%d (%.4f), blank(%d)=%.4f\n", best, frame0[best], hp.pad_id,
-                    frame0[hp.pad_id]);
+            fprintf(stderr, "  logits frame 0: argmax=%d (%.4f), blank(0)=%.4f\n", best, frame0[best], frame0[0]);
         }
     }
 
@@ -904,8 +903,9 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
         fprintf(stderr, "omniasr: logits [%d, %d], CTC decoding...\n", V, T);
 
     // Greedy CTC decode: argmax per frame, collapse repeats, remove blanks
-    // Blank token = pad_id = 1 (SentencePiece convention for OmniASR)
-    int blank_id = hp.bos_id; // CTC blank = <s> = 0 (fairseq2 convention)
+    // CTC blank is always index 0: fairseq2 uses <s>=0, HF uses <pad>=0.
+    // Both trained with PyTorch CTC loss (blank=0 default).
+    int blank_id = 0;
     std::vector<int> tokens;
     int prev_id = -1;
     for (int t = 0; t < T; t++) {
@@ -1501,25 +1501,12 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const std::vector<floa
         std::vector<int> seg_tokens;
 
         if (beam) {
-            struct omniasr_kv_snap {
-                std::vector<uint8_t> k_data;
-                std::vector<uint8_t> v_data;
-            };
-            auto save = [](omniasr_context* c) -> omniasr_kv_snap* {
-                auto* s = new omniasr_kv_snap();
-                const size_t kb = ggml_nbytes(c->kv_k);
-                const size_t vb = ggml_nbytes(c->kv_v);
-                s->k_data.resize(kb);
-                s->v_data.resize(vb);
-                ggml_backend_tensor_get(c->kv_k, s->k_data.data(), 0, kb);
-                ggml_backend_tensor_get(c->kv_v, s->v_data.data(), 0, vb);
-                return s;
-            };
-            auto restore = [](omniasr_context* c, omniasr_kv_snap* s) {
-                ggml_backend_tensor_set(c->kv_k, s->k_data.data(), 0, s->k_data.size());
-                ggml_backend_tensor_set(c->kv_v, s->v_data.data(), 0, s->v_data.size());
-            };
-            auto snap_free = [](omniasr_kv_snap* s) { delete s; };
+            // GH #161: snapshot/restore KV on-device via a recycled buffer
+            // pool (no PCIe round-trip + sync per beam per step).
+            core_attn::kv_snapshot_pool kv_pool(ctx->kv_k, ctx->kv_v);
+            auto save = [&kv_pool](omniasr_context*) -> core_attn::kv_snapshot* { return kv_pool.save(); };
+            auto restore = [&kv_pool](omniasr_context*, core_attn::kv_snapshot* s) { kv_pool.restore(s); };
+            auto snap_free = [&kv_pool](core_attn::kv_snapshot* s) { kv_pool.release(s); };
             std::vector<float> step_buf;
             auto step_fn = [&step_buf, perf](omniasr_context* c, int32_t tok, int n_past) -> float* {
                 int dummy = 0;
@@ -1701,4 +1688,8 @@ extern "C" void omniasr_set_seed(struct omniasr_context* ctx, uint64_t seed) {
 extern "C" void omniasr_set_beam_size(struct omniasr_context* ctx, int beam_size) {
     if (ctx)
         ctx->params.beam_size = (beam_size > 0) ? beam_size : 1;
+}
+
+extern "C" bool omniasr_is_ctc(struct omniasr_context* ctx) {
+    return ctx && ctx->model.hp.model_type == 0;
 }

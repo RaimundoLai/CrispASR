@@ -34,7 +34,7 @@ and where the gaps are. Last refresh: **2026-05-04** (after PLAN §79 —
 | backend | KV_QUANT | KV_QUANT_K/_V | KV_ON_CPU | N_GPU_LAYERS | notes |
 |---|:-:|:-:|:-:|:-:|---|
 | canary (1B) | ✓ | ✓ | ✓ | · | flash_attn_ext default, -17 % on JFK with q8_0/q4_0 |
-| cohere (2B) | ✓ | ✓ | ✓ | · | flash_attn_ext available; +11 % regression vs cast-on-read on JFK with q8_0/q4_0 — long-form rerun needed before promoting (see PLAN) |
+| cohere (2B) | ✓ | ✓ | ✓ | · | cast-on-read default (13 % faster on 30 s chunks); `CRISPASR_COHERE_FLASH=1` for unchunked long-form (-26 % win at 300 s) — see §5 |
 | kyutai-stt (1B) | ✓ | ✓ | ✓ | · | flash_attn_ext native, quant-safe |
 | firered-asr (900M) | — | — | — | — | inline AED, no exposed transformer KV |
 | moonshine-tiny / streaming | — | — | — | — | tiny decoder, no exposed KV |
@@ -83,13 +83,21 @@ and where the gaps are. Last refresh: **2026-05-04** (after PLAN §79 —
    dGPU should be even more favourable; deferred until a CUDA host
    is available. If a platform regresses, gate via env
    (`CRISPASR_FORCE_CPU_WEIGHTS=1`).
-5. **Cohere flash_attn_ext regresses on short audio.** JFK (~11 s)
-   with q8_0 K / q4_0 V is +11 % slower under flash than under the
-   cast-on-read fallback (canary on the same workload is -17 %, so
-   the kernel works — cohere's cache layout or head dim flips the
-   crossover). Need a multi-minute clip to confirm flash pulls ahead
-   on long-form before promoting it to the recommended path; until
-   then short-form users on cohere should treat flash as opt-in.
+5. **Cohere flash_attn_ext: crossover confirmed (PLAN #73 closeout,
+   2026-06-04).** Long-form rerun on FLEURS EN, VPS x86 CPU, 2
+   threads, `cohere-transcribe-q4_k.gguf`:
+
+   | audio | flash-attn (s) | cast-on-read (s) | delta |
+   |---|---:|---:|---|
+   | 60 s | 202.72 | 179.13 | flash **+13% slower** |
+   | 300 s | 820.37 | 1114.96 | flash **-26% faster** |
+
+   Crossover is between 60 s and 300 s. Flash wins decisively on
+   unchunked long-form (5+ min) due to O(n) vs O(n²) attention scaling.
+   But with default 30 s auto-chunking, each decode pass is short-form.
+   **Recommendation:** cast-on-read is now the cohere default (13%
+   faster on the chunked path that all normal users hit). For unchunked
+   long-form, set `CRISPASR_COHERE_FLASH=1`.
 
 ### Stacking the four knobs
 
@@ -114,6 +122,154 @@ CRISPASR_N_GPU_LAYERS=10 \
 See [`docs/cli.md`](docs/cli.md) "Memory footprint" for the full env-
 var reference and the llama.cpp parity comparison table; HISTORY §79
 for the implementation write-up.
+
+---
+
+## Kaggle T4 GPU — 2026-06-03
+
+Platform: Tesla T4 (16 GB VRAM), 4 CPU threads, CUDA. Commit: latest
+`main` (post `b102060a`). Run via `tools/kaggle-benchmark-all-backends.py`.
+**30 backends tested, 30 pass.** First run to cover all backends added in
+the June 2-3 script completeness audit: granite-4.1-plus, granite-4.1-nar,
+fun-asr-mlt-nano, voxtral4b.
+
+### Speed ranking (11.0 s JFK, Q4_K unless noted, greedy)
+
+| Rank | Backend | RTx | WER | Architecture |
+|---|---|---|---|---|
+| 1 | SenseVoice Small | **17.3x** | 0.0% | Encoder (multitask) |
+| 2 | FastConformer CTC Large | 7.7x | 0.0% | Encoder-CTC |
+| 3 | Data2Vec Base | 6.9x | 4.5% | Encoder-CTC |
+| 4 | Canary 1B | 6.8x | 0.0% | Encoder-AED |
+| 5 | Moonshine Tiny | 6.7x | 9.1% | Encoder-Decoder |
+| 6 | Wav2Vec2 XLSR-EN | 6.4x | 0.0% | Encoder-CTC |
+| 7 | HuBERT Large | 6.2x | 0.0% | Encoder-CTC |
+| 8 | OmniASR CTC 1B v2 | 6.2x | 4.5% | Encoder-CTC |
+| 9 | Cohere Transcribe | 6.1x | 0.0% | Encoder-AED |
+| 10 | Fun-ASR Nano 2512 | 5.5x | 0.0% | Encoder-LLM (enc GPU, LLM CPU) |
+| 11 | Parakeet TDT 0.6B | 5.3x | 0.0% | Encoder-TDT |
+| 12 | Paraformer-zh NAR | 4.3x | 0.0% | Encoder (NAR) |
+| 13 | Qwen3 ASR 0.6B | 4.0x | 0.0% | Encoder-LLM |
+| 14 | GLM ASR Nano | 3.9x | 0.0% | Encoder-LLM |
+| 15 | Mega-ASR 1.7B | 2.6x | 0.0% | Encoder-LLM (qwen3) |
+| 16 | Moonshine Streaming Tiny | 2.5x | 0.0% | Encoder-Decoder |
+| 17 | Granite Speech 1B | 2.5x | 0.0% | Encoder-LLM |
+| 18 | Granite Speech 4.1 2B | 2.4x | 0.0% | Encoder-LLM |
+| 19 | Voxtral Mini 3B | 2.3x | 0.0% | Encoder-LLM |
+| 20 | OmniASR LLM 300M | 1.4x | 4.5% | Encoder-LLM |
+| 21 | Kyutai STT 1B | 1.3x | 0.0% | Encoder-AED |
+| 22 | VibeVoice ASR | 1.2x | 4.5% | Encoder-LLM |
+| 23 | Voxtral 4B Realtime | 0.9x | 0.0% | Encoder-LLM (streaming) |
+| 24 | Granite Speech 4.1 2B+ | 0.8x | 0.0% | Encoder-LLM |
+| 25 | Gemma-4-E2B 2.3B | 0.8x | 9.1% | Encoder-LLM |
+| 26 | Granite Speech 4.1 NAR | 0.6x | 0.0% | Encoder-CTC (non-AR) |
+| 27 | FireRed ASR2 AED | 0.5x | 0.0% | Encoder-AED |
+| 28 | Whisper (base) | 0.4x | 0.0% | Encoder-Decoder |
+| 29 | MiMo-ASR | 0.2x | 0.0% | Encoder-LLM (CPU-forced, #115) |
+| 30 | Fun-ASR MLT Nano 2512 | 0.1x | 0.0% | Encoder-LLM (F16 on CPU) |
+
+### Notes
+
+- **30/30 pass, 24/30 at WER 0.0%** on JFK. The 4.5%/9.1% WER backends
+  have minor word-boundary differences (e.g. "americans" → "americas").
+- **mimo-asr (0.2x RT):** still CPU-forced (PLAN #115 option A). GPU fix
+  landed in `3ef9f87e` (June 2) — needs validation run to flip default.
+- **fun-asr-mlt-nano (0.1x RT):** running F16 (~2 GB) on CPU. Q8_0 quant
+  exists on HF (`cstr/funasr-mlt-nano-GGUF/funasr-mlt-nano-2512-q8_0.gguf`)
+  and should be GPU-safe; switching would recover 5-10x speed.
+### TTS benchmark (same run, P100 GPU)
+
+First comprehensive TTS benchmark across 11 backends. Phrase: "The quick
+brown fox jumps over the lazy dog." Each model auto-downloaded, synthesised,
+output WAV checked for >1 KB, then cleaned up.
+
+| Rank | Backend | Status | Wall (s) | WAV size | Notes |
+|---|---|---|---|---|---|
+| 1 | Piper LessAC Medium | PASS | 3.7 | 103 KB | Fastest TTS, 22 kHz VITS |
+| 2 | SpeechT5 TTS | PASS | 4.6 | 56 KB | 16 kHz, deterministic |
+| 3 | Bark Small | PASS | 16.9 | 245 KB | 3-stage GPT-2, 24 kHz |
+| 4 | Kokoro 82M | PASS | 17.5 | 152 KB | Needs espeak-ng (installed) |
+| 5 | Pocket TTS 100M | PASS | 72.1 | 181 KB | Continuous-latent AR, 24 kHz |
+| 6 | CSM 1B | PASS | 213.4 | 165 KB | Llama-3.2 + Mimi, 24 kHz |
+| 7 | Orpheus 3B-FT | PASS | 269.7 | 205 KB | Llama-3.2 + SNAC, 24 kHz |
+| — | FastPitch 60M | TIMEOUT | >30 | 0 | Timeout too short (30s) |
+| — | F5-TTS v1 Base | FAIL | 4.1 | 0 | Needs `--voice <ref.wav>` |
+| — | Parler TTS Mini v1.1 | TIMEOUT | >180 | 0 | Too slow on CPU path |
+| — | Dia 1.6B | TIMEOUT | >240 | 0 | Too slow on CPU path |
+
+**7/11 pass.** FastPitch needs a longer timeout (model download is slow, not
+inference). F5-TTS requires a reference audio for voice cloning. Parler-TTS
+and Dia are AR LLM-based and need GPU acceleration or longer timeouts.
+
+---
+
+## Kaggle P100 GPU — 2026-05-31
+
+Platform: Tesla P100-PCIE (16 GB VRAM), 4 CPU threads, CUDA **sm_60**
+(auto-detected — the kernel pins `CMAKE_CUDA_ARCHITECTURES` from
+`nvidia-smi compute_cap`, so the build is correct whether the box is a
+T4/P100/A100/L4). Commit: `7bc3ef5b`. Run via
+`tools/kaggle-benchmark-all-backends.py` (now on the shared
+`tools/kaggle/kaggle_harness.py`). **27 backends tested, 26 pass.**
+
+First run to cover all six newly-registered ASR backends (marked †):
+sensevoice, paraformer, mega-asr, granite-4.1, funasr, mimo-asr.
+
+### Speed ranking (11.0 s JFK, Q4_K unless noted, greedy)
+
+| Rank | Backend | RTx | Time | WER | Architecture |
+|---|---|---|---|---|---|
+| 1 | SenseVoice Small † | **19.8x** | 0.6s | 0.0% | Encoder (multitask) |
+| 2 | FastConformer CTC | 8.9x | 1.2s | 0.0% | Encoder-CTC |
+| 3 | Moonshine Tiny | 8.6x | 1.3s | 9.1% | Encoder-Decoder |
+| 4 | Canary 1B | 8.0x | 1.4s | 9.1% | Encoder-AED |
+| 5 | Data2Vec Base | 7.5x | 1.5s | 4.5% | Encoder-CTC |
+| 6 | OmniASR CTC 1B | 7.0x | 1.6s | 9.1% | Encoder-CTC |
+| 7 | HuBERT Large | 6.9x | 1.6s | 0.0% | Encoder-CTC |
+| 8 | Wav2Vec2 XLSR-EN | 6.9x | 1.6s | 0.0% | Encoder-CTC |
+| 9 | Cohere Transcribe | 6.6x | 1.7s | 0.0% | Encoder-AED |
+| 10 | Parakeet TDT 0.6B | 6.0x | 1.8s | 0.0% | Encoder-TDT |
+| 11 | Whisper base | 5.6x | 2.0s | 0.0% | Encoder-Decoder |
+| 12 | Paraformer-zh NAR † | 5.0x | 2.2s | 0.0% | Encoder (NAR) |
+| 13 | GLM ASR Nano | 4.7x | 2.4s | 0.0% | Encoder-LLM |
+| 14 | Qwen3 ASR 0.6B | 4.4x | 2.5s | 0.0% | Encoder-LLM |
+| 15 | Moonshine Streaming Tiny | 2.9x | 3.8s | 0.0% | Encoder-Decoder |
+| 16 | Mega-ASR 1.7B † | 2.9x | 3.9s | 0.0% | Encoder-LLM (qwen3) |
+| 17 | Granite Speech 1B | 2.8x | 3.9s | 0.0% | Encoder-LLM |
+| 18 | Granite Speech 4.1 2B † | 2.7x | 4.1s | 0.0% | Encoder-LLM |
+| 19 | Voxtral Mini 3B | 2.5x | 4.4s | 0.0% | Encoder-LLM |
+| 20 | OmniASR LLM 300M | 1.6x | 7.0s | 4.5% | Encoder-LLM |
+| 21 | Kyutai STT 1B | 1.5x | 7.5s | 0.0% | Encoder-AED |
+| 22 | VibeVoice ASR | 1.3x | 8.6s | 4.5% | Encoder-LLM |
+| 23 | Voxtral 4B Realtime | 0.9x | 11.9s | 0.0% | Encoder-LLM |
+| 24 | Gemma-4-E2B 2.3B | 0.8x | 13.6s | 0.0% | Encoder-LLM |
+| 25 | FireRed ASR2 AED | 0.6x | 19.2s | 0.0% | Encoder-AED |
+| 26 | MiMo-ASR † | 0.3x | 38.0s | 0.0% | Encoder-LLM (CPU-forced, #115) |
+| 27 | FunASR Nano † | ~1.0x | ~10.6s | 0.0% | Encoder-LLM (enc GPU, LLM CPU) |
+
+### Notes
+
+- **funasr is FIXED (§136, 2026-06-01).** The original benchmark showed
+  6.0× RT / 1.8s but **100% WER** — the `ggml_backend_sched` produced
+  all-NaN logits on CUDA (issue #125). The fix (`f94fec90`) splits
+  weights: encoder on GPU, LLM+KV on CPU. Now ~1.0× RT / 10.6s wall-clock
+  (including model load) with **0% WER**. Slower than the broken all-GPU
+  run because the Qwen2-0.6B decode is CPU-bound. The encoder (70 SANM
+  blocks) still benefits from GPU — for longer audio the encoder
+  dominates and the GPU speedup matters more. `FUNASR_LLM_GPU=1`
+  overrides to all-GPU for future testing once the upstream sched bug
+  is fixed.
+- **SenseVoice debuts at #1** (19.8× RT, 0% WER) — encoder-only multitask
+  model, fastest backend now measured.
+- **mimo-asr** runs at 0.3× (38 s) because PLAN #115 forces it to CPU; it
+  transcribes correctly. The 420 s timeout budgeted for it was ample.
+- P100 (sm_60, ~9.3 TFLOPS fp32) lands the LLM-AR tail a touch faster than
+  the 2026-04-26 T4 run (e.g. voxtral-3B 2.5× vs 2.4×, granite-1B 2.8× vs
+  1.7×); CTC/encoder backends are comparable. Cross-run deltas are also
+  affected by Q4_K model refreshes since April.
+- Two non-fatal HF pre-download `401`s (the Kaggle Secrets API was
+  flaking, so no HF token) fell back to the C++ downloader; all models are
+  public `cstr/*` so downloads still succeeded.
 
 ---
 
@@ -1600,6 +1756,8 @@ faster on the parakeet rows; numbers below are the Linux x86 VPS.
 | voxtral-mini-3b                             | 166 | 165 |  189 |  193 |
 | cohere-transcribe                           |  79 | 144 |  349 |  673 |
 | cohere-transcribe + `--vad`                 |  65 | 117 |  279 |  557 |
+| cohere-asr-ja (Q4_K, JA audio)             |  31 | 140 |    — |    — |
+| cohere-asr-ja (Q4_K, EN audio)             |  39 | 104 |    — |    — |
 | canary-1b-v2                                |  68 | 122 |  381 | OOM  |
 
 (voxtral wall time is roughly constant because it silently skips
@@ -1698,10 +1856,12 @@ Both scripts in this commit. Audio: `/mnt/akademie_storage/yt_{60,120,300,600}s.
 
 **Knob:** `--beam-size N` (CLI) / `CRISPASR_BEAM_SIZE=N` (env) /
 `crispasr_session_set_beam_size(session, N)` (C API).
-Default N=1 (greedy). N > 1 activates `core_beam_decode::run_with_probs`
-on LLM-decoder backends: qwen3-asr, granite-speech, voxtral.
-Non-AR backends (parakeet, canary, fastconformer-ctc, etc.) ignore the
-flag — beam search only makes sense on autoregressive token decoders.
+Default N=1 (greedy). N > 1 activates beam search on supported backends.
+LLM-decoder backends (qwen3-asr, granite-speech, voxtral, gemma4-e2b) use
+`core_beam_decode::run_with_probs` (replay-from-prefix). Encoder-decoder
+backends (canary, cohere) use `core_beam_decode::run_with_probs_branched`
+(KV snapshots). Transducer backends (parakeet) use a dedicated TDT/RNNT
+label-looping beam search. CTC-only and NAR backends ignore the flag.
 
 Benchmark script: `tools/benchmark_vitw_beam.py` — runs against
 [`zhifeixie/Voices-in-the-Wild-Bench`](https://huggingface.co/datasets/zhifeixie/Voices-in-the-Wild-Bench)
@@ -1766,6 +1926,121 @@ python tools/benchmark_vitw_beam.py \
     --n 8 --beams 1,2,4 \
     --json tools/vitw_beam_results.json
 ```
+
+### MAES beam search for transducers (2026-06-03, §134)
+
+MAES (Modified Adaptive Expansion Search) is a transducer-specific beam
+search that's more efficient than the label-looping beam above. It processes
+one encoder frame at a time with up to N adaptive non-blank expansions per
+frame, using gamma-threshold pruning to kill low-probability branches.
+
+**Knob:** `CRISPASR_PARAKEET_MAES=1` + `--beam-size N` (CLI), or
+`--parakeet-decoder maes` + `--beam-size N`, or
+`parakeet_set_maes(ctx, true, num_steps, gamma, beta)` (C API).
+Config: `CRISPASR_MAES_NUM_STEPS` (default 2), `CRISPASR_MAES_GAMMA` (2.3),
+`CRISPASR_MAES_BETA` (2).
+
+Supports both TDT (Token-and-Duration Transducer) and pure RNNT models.
+
+#### MAES vs greedy on FLEURS English (CPU, Hetzner CCX13, 4 threads)
+
+| Model | Audio | Greedy | MAES beam=4 | Speed cost |
+|---|---|---|---|---|
+| tdt-0.6b-v2 (1K vocab) | 10s | "...by 25%." | "...by 25 years." | — |
+| tdt-0.6b-v3 (8K vocab) | 10s | "...by 25-30 years." | "...by 25 to 30 years." | — |
+| tdt-0.6b-v2 | 60s | 5 sentences | 6 sentences (recovered full missing sentence) | +35% |
+| tdt-1.1b (8K vocab) | 10s | "...by twenty five to thirty years" | identical | — |
+| tdt_ctc-110m (1K vocab) | 10s | garbled | same garble | — |
+| rnnt-0.6b (8K vocab) | 10s | "...by twenty five to thirty years" | identical | — |
+| rnnt-1.1b (8K vocab) | 60s | truncated at "lettering" | identical | +25% |
+
+#### When to use MAES vs standard beam
+
+| scenario | recommendation |
+|---|---|
+| Parakeet TDT with small vocab (v2, 1K BPE) | MAES beam=4 — measurable quality gain |
+| Parakeet TDT/RNNT with large vocab (8K BPE) | greedy — already strong baseline, MAES matches but costs 25-35% |
+| Parakeet with hotwords (CTC-WS) | label-looping beam — hotword trie not yet wired into MAES |
+| Tiny model (110M) | neither — model capacity is the bottleneck |
+
+### CTC prefix beam search (2026-06-03, §134)
+
+Shared `core_ctc::prefix_beam_search()` with optional gamma-threshold
+pruning. Available for any CTC backend via `--beam-size N`.
+Currently wired into: parakeet-CTC, sensevoice, wav2vec2 (16 languages).
+
+CTC beam search has not yet been benchmarked for WER improvement — the
+primary benefit is expected to be on character-level CTC models (wav2vec2)
+where the small vocab makes greedy more error-prone than BPE models.
+
+### Transducer + encoder-decoder beam search (2026-06-02, issue #136 + §139)
+
+Parakeet TDT/RNNT label-looping beam (`b3cdcebd`), canary + cohere
+AED branched-KV beam (§90 runtime, adapter wiring `§139`), gemma4-e2b
+replay-from-prefix beam (§139). All on VPS CPU-only (no GPU).
+
+**JFK 11 s — wall time (user time in parentheses)**
+
+| backend | model | beam=1 | beam=2 | beam=4 |
+|---|---|---|---|---|
+| parakeet | parakeet-tdt-0.6b-v3 F16 | 27 s (30 s) | 26 s (31 s) | 15 s (32 s) |
+| canary | canary-1b-v2 Q4_K | 27 s (37 s) | 32 s (50 s) | 42 s (68 s) |
+| cohere | cohere-transcribe F16 | 125 s (91 s) | 104 s (107 s) | 120 s (118 s) |
+
+Notes:
+- Parakeet beam adds ~7 % user time at beam=4 (LSTM predictor + joint
+  head are tiny; encoder dominates). Wall time variance is system load.
+- Canary beam=4 costs ~84 % more user time (8-layer decoder × KV
+  snapshot/restore per beam step).
+- Cohere F16 model is ~3 GB; beam=4 KV snapshots increase peak memory
+  substantially. beam=4 was OOM-killed on the FLEURS-10s test.
+- All backends produce identical text on JFK at beam=1/2/4.
+
+**FLEURS 10 s — canary beam=4 vs greedy**
+
+| beam | output |
+|---|---|
+| 1 | "…Styles in the West could lag behind by twenty five percent. 25 to 30 years." |
+| 4 | "…styles in the west could lag behind by twenty five percent. 25 to 30 years." |
+
+Minor capitalization difference (proper-noun casing on "Styles"/"West").
+
+**FLEURS 60 s — parakeet beam=4 vs greedy**
+
+| beam | output diff |
+|---|---|
+| 1 | "…, and which was made famous…" |
+| 4 | "… and which was made famous…" (comma dropped) |
+
+Both valid; stylistic punctuation variation.
+
+**Overhead summary (user time)**
+
+| backend | beam=2 | beam=4 | beam=8 |
+|---|---|---|---|
+| parakeet (TDT LSTM) | ~3 % | ~7 % | ~20 % |
+| moonshine-streaming | ~24 % | ~56 % | — |
+| canary | ~35 % | ~84 % | — |
+| cohere | ~18 % | ~30 % | OOM (F16) |
+
+Parakeet beam search is nearly free because the decoder is a tiny
+LSTM (~10 KB state per beam). Canary and cohere have 8-layer
+transformer decoders with full KV snapshot/restore, so the cost
+scales with decoder depth × sequence length × beam width.
+
+### Translation beam search (m2m100 + madlad/t5, 2026-06-02)
+
+**m2m100-418m Q8_0 — en→de (CPU-only VPS)**
+
+| sentence | beam=1 user | beam=4 user | output |
+|---|---|---|---|
+| "Hello world, how are you today?" | 6 s | 21 s (3.4×) | "Hallo Welt, wie bist du heute?" |
+| "The president said he would not attend…" | 7 s | 45 s (6.4×) | "Der Präsident sagte, er würde wegen der Wetterbedingungen nicht an der Sitzung teilnehmen." |
+
+Translation beam is expensive: the decoder-only replay cost is
+O(beam × T²) where T is the output length, and for translation the
+decoder does more work per token than for ASR. Identical output on
+these clean inputs; benefit is on ambiguous source text.
 
 ## Multi-backend long-form comparison — 2026-05-26 (PLAN #114 P3 closeout)
 
@@ -1835,3 +2110,162 @@ clip turns out to be a streamed-path bug rather than a one-off.
 Before this thread canary truncated to ~460 chars on the 1.3 m
 De-Abwasch article and ~360 chars on EN FLEURS 60 s; after, full
 coverage (~1196 chars and ~735 chars respectively).
+
+## Parakeet long-form option matrix — 2026-05-26 (PLAN #114 follow-up)
+
+Empirical sweep across all the dispatch knobs the parakeet backend
+exposes, on the same three 60 s fixtures used elsewhere in this
+section. Default mode includes the `e1904a1e` per-model chunk default
+(v3 → c=30 internal, ja → c=8 internal).
+
+| Mode | v3 + EN 60s | v3 + DE 60s | v3 + JA 60s | ja + JA 60s |
+|---|---|---|---|---|
+| **default** (backend streamed, c=auto) | 520 | 679 | 605 | **1674** |
+| `CRISPASR_PARAKEET_STREAM_CHUNK=8` forced | 187 | 503 | 375 | **1674** |
+| `CRISPASR_PARAKEET_STREAM_CHUNK=30` forced | 520 | 679 | 605 | 508 |
+| `CRISPASR_PARAKEET_STREAM_THRESHOLD=999` (single-pass) | **626** | 621 | 599 | 271 |
+| `--vad --vad-model silero` | 368 | **709** | 637 | 1627 |
+| `--chunk-seconds 30 --chunk-overlap 0` (no LCS) | 713 | 689 | 608 | 1413 |
+| `--chunk-seconds 30 --chunk-overlap 3` (LCS) | **755** | 665 | **660** | **1942** |
+
+### Headline finding: dispatcher-side `--chunk-seconds 30 --chunk-overlap 3` wins on 3 of 4 cases — **shipped as the new default in `98381810`**
+
+The internal-streamed-path default that previously shipped was **not** the
+quality-optimal long-form mode. The CLI's dispatcher-side chunking +
+overlap-save context wrap + LCS-merge dedup recovers more content than
+the backend's single-pass-over-concat-encoder design.
+
+**Shipped as the new default 2026-05-26 (`98381810`)** by dropping
+`CAP_INTERNAL_CHUNKING` from the parakeet backend's capabilities
+declaration. The dispatcher's `should_auto_chunk_long` fallback then
+fires for audio > 30 s — chunking at 30 s, overlap-save 3 s, LCS-merge
+dedup — exactly the matrix's winning mode. Short audio (< 30 s) is
+unaffected: the dispatcher only auto-chunks past the threshold, so the
+11 s JFK case still routes through a single backend call.
+
+After-the-fix matrix (the previous matrix was with `CAP_INTERNAL_CHUNKING`
+declared, blocking the auto-chunk path):
+
+| case | old default | new default | Δ |
+|---|---|---|---|
+| JFK 11s | 109 | 109 | unchanged |
+| v3 + EN 60s | 520 | **755** | **+45 %** |
+| v3 + DE 60s | 679 | 665 | -2 % |
+| v3 + JA 60s | 605 | **660** | +9 % |
+| ja + JA 60s | 1674 | **1942** | **+16 %** |
+| v3 + EN 300s | 1550 | **3865** | **+150 %** |
+| v3 + DE 300s | 3064 | **3288** | +7 % |
+
+The longer the audio, the bigger the win — EN 300 s scales from +45 % at
+60 s to +150 % at 300 s. The internal-streamed-path's quality
+degradation compounds with audio length; the dispatcher chunks scale
+linearly.
+
+Wall time on M1 Metal: 300 s EN now takes ~86 s (was ~30 s) — 3.5×
+realtime. Acceptable for the quality gains; users can still pass
+`CRISPASR_PARAKEET_STREAM_THRESHOLD=99999` to force the older
+single-pass path if the wall-time matters more than coverage.
+
+### Headline finding: dispatcher-side `--chunk-seconds 30 --chunk-overlap 3` wins on 3 of 4 cases (original 4-trial sweep)
+
+Why this works: the dispatcher splits the 60 s input into ~30 s chunks
+with ±3 s acoustic overlap, calls the backend once per chunk (each
+call sees a 33 s window), and LCS-merges the boundary tokens. Inside
+each backend call, parakeet's internal streamed path now runs as a
+single 30 s encoder window (no further sub-chunking), which is
+exactly the encoder context size the v3 model was trained for. The
+backend's own "streamed over 60 s with c=30" instead splits the 60 s
+mel into two ~30 s chunks internally — but the per-chunk encoder
+passes don't see the bidirectional context across the cut as cleanly
+as the dispatcher's per-call boundaries do (the dispatcher feeds each
+chunk independently with its own mel-norm; the backend's streamed
+path applies global mel-norm first then splits).
+
+### When each mode wins
+
+| Audio profile | Recommended mode | Why |
+|---|---|---|
+| Continuous EN/DE long-form, supported v3 lang | `--chunk-seconds 30 --chunk-overlap 3` | Highest coverage; modest wallclock overhead (12 s for 60 s audio) |
+| JA model on JA long-form | `--chunk-seconds 30 --chunk-overlap 3` OR default | Both recover most content; LCS edges default by 16 % on the tested clip |
+| Short audio (< 30 s) | default | Single backend call, no dispatcher overhead |
+| Speech-with-long-silences | `--vad --vad-model silero` | VAD trims silences and feeds the backend with bounded slices; can outperform chunking when speech density is uneven |
+| Reference parity / debugging | `CRISPASR_PARAKEET_STREAM_THRESHOLD=999` | Forces `parakeet_transcribe_ex`, the bit-exact single-pass path |
+
+### Caveats
+
+- The dispatcher's chunk-overlap wrap is what `kBlocked` opts cohere /
+  gemma4-e2b / kyutai-stt etc. *out* of (LCS doesn't compose with
+  their internal-chunking pipelines). Parakeet is intentionally NOT
+  in `kBlocked` — the dispatcher's wrap and LCS dedup are correct for
+  TDT's frame-synchronous output.
+- The default did NOT change to `--chunk-seconds 30 --chunk-overlap 3`
+  because that would force a dispatcher change visible to every
+  caller (server API, Python session, …) without their request.
+  Users who want the +45 % EN coverage today pass the flags
+  explicitly; the option matrix above is the documentation.
+- Single-pass occasionally wins (v3 + EN 60s: 626 chars vs 520
+  internal-streamed default) — for clips that comfortably fit a single
+  encoder forward pass on the model's hardware, the streamed wrapper
+  is overhead. `CRISPASR_PARAKEET_STREAM_THRESHOLD=99999` makes
+  single-pass the default.
+
+### Reproduce
+
+```
+B=build/bin/crispasr
+V3=/Volumes/backups/ai/crispasr/parakeet-tdt-0.6b-v3-q4_k.gguf
+JA=/Volumes/backups/ai/crispasr/parakeet-tdt-0.6b-ja-q4_k.gguf
+EN60=/Volumes/backups/code/audio_samples/en/fleurs_60s.wav
+DE60=/Volumes/backups/code/audio_samples/de/fleurs_60s.wav
+JA60=/Volumes/backups/ai/long-clips/yt_60s.wav
+
+# default
+$B --backend parakeet -m $V3 -f $EN60 -np -nt
+# --chunk-seconds 30 --chunk-overlap 3
+$B --backend parakeet -m $V3 -f $EN60 -np -nt --chunk-seconds 30 --chunk-overlap 3
+# (etc)
+```
+
+### Coverage parity check vs cohere / canary on 300 s — 2026-05-26
+
+User direction: "are these after-numbers complete? compare to what
+other models deliver". Right — char-count delta vs the previous parakeet
+default proves we *improved*, but says nothing about *complete*. Real
+test: how does parakeet's new default compare against the best
+long-form-capable backends on the same audio.
+
+Ran parakeet (post-`98381810` default) vs cohere vs canary on the
+300 s FLEURS clips. Voxtral skipped — its mem-thrash failure mode on
+M1 with the 300 s clip is documented in
+[`feedback_torch_omp_deadlock`](../memory/feedback_torch_omp_deadlock.md);
+sat at 5 s CPU / 30 min wall and was killed.
+
+**EN FLEURS 300 s:**
+
+| Backend | chars | wall (s) | × RT | vs cohere |
+|---|---|---|---|---|
+| parakeet (default) | **3865** | 66 | 5.0× | -3 % |
+| cohere | 3994 | 94 | 3.2× | (ref) |
+| canary | 2971 | 74 | 4.1× | -26 % |
+
+**DE FLEURS 300 s:**
+
+| Backend | chars | wall (s) | × RT | vs cohere |
+|---|---|---|---|---|
+| parakeet (default) | **3288** | 69 | 4.3× | -0.3 % |
+| cohere | 3299 | 87 | 3.4× | (ref) |
+| canary | 3532 | 273 | 1.1× | +7 %, 3.1× slower |
+
+**Headline.** Parakeet's post-fix default is now within **3 % of cohere
+on EN 300 s and within 0.3 % on DE 300 s** at higher throughput
+(66 / 69 s wall vs cohere's 94 / 87 s). The numbers are complete in
+the same sense as cohere — coverage parity with the best long-form
+backend, at faster wallclock. The previous default (CAP_INTERNAL_CHUNKING
+set) was 60 % below cohere on EN 300 s; the fix closes that gap.
+
+Canary on DE wins on coverage (3532 chars) but pays 4× the wall time
+(273 s) — a different trade-off. For German-only workflows where wall
+time is bounded, canary's per-chunk AED decode produces slightly more
+content; for general use, parakeet's faster path with coverage-parity
+is the recommended default.
+

@@ -31,9 +31,23 @@ public:
         // (crispasr_run.cpp:`!has_native_lid`), so users wanting LID
         // get nothing. With the cap absent, `-dl` correctly routes
         // through the whisper-tiny pre-step.
+        //
+        // CAP_INTERNAL_CHUNKING intentionally NOT declared (2026-05-26,
+        // PLAN #114 follow-up). The backend's own
+        // `parakeet_transcribe_streamed` does handle long audio
+        // internally (chunked encode + concat + single TDT decode), but
+        // the empirical option matrix in PERFORMANCE.md shows that the
+        // dispatcher's chunk-30 + overlap-save + LCS-merge dedup path
+        // produces materially more content on long audio (v3+EN60:
+        // 520→755 chars +45 %; ja+JA60: 1674→1942 +16 %; v3+JA60:
+        // 605→660 +9 %). Without this flag the dispatcher's
+        // auto-chunk-at-30s fallback fires for audio > 30 s. Short audio
+        // (< 30 s) is unaffected — the dispatcher only auto-chunks past
+        // the threshold, so 11 s JFK still gets one backend call on the
+        // full audio.
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
-               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS | CAP_AUTO_DOWNLOAD |
-               CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;
+               CAP_PUNCTUATION_TOGGLE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS |
+               CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT;
     }
 
     bool init(const whisper_params& p) override {
@@ -48,6 +62,9 @@ public:
             fprintf(stderr, "crispasr[parakeet]: failed to load model '%s'\n", p.model.c_str());
             return false;
         }
+        // Issue #89: JA-only models (vocab=3072) collapse past ~12 s on
+        // real audio. Auto-chunk at 10 s instead of the global 30 s default.
+        is_ja_model_ = (parakeet_n_vocab(ctx_) <= 4096);
         // CTC decode mode (hybrid TDT+CTC models).
         if (p.parakeet_decoder == "ctc") {
             if (parakeet_has_ctc(ctx_)) {
@@ -84,6 +101,26 @@ public:
         // who toggles --temperature back off doesn't keep the previous
         // sampling state from a prior file.
         parakeet_set_temperature(ctx_, params.temperature, params.seed);
+        parakeet_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+
+        // MAES beam search (env: CRISPASR_PARAKEET_MAES=1, or --decode maes).
+        // Requires beam_size > 1. Configurable via env vars.
+        {
+            const char* maes_env = std::getenv("CRISPASR_PARAKEET_MAES");
+            bool use_maes = (maes_env && atoi(maes_env) > 0) || params.parakeet_decoder == "maes";
+            if (use_maes && params.beam_size > 1) {
+                int num_steps = 2;
+                float gamma = 2.3f;
+                int beta = 2;
+                if (const char* v = std::getenv("CRISPASR_MAES_NUM_STEPS"))
+                    num_steps = atoi(v);
+                if (const char* v = std::getenv("CRISPASR_MAES_GAMMA"))
+                    gamma = (float)atof(v);
+                if (const char* v = std::getenv("CRISPASR_MAES_BETA"))
+                    beta = atoi(v);
+                parakeet_set_maes(ctx_, true, num_steps, gamma, beta);
+            }
+        }
 
         // PLAN #98: CTC-WS hotword phrase boost
         if (!params.hotwords.empty()) {
@@ -196,6 +233,13 @@ public:
         return out;
     }
 
+    bool prefers_vad() const override {
+        // Issue #89: parakeet-ja's encoder degenerates on arbitrary chunks
+        // (repetition loops). VAD gives silence-bounded segments matching
+        // the ~10-15 s utterances the model was trained on.
+        return is_ja_model_;
+    }
+
     void shutdown() override {
         if (ctx_) {
             parakeet_free(ctx_);
@@ -205,6 +249,7 @@ public:
 
 private:
     parakeet_context* ctx_ = nullptr;
+    bool is_ja_model_ = false;
 };
 
 } // namespace

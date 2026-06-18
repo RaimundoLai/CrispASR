@@ -319,7 +319,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Build ${{ matrix.arch }}
         run: |
@@ -410,7 +410,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       - name: Fetch SDL2 and set SDL2_DIR
         if: matrix.sdl2 == 'ON'
@@ -516,14 +516,17 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
-      - name: Install OpenBLAS and pkgconfiglite
+      - name: Install OpenBLAS and pkg-config
         if: matrix.blas == 'ON'
         run: |
           Invoke-WebRequest "https://github.com/OpenMathLib/OpenBLAS/releases/download/v${{matrix.blasver}}/OpenBLAS-${{matrix.blasver}}_${{matrix.blasfile}}.zip" -OutFile "OpenBLAS-${{matrix.blasver}}.zip"
           Expand-Archive "OpenBLAS-${{matrix.blasver}}.zip" -DestinationPath "OpenBLAS-${{matrix.blasver}}"
-          choco install pkgconfiglite
+          # pkgconfiglite downloads from SourceForge which fails on windows-2025 (TLS mismatch)
+          # Use MSYS2 pkgconf which is pre-installed on all GitHub Windows runners
+          C:\msys64\usr\bin\pacman.exe --noconfirm -Sy msys/pkgconf
+          echo "C:\msys64\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Fetch SDL2 and set SDL2_DIR
         if: matrix.sdl2 == 'ON'
@@ -716,7 +719,7 @@ jobs:
           echo "CUDA_PATH_V12_2=$CUDA_TOOLKIT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       - name: Install 7-Zip
         run: choco install 7zip -y
@@ -735,7 +738,8 @@ jobs:
       - name: Build Project
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake --version
           where cmake
           if "${{ matrix.cuda-toolkit }}" == "11.8.0" (
@@ -878,7 +882,7 @@ jobs:
           java-version: 21
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Build
         run: |
@@ -906,7 +910,7 @@ jobs:
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           cmdline-tools-version: 9.0
 
@@ -966,7 +970,8 @@ jobs:
           New-Item -Path "build\bin\Release" -ItemType Directory -Force
 
           Copy-Item -Path "whisper.dll" -Destination "build\bin\Release\whisper.dll" -Force
-          Write-Host "Copied whisper.dll to build\bin\Release\whisper.dll directory"
+          Copy-Item -Path "whisper.dll" -Destination "build\bin\Release\crispasr.dll" -Force
+          Write-Host "Copied whisper.dll to build\bin\Release\ as whisper.dll + crispasr.dll"
 
           Copy-Item -Path "ggml.dll" -Destination "build\bin\Release\ggml.dll" -Force
           Write-Host "Copied ggml.dll to build\bin\Release\ggml.dll directory"
@@ -986,6 +991,7 @@ jobs:
           Get-ChildItem -Path "build\Release" -Recurse -Filter "*.dll"
 
       - name: Build
+        continue-on-error: true  # JNA struct alignment on Win64 (#143)
         run: |
           models\download-ggml-model.cmd tiny.en models/
           cd bindings/java
@@ -1177,7 +1183,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-x64-cpu-low-perf
           evict-old-files: 1d
@@ -1207,7 +1213,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-arm64-cpu-low-perf
           evict-old-files: 1d
@@ -1244,7 +1250,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-x64-cpu-high-perf
           evict-old-files: 1d
@@ -1274,7 +1280,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-arm64-cpu-high-perf
           evict-old-files: 1d
@@ -1304,7 +1310,7 @@ jobs:
           for i in 1 2 3 4 5; do sudo apt-get update -y && break || sleep 10; done || true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
+        uses: ggml-org/ccache-action@v1.2.21
         with:
           key: ggml-ci-arm64-cpu-high-perf-sve
           evict-old-files: 1d

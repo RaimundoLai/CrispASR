@@ -96,6 +96,7 @@ struct paraformer_context {
     core_gguf::WeightLoad wl;
     std::string model_path;
     ggml_backend_t backend = nullptr;
+    ggml_backend_sched_t sched = nullptr;
     int n_threads = 4;
     bool flash_attn = true;
     int verbosity = 0;
@@ -312,7 +313,7 @@ static std::vector<float> paraformer_compute_features(paraformer_context* ctx, c
 // ===========================================================================
 
 static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, int D,
-                        std::vector<float>& acoustic_embeds, int& N_tokens) {
+                        std::vector<float>& acoustic_embeds, int& N_tokens, std::vector<int>* fire_frames = nullptr) {
     // Conv1d(D, D, 3, padding=1) → ReLU → Linear(D, 1) → sigmoid
     // Then CIF accumulation loop.
 
@@ -388,6 +389,8 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
                 partial[d] += remainder * enc_out[(size_t)t * D + d];
             }
             fired.insert(fired.end(), partial.begin(), partial.end());
+            if (fire_frames)
+                fire_frames->push_back(t);
             // Start new token with leftover
             float leftover = accum - 1.0f;
             for (int d = 0; d < D; d++) {
@@ -403,6 +406,8 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
     // Tail handling: if remaining accum > threshold, fire one more
     if (accum > tail_threshold) {
         fired.insert(fired.end(), partial.begin(), partial.end());
+        if (fire_frames)
+            fire_frames->push_back(T - 1);
     }
 
     N_tokens = (int)(fired.size() / (size_t)D);
@@ -507,8 +512,17 @@ static ggml_tensor* build_decoder_post(ggml_context* ctx0, ggml_tensor* cur, con
 // Full inference
 // ===========================================================================
 
+static bool paraformer_ensure_sched(paraformer_context* ctx) {
+    if (ctx->sched)
+        return true;
+    ggml_backend_t backends[1] = {ctx->backend};
+    ctx->sched = ggml_backend_sched_new(backends, nullptr, 1, 8192, false, false);
+    return ctx->sched != nullptr;
+}
+
 static std::string paraformer_transcribe_impl(paraformer_context* ctx, const float* pcm, int n_samples,
-                                              std::vector<float>* staged_out = nullptr, const char* stage = nullptr) {
+                                              std::vector<float>* staged_out = nullptr, const char* stage = nullptr,
+                                              std::vector<int>* out_fire_frames = nullptr) {
     const auto& hp = ctx->model.hp;
     const int D = (int)hp.d_model;
 
@@ -583,15 +597,22 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     ggml_build_forward_expand(gf, cur);
 
     // Allocate and run encoder
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    ggml_gallocr_alloc_graph(alloc, gf);
+    if (!paraformer_ensure_sched(ctx)) {
+        ggml_free(ctx0);
+        return "";
+    }
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "paraformer: sched alloc encoder graph failed\n");
+        ggml_free(ctx0);
+        return "";
+    }
     {
         const size_t inp_bytes = ggml_nbytes(inp);
         const size_t lfr_bytes = lfr.size() * sizeof(float);
         if (lfr_bytes > inp_bytes) {
             fprintf(stderr, "paraformer: input tensor too small: %zu bytes vs %zu lfr bytes (T=%d, D=%d)\n", inp_bytes,
                     lfr_bytes, T_lfr, D_lfr_actual);
-            ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return "";
         }
@@ -599,16 +620,18 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
                 lfr_bytes);
         ggml_backend_tensor_set(inp, lfr.data(), 0, lfr_bytes);
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     fprintf(stderr, "paraformer: running encoder graph...\n");
-    ggml_backend_graph_compute(ctx->backend, gf);
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "paraformer: encoder graph compute failed\n");
+        ggml_free(ctx0);
+        return "";
+    }
     fprintf(stderr, "paraformer: encoder done\n");
 
     // Extract encoder output
     ggml_tensor* enc_result = ggml_graph_get_tensor(gf, "encoder_output");
     if (!enc_result) {
         fprintf(stderr, "paraformer: encoder_output tensor not found in graph\n");
-        ggml_gallocr_free(alloc);
         ggml_free(ctx0);
         return "";
     }
@@ -619,7 +642,6 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     if (enc_bytes < enc_expect) {
         fprintf(stderr, "paraformer: encoder_output size mismatch: got %zu, expected %zu (D=%d, T=%d)\n", enc_bytes,
                 enc_expect, D, T_lfr);
-        ggml_gallocr_free(alloc);
         ggml_free(ctx0);
         return "";
     }
@@ -632,13 +654,11 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         if (sn == "mel_features") {
             // lfr is the post-LFR feature vector (T_lfr, D_lfr=560) in row-major
             *staged_out = lfr;
-            ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return "";
         }
         if (sn == "encoder_output") {
             *staged_out = enc_out;
-            ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return "";
         }
@@ -648,13 +668,11 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
                 staged_out->resize(ggml_nelements(t));
                 ggml_backend_tensor_get(t, staged_out->data(), 0, ggml_nbytes(t));
             }
-            ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return "";
         }
     }
 
-    ggml_gallocr_free(alloc);
     ggml_free(ctx0);
 
     // 3. CIF predictor (CPU)
@@ -662,7 +680,10 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     // flat index t*D + d.  This IS row-major (T, D), so no transpose needed.
     std::vector<float> acoustic_embeds;
     int N_tokens = 0;
-    cif_predict(ctx, enc_out.data(), T_lfr, D, acoustic_embeds, N_tokens);
+    std::vector<int> fire_frames_vec;
+    cif_predict(ctx, enc_out.data(), T_lfr, D, acoustic_embeds, N_tokens, out_fire_frames ? &fire_frames_vec : nullptr);
+    if (out_fire_frames)
+        *out_fire_frames = std::move(fire_frames_vec);
 
     fprintf(stderr, "paraformer: CIF predicted %d tokens from T_lfr=%d\n", N_tokens, T_lfr);
     if (N_tokens <= 0)
@@ -718,16 +739,23 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     ggml_build_forward_expand(gf, cur);
 
     // Allocate and run decoder
-    alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    ggml_gallocr_alloc_graph(alloc, gf);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "paraformer: sched alloc decoder graph failed\n");
+        ggml_free(ctx0);
+        return "";
+    }
 
     // Set decoder inputs: acoustic_embeds from CIF is row-major (N, D).
     // ggml tensor ne=(D, N) stores element (d,n) at flat index n*D+d, which
     // is the same layout. No transposition needed.
     ggml_backend_tensor_set(dec_inp, acoustic_embeds.data(), 0, (size_t)D * N_tokens * sizeof(float));
     ggml_backend_tensor_set(enc_tensor, enc_out.data(), 0, enc_out.size() * sizeof(float));
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
-    ggml_backend_graph_compute(ctx->backend, gf);
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "paraformer: decoder graph compute failed\n");
+        ggml_free(ctx0);
+        return "";
+    }
 
     // Stage capture from decoder graph
     if (stage && staged_out) {
@@ -738,7 +766,6 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
                 staged_out->resize(ggml_nelements(t));
                 ggml_backend_tensor_get(t, staged_out->data(), 0, ggml_nbytes(t));
             }
-            ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return "";
         }
@@ -791,7 +818,6 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         }
     }
 
-    ggml_gallocr_free(alloc);
     ggml_free(ctx0);
 
     return result;
@@ -855,6 +881,8 @@ paraformer_context* paraformer_init_from_file(const char* path, paraformer_conte
 void paraformer_free(paraformer_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
     core_gguf::free_weights(ctx->wl);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
@@ -871,6 +899,44 @@ char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n
         buf[s.size()] = '\0';
     }
     return buf;
+}
+
+paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx, const float* samples, int n_samples) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::vector<int> fire_frames;
+    std::string s = paraformer_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, &fire_frames);
+
+    auto* r = (paraformer_result*)std::malloc(sizeof(paraformer_result));
+    if (!r)
+        return nullptr;
+    r->text = (char*)std::malloc(s.size() + 1);
+    if (r->text) {
+        std::memcpy(r->text, s.data(), s.size());
+        r->text[s.size()] = '\0';
+    }
+
+    // Convert fire frame indices to centiseconds.
+    // LFR (low frame rate) subsampling: each LFR frame covers `lfr_m` raw
+    // mel frames. Raw mel frames are 10ms apart (hop=160 at 16kHz).
+    // So frame t in the encoder corresponds to t * lfr_m * 10ms.
+    const int lfr_m = (int)ctx->model.hp.lfr_m;
+    const int ms_per_frame = lfr_m * 10;
+    r->n_chars = (int)fire_frames.size();
+    r->char_times_cs = (int32_t*)std::malloc(fire_frames.size() * sizeof(int32_t));
+    if (r->char_times_cs) {
+        for (int i = 0; i < r->n_chars; i++)
+            r->char_times_cs[i] = fire_frames[i] * ms_per_frame / 10; // ms → cs
+    }
+    return r;
+}
+
+void paraformer_result_free(paraformer_result* r) {
+    if (!r)
+        return;
+    std::free(r->text);
+    std::free(r->char_times_cs);
+    std::free(r);
 }
 
 float* paraformer_extract_stage(paraformer_context* ctx, const float* samples, int n_samples, const char* stage_name,

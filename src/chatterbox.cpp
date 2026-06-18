@@ -742,6 +742,7 @@ struct chatterbox_context {
     cb_ve_model ve;
     cb_tokenizer tokenizer;
     cb_precomputed_conds conds;
+    std::string language; // multilingual: "[de]", "[fr]", etc. Empty = English
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -811,6 +812,17 @@ struct chatterbox_context {
             ggml_backend_free(backend_cpu);
     }
 };
+
+static void prepend_language_token(chatterbox_context* ctx, std::vector<int32_t>& text_tokens) {
+    if (!ctx || ctx->language.empty() || text_tokens.empty()) {
+        return;
+    }
+    const auto it = ctx->tokenizer.token_to_id.find(ctx->language);
+    if (it == ctx->tokenizer.token_to_id.end()) {
+        return;
+    }
+    text_tokens.insert(text_tokens.begin(), it->second);
+}
 
 namespace {
 
@@ -2524,6 +2536,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
 
     // 1. Normalize and tokenize text
     std::string norm_text = punc_norm(text);
+
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.has_bpe) {
         text_tokens = ctx->tokenizer.bpe_byte_level ? tokenize_text_bpe(ctx->tokenizer, norm_text)
@@ -2531,6 +2544,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     } else {
         text_tokens = tokenize_text(ctx->tokenizer, norm_text);
     }
+    prepend_language_token(ctx, text_tokens);
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: text \"%s\" → %zu %s tokens\n", norm_text.c_str(), text_tokens.size(),
@@ -2891,6 +2905,15 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
         se_buf.resize(192);
         ggml_backend_tensor_get(ctx->conds.gen_embedding, se_buf.data(), 0, 192 * sizeof(float));
         spk_emb = se_buf.data();
+    }
+
+    if (!prompt_tokens && !spk_emb) {
+        const bool is_gpt2 = (ctx->hp.arch == "chatterbox_turbo" || ctx->hp.arch == "kartoffelbox");
+        if (is_gpt2) {
+            fprintf(stderr, "chatterbox-turbo: WARNING — no voice conditioning loaded. "
+                            "Audio will be unconditioned (noisy/quiet). Use --voice ref.wav or "
+                            "ensure the T3 GGUF includes baked conds.pt tensors.\n");
+        }
     }
 
     float* pcm =
@@ -3663,6 +3686,24 @@ extern "C" void chatterbox_set_seed(struct chatterbox_context* ctx, uint32_t see
         chatterbox_s3gen_set_seed(ctx->s3gen_ctx, seed);
 }
 
+extern "C" void chatterbox_set_language(struct chatterbox_context* ctx, const char* lang) {
+    if (!ctx)
+        return;
+    if (!lang || !*lang) {
+        ctx->language.clear();
+        return;
+    }
+    // Validate: check the tokenizer vocab for [lang] token
+    std::string tag = std::string("[") + lang + "]";
+    if (ctx->tokenizer.token_to_id.find(tag) == ctx->tokenizer.token_to_id.end()) {
+        fprintf(stderr,
+                "chatterbox: warning: language token '%s' not in vocab — "
+                "generation may not work as expected\n",
+                tag.c_str());
+    }
+    ctx->language = tag;
+}
+
 extern "C" void chatterbox_tokens_free(int32_t* tokens) {
     free(tokens);
 }
@@ -3830,6 +3871,7 @@ extern "C" float* chatterbox_dump_t3_prefill_emb(struct chatterbox_context* ctx,
     } else {
         text_tokens = tokenize_text(ctx->tokenizer, norm_text);
     }
+    prepend_language_token(ctx, text_tokens);
     text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
     text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
 
@@ -3881,6 +3923,7 @@ extern "C" int chatterbox_dump_t3_next_logits(struct chatterbox_context* ctx, co
     } else {
         text_tokens = tokenize_text(ctx->tokenizer, norm_text);
     }
+    prepend_language_token(ctx, text_tokens);
     text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
     text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
 
