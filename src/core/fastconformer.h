@@ -824,7 +824,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     ggml_tensor* inpL = cur;
 
     // ---- FFN1 (macaron half) ----
-    ggml_tensor* x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_ff1_w), e.norm_ff1_b);
+    ggml_tensor* x = ggml_norm_affine(ctx0, cur, e.norm_ff1_w, e.norm_ff1_b, eps);
     x = mm_bias(e.ff1_l1_w, x, e.ff1_l1_b);
     x = ggml_silu(ctx0, x);
     x = mm_bias(e.ff1_l2_w, x, e.ff1_l2_b);
@@ -833,7 +833,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     ggml_tensor* inpAttn = cur;
 
     // ---- Self-Attention (rel_pos with untied biases) ----
-    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_attn_w), e.norm_attn_b);
+    x = ggml_norm_affine(ctx0, cur, e.norm_attn_w, e.norm_attn_b, eps);
 
     // Q/K/V projections — fused single matmul + view-split when the load-time
     // concat is available (bit-identical: each output row is the same dot
@@ -955,7 +955,7 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
 
     // ---- Conformer convolution module ----
     ggml_tensor* inpConv = cur;
-    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_conv_w), e.norm_conv_b);
+    x = ggml_norm_affine(ctx0, cur, e.norm_conv_w, e.norm_conv_b, eps);
 
     // pw1: (d → 2d), then sigmoid GLU — fused into one op, avoids strided-view
     // CUDA fallback that plagued the manual sigmoid path (see issue #81 PR #05).
@@ -994,14 +994,14 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
 
     // ---- FFN2 (macaron half) ----
     ggml_tensor* inpFF2 = cur;
-    x = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_ff2_w), e.norm_ff2_b);
+    x = ggml_norm_affine(ctx0, cur, e.norm_ff2_w, e.norm_ff2_b, eps);
     x = mm_bias(e.ff2_l1_w, x, e.ff2_l1_b);
     x = ggml_silu(ctx0, x);
     x = mm_bias(e.ff2_l2_w, x, e.ff2_l2_b);
     cur = ggml_add(ctx0, inpFF2, ggml_scale(ctx0, x, 0.5f));
 
     // ---- Block final LN ----
-    cur = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, cur, eps), e.norm_out_w), e.norm_out_b);
+    cur = ggml_norm_affine(ctx0, cur, e.norm_out_w, e.norm_out_b, eps);
 
     // Re-zero pad columns at the block boundary (bucketed path): pad garbage
     // otherwise grows across blocks until 0-weight × huge-value artifacts
