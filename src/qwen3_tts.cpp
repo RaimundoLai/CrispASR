@@ -5667,6 +5667,50 @@ extern "C" int qwen3_tts_set_language(struct qwen3_tts_context* ctx, int codec_l
     return 0;
 }
 
+extern "C" int qwen3_tts_set_language_by_name(struct qwen3_tts_context* ctx, const char* name) {
+    if (!ctx || !name) {
+        return -1;
+    }
+    std::string want = name;
+    std::transform(want.begin(), want.end(), want.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    if (want.empty() || want == "auto") {
+        ctx->language_id = -1;
+        return 0;
+    }
+
+    if (want == "zh") want = "chinese";
+    else if (want == "en") want = "english";
+    else if (want == "ja") want = "japanese";
+    else if (want == "ko") want = "korean";
+    else if (want == "de") want = "german";
+    else if (want == "fr") want = "french";
+    else if (want == "ru") want = "russian";
+    else if (want == "pt") want = "portuguese";
+    else if (want == "es") want = "spanish";
+    else if (want == "it") want = "italian";
+
+    static const struct { const char* name; int id; } std_langs[] = {
+        { "chinese", 2038 },
+        { "english", 2039 },
+        { "japanese", 2040 },
+        { "korean", 2041 },
+        { "german", 2042 },
+        { "french", 2043 },
+        { "russian", 2044 },
+        { "portuguese", 2045 },
+        { "spanish", 2046 },
+        { "italian", 2047 },
+    };
+
+    for (const auto& l : std_langs) {
+        if (want == l.name) {
+            ctx->language_id = l.id;
+            return 0;
+        }
+    }
+    return -3;
+}
+
 extern "C" int qwen3_tts_is_custom_voice(struct qwen3_tts_context* ctx) {
     return (ctx && ctx->hp.tts_model_type == "custom_voice") ? 1 : 0;
 }
