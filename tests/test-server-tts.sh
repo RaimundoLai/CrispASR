@@ -462,29 +462,160 @@ else
     FAILED_NAMES="$FAILED_NAMES\n    - clone consent gate"
 fi
 
-# spoken_disclaimer=false should be accepted (JSON boolean field).
-# The server should log spoken_disclaimer=no in the CONSENT line.
-code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+# spoken_disclaimer=false WITH marking_attestation → opt-out honoured:
+# accepted, logged as no_spoken_disclaimer=yes, disclaimer skipped.
+hdrs=$(curl -s -o /dev/null -D - -X POST \
     -H 'Content-Type: application/json' \
-    -d '{"input":"disclaimer opt-out","voice":"clone.wav","consent_attestation":"I have consent","spoken_disclaimer":false}' \
+    -d '{"input":"disclaimer opt-out","voice":"clone.wav","consent_attestation":"I have consent","spoken_disclaimer":false,"marking_attestation":"I will disclose this is AI-generated"}' \
     "http://127.0.0.1:$PORT/v1/audio/speech")
+code=$(printf '%s' "$hdrs" | head -1 | awk '{print $2}')
 if [ "$code" != "400" ]; then
-    echo "  ✓ spoken_disclaimer=false accepted (HTTP $code)"
+    echo "  ✓ attested spoken_disclaimer=false accepted (HTTP $code)"
     PASS=$((PASS + 1))
 else
-    echo "  ✗ spoken_disclaimer=false rejected as 400"
+    echo "  ✗ attested spoken_disclaimer=false rejected as 400"
     FAIL=$((FAIL + 1))
-    FAILED_NAMES="$FAILED_NAMES\n    - spoken_disclaimer opt-out"
+    FAILED_NAMES="$FAILED_NAMES\n    - attested spoken_disclaimer opt-out"
+fi
+# Headers only exist on a 200 (synthesis may 500 on CustomVoice, which
+# cannot clone from a .wav) — the audit log below is the load-bearing check.
+if [ "$code" = "200" ]; then
+    assert_contains "attested opt-out → X-Crispasr-Spoken-Disclaimer: skipped" \
+        "X-Crispasr-Spoken-Disclaimer: skipped" "$hdrs"
 fi
 
-# Verify the audit log records spoken_disclaimer=no
-if grep -q 'spoken_disclaimer=no' "$SERVER_LOG"; then
-    echo "  ✓ audit log records spoken_disclaimer=no"
+# Verify the audit log records the honoured opt-out
+if grep -q 'spoken_disclaimer=no' "$SERVER_LOG" && grep -q 'no_spoken_disclaimer=yes' "$SERVER_LOG"; then
+    echo "  ✓ audit log records the attested opt-out"
     PASS=$((PASS + 1))
 else
-    echo "  ✗ audit log missing spoken_disclaimer=no"
+    echo "  ✗ audit log missing the attested opt-out"
     FAIL=$((FAIL + 1))
     FAILED_NAMES="$FAILED_NAMES\n    - audit log spoken_disclaimer"
+fi
+
+# #312: spoken_disclaimer=false WITHOUT marking_attestation → the OPT-OUT is
+# denied, not the request. Must never 400 (that broke every Subtitle Edit build
+# up to v5.1.0-rc16), and the response must say the disclaimer was applied.
+hdrs=$(curl -s -o /dev/null -D - -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"unattested opt-out","voice":"clone.wav","consent_attestation":"I have consent","spoken_disclaimer":false}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+code=$(printf '%s' "$hdrs" | head -1 | awk '{print $2}')
+if [ "$code" != "400" ]; then
+    echo "  ✓ unattested spoken_disclaimer=false not refused (HTTP $code)"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ unattested spoken_disclaimer=false refused with 400 (#312 regression)"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - #312 unattested opt-out refused"
+fi
+if [ "$code" = "200" ]; then
+    assert_contains "unattested opt-out → X-Crispasr-Spoken-Disclaimer: applied" \
+        "X-Crispasr-Spoken-Disclaimer: applied" "$hdrs"
+    assert_contains "unattested opt-out → X-Crispasr-Marking-Warning" \
+        "X-Crispasr-Marking-Warning" "$hdrs"
+fi
+
+# The denial must be in the audit log, and the CONSENT line must record the
+# EFFECTIVE state (disclaimer applied), not what was asked for.
+if grep -q 'no_spoken_disclaimer=DENIED' "$SERVER_LOG"; then
+    echo "  ✓ audit log records the denied opt-out"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ audit log missing no_spoken_disclaimer=DENIED"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - audit log marking denial"
+fi
+
+# ─────────────────────── streaming synthesis (PR #177) ───────────────────
+echo
+echo "=== POST /v1/audio/speech?stream — per-chunk PCM (CAP_STREAMING) ==="
+
+# stream=true with a PCM format → 200, raw int16 (no RIFF), non-trivial,
+# int16-aligned. qwen3-tts has CAP_STREAMING so this exercises the true
+# per-chunk path (worker thread + chunked provider); other backends fall
+# back to whole-clip but still stream the bytes.
+TMPSTREAM=$(mktemp -t crispasr-stream.XXXXXX.pcm)
+code=$(curl -s -N -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"Streaming first audio test. This is the second sentence.","response_format":"pcm","stream":true}' \
+    -o "$TMPSTREAM" -w "%{http_code}" \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+assert "stream=true pcm → 200" "200" "$code"
+if [ -s "$TMPSTREAM" ]; then
+    SIZE=$(wc -c < "$TMPSTREAM" | tr -d ' ')
+    head4=$(dd if="$TMPSTREAM" bs=4 count=1 2>/dev/null)
+    if [ "$head4" != "RIFF" ]; then
+        echo "  ✓ streamed pcm has no RIFF header (raw int16, $SIZE bytes)"
+        PASS=$((PASS + 1))
+    else
+        echo "  ✗ streamed pcm unexpectedly starts with RIFF"
+        FAIL=$((FAIL + 1))
+    fi
+    if [ "$SIZE" -gt 1000 ] && [ $((SIZE % 2)) -eq 0 ]; then
+        echo "  ✓ streamed pcm is non-trivial and int16-aligned ($SIZE bytes)"
+        PASS=$((PASS + 1))
+    else
+        echo "  ✗ streamed pcm too small or misaligned ($SIZE bytes)"
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES="$FAILED_NAMES\n    - streamed pcm size/alignment"
+    fi
+else
+    echo "  ✗ streamed pcm response body empty"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - streamed pcm body present"
+fi
+rm -f "$TMPSTREAM"
+
+# stream=true with wav format → 200 (wav is a PCM format; streaming wraps it).
+code=$(curl -s -N -o /dev/null -w "%{http_code}" -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"stream wav","response_format":"wav","stream":true}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+assert "stream=true wav → 200" "200" "$code"
+
+# stream=true with mp3 → 400 (compressed formats need whole-file encoding).
+out=$(curl -s -N -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"stream mp3","response_format":"mp3","stream":true}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+assert_contains "stream=true mp3 → rejected (use pcm/wav/f32)" "stream=false" "$out"
+
+# The server log should show the streaming-synthesis-finished marker for at
+# least one of the streamed requests above.
+if grep -q 'streaming synthesis finished' "$SERVER_LOG"; then
+    echo "  ✓ server log records streaming-synthesis-finished"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ server log missing streaming-synthesis marker"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - streaming-synthesis log marker"
+fi
+
+# Stream vs whole-clip equivalence: with a fixed seed the talker generates the
+# same codes either way, so the streaming windowed decode must cover exactly the
+# same frames as the whole-clip decode → identical total sample count. (The
+# per-window seam differs by <2% in amplitude but never in length.) This is the
+# regression guard that streaming stays a windowing of the same synthesis, not a
+# diverging path.
+SEQ_INPUT='{"input":"Stream equals whole clip equivalence check sentence.","response_format":"pcm","seed":4242'
+TMPNS=$(mktemp -t crispasr-ns.XXXXXX.pcm)
+TMPST=$(mktemp -t crispasr-st.XXXXXX.pcm)
+curl -s -X POST -H 'Content-Type: application/json' \
+    -d "$SEQ_INPUT}" -o "$TMPNS" "http://127.0.0.1:$PORT/v1/audio/speech" >/dev/null
+curl -s -N -X POST -H 'Content-Type: application/json' \
+    -d "$SEQ_INPUT, \"stream\":true}" -o "$TMPST" "http://127.0.0.1:$PORT/v1/audio/speech" >/dev/null
+NS_SZ=$(wc -c < "$TMPNS" | tr -d ' ')
+ST_SZ=$(wc -c < "$TMPST" | tr -d ' ')
+rm -f "$TMPNS" "$TMPST"
+if [ "$NS_SZ" -gt 1000 ] && [ "$NS_SZ" = "$ST_SZ" ]; then
+    echo "  ✓ same-seed stream == whole-clip total samples ($NS_SZ bytes)"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ stream/whole-clip sample count differs: non-stream=$NS_SZ stream=$ST_SZ"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - stream==whole-clip sample count"
 fi
 
 # ─────────────────────────── 401 path ────────────────────────────────────

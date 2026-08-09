@@ -9,7 +9,7 @@
 #pragma once
 
 #include "audioseal.h"
-#include "crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +23,51 @@ namespace crispasr_wm_dispatch {
 inline audioseal_ctx*& get_ctx() {
     static audioseal_ctx* ctx = nullptr;
     return ctx;
+}
+
+// Operator opt-out flag, set once at startup from the --no-watermark CLI flag.
+// The CRISPASR_NO_WATERMARK env var is an equivalent opt-out (both are honored;
+// neither is more "official" than the other). Either path disables watermark
+// embedding for the process.
+inline bool& disabled_flag() {
+    static bool disabled = false;
+    return disabled;
+}
+
+// Set from the --no-watermark CLI flag at startup.
+inline void set_disabled(bool value) {
+    disabled_flag() = value;
+}
+
+// Watertight override. When set, is_disabled() always returns false — even
+// against --no-watermark / CRISPASR_NO_WATERMARK. The CLI sets this for outputs
+// that cannot carry a C2PA manifest (raw ADTS .aac / Ogg .opus, and the raw PCM
+// --tts-stream), where the audio watermark is the ONLY robust machine-readable
+// AI mark. This guarantees no CLI path can ever emit a fully unmarked AI file:
+// the watermark opt-out is honored only when C2PA still marks the output.
+inline bool& forced_flag() {
+    static bool forced = false;
+    return forced;
+}
+
+// Force watermarking on for this process regardless of the opt-out.
+inline void set_forced(bool value) {
+    forced_flag() = value;
+}
+
+// True if watermarking has been turned off via the CLI flag or the env var,
+// UNLESS a watertight override forces it on.
+//
+// `force` is the per-call equivalent of set_forced(), for callers that decide
+// per output rather than per process. The server needs that: its response
+// format is chosen per request, so which outputs can carry a C2PA manifest —
+// and therefore which ones the watermark is the ONLY mark on — varies request
+// to request, and mutating the process-global flag would race across
+// --server-workers threads.
+inline bool is_disabled(bool force = false) {
+    if (force || forced_flag())
+        return false;
+    return disabled_flag() || std::getenv("CRISPASR_NO_WATERMARK") != nullptr;
 }
 
 // Initialize AudioSeal from GGUF path. Call once at startup.
@@ -54,10 +99,28 @@ inline void shutdown() {
 // Embed watermark into float32 PCM. Modifies in-place.
 // If AudioSeal is loaded, resamples to 16kHz if needed, embeds, and
 // resamples back. Otherwise uses spread-spectrum.
-// Set CRISPASR_NO_WATERMARK=1 to disable (debug only).
-inline void embed(float* pcm, int n_samples, int sample_rate = 24000) {
-    if (std::getenv("CRISPASR_NO_WATERMARK")) {
-        return; // debug: skip watermarking entirely
+//
+// Watermarking is on by default. It can be turned off with the --no-watermark
+// CLI flag or the CRISPASR_NO_WATERMARK env var (equivalent opt-outs). Either
+// way we log a one-time warning: disabling the mark shifts the AI-content
+// disclosure/marking duty onto the operator (see docs/issue-260/PLAN.md for the
+// regulatory background, incl. EU AI Act Art. 50, which we intentionally do NOT
+// name at runtime — the obligation is jurisdiction-specific and the operator,
+// not this binary, is the party bound by it).
+//
+// Pass force=true when this particular output cannot carry a C2PA manifest, so
+// stripping the watermark would leave it with no machine-readable AI mark at
+// all. That is the watertight floor; see crispasr_enforce_cli_watermark_floor()
+// for the CLI's process-wide equivalent.
+inline void embed(float* pcm, int n_samples, int sample_rate = 24000, bool force = false) {
+    if (is_disabled(force)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "crispasr: warning: watermarking disabled. "
+                            "AI usage marking responsibility rests with the operator.\n");
+        }
+        return; // opt-out honored; warning emitted once per process
     }
     if (get_ctx()) {
         // AudioSeal operates at 16 kHz. If audio is at a different rate,
@@ -143,8 +206,9 @@ inline float detect(const float* pcm, int n_samples, int sample_rate = 24000) {
         if (probs)
             std::free(probs);
     }
-    // Fallback: spread-spectrum
-    return crispasr_watermark_detect_impl(pcm, n_samples);
+    // Fallback: spread-spectrum. Goes through the selector so this surface and
+    // the session C-ABI cannot end up on different statistics.
+    return crispasr_watermark_detect_select(pcm, n_samples);
 }
 
 } // namespace crispasr_wm_dispatch

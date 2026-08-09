@@ -23,6 +23,11 @@ pub struct WhisperContextParams(c_void);
 pub const CRISPASR_SAMPLING_GREEDY: c_int = 0;
 pub const CRISPASR_SAMPLING_BEAM_SEARCH: c_int = 1;
 
+/// Progress callback for long-form (chunked) transcription (issue #208).
+/// `Option<...>` so a null pointer clears the callback (C `NULL`).
+pub type CrispasrProgressCallback =
+    Option<unsafe extern "C" fn(processed: c_int, total: c_int, user_data: *mut c_void)>;
+
 extern "C" {
     // --- Lifecycle ---
     pub fn whisper_init_from_file_with_params(
@@ -149,8 +154,14 @@ pub struct CrispasrDiarizeSegAbi {
 }
 
 /// ABI options for [`crispasr_diarize_segments_abi`]. `method` is a
-/// value in 0..3: 0 = Energy, 1 = Xcorr, 2 = VadTurns, 3 = Pyannote.
-/// `pyannote_model_path` is required for Pyannote, ignored otherwise.
+/// value in 0..4: 0 = Energy, 1 = Xcorr, 2 = VadTurns, 3 = Pyannote,
+/// 4 = FoxNose. `pyannote_model_path` is required for Pyannote,
+/// `foxnose_embedder_path` for FoxNose; each is ignored otherwise.
+///
+/// This layout is hand-maintained and MUST match
+/// `crispasr_diarize_opts_abi` in `src/crispasr_c_api.cpp`, which is
+/// APPEND-ONLY: the C side reads every field unconditionally, so a
+/// short struct here is an out-of-bounds read even for methods 0..3.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct CrispasrDiarizeOptsAbi {
@@ -158,6 +169,15 @@ pub struct CrispasrDiarizeOptsAbi {
     pub n_threads: c_int,
     pub slice_t0_cs: i64,
     pub pyannote_model_path: *const c_char,
+    // #324 FoxNose (method 4). Ignored by the other methods.
+    pub foxnose_embedder_path: *const c_char,
+    /// 0 -> 1
+    pub min_speakers: c_int,
+    /// 0 -> 8
+    pub max_speakers: c_int,
+    /// >0 pins the speaker count and skips estimation
+    pub num_speakers: c_int,
+    pub _pad2: c_int,
 }
 
 extern "C" {
@@ -173,6 +193,24 @@ extern "C" {
     ) -> *mut CrispasrSession;
 
     pub fn crispasr_session_backend(s: *mut CrispasrSession) -> *const c_char;
+
+    // CTC vocabulary access (Omni CTC backend). `n_vocab` is the number of
+    // SentencePiece pieces (0 for backends without an exposed CTC vocab);
+    // `token_text` maps an id in `[0, n_vocab)` to its raw piece (U+2581 marker
+    // intact), or "" when out of range / unsupported. Pairs with the result
+    // logits accessor to detokenize a greedy CTC decode.
+    pub fn crispasr_session_n_vocab(s: *mut CrispasrSession) -> c_int;
+    pub fn crispasr_session_token_text(s: *mut CrispasrSession, id: c_int) -> *const c_char;
+
+    // Acoustic language detected by the last transcribe, written into `out_buf`
+    // as an ISO-639-1 code (whisper only; other backends fall back to the
+    // source-language hint, then "unknown"). Returns the code length in bytes
+    // (not counting NUL) or -1 on bad args. Distinct from the text-LID pass.
+    pub fn crispasr_session_detected_language(
+        s: *mut CrispasrSession,
+        out_buf: *mut c_char,
+        out_cap: c_int,
+    ) -> c_int;
 
     /// Write a comma-separated list of backend names the loaded dylib
     /// was built with. Returns the number of bytes written (not counting
@@ -196,6 +234,44 @@ extern "C" {
         n_samples: c_int,
         language: *const c_char,
     ) -> *mut CrispasrSessionResult;
+
+    /// 0.8.7+: chunked-encode transcribe (issue #208). Forces the
+    /// Parakeet backend through its bounded long-form path (overlapping
+    /// short-window transcribe-and-merge for non-JA models, streamed
+    /// encoder for the JA-only model) regardless of audio length, so long
+    /// files transcribe in bounded time AND recover the sections a single
+    /// full-length pass drops. `chunk_seconds <= 0` keeps the per-model
+    /// defaults; otherwise it sets the non-JA window length / the JA
+    /// streamed window. `overlap_seconds < 0` uses the default. For
+    /// non-Parakeet backends the chunk params are inert and this matches
+    /// `crispasr_session_transcribe_lang`.
+    pub fn crispasr_session_transcribe_chunked_lang(
+        s: *mut CrispasrSession,
+        pcm: *const c_float,
+        n_samples: c_int,
+        chunk_seconds: c_int,
+        overlap_seconds: c_int,
+        language: *const c_char,
+    ) -> *mut CrispasrSessionResult;
+
+    pub fn crispasr_session_transcribe_chunked(
+        s: *mut CrispasrSession,
+        pcm: *const c_float,
+        n_samples: c_int,
+        chunk_seconds: c_int,
+        overlap_seconds: c_int,
+    ) -> *mut CrispasrSessionResult;
+
+    /// 0.10.3+ (issue #208): register a per-session progress callback for
+    /// long-form (chunked) transcription. Fired once per finished window
+    /// with `(processed_samples, total_samples, user_data)`; `processed`
+    /// is monotonic and reaches `total` on the last window. Invoked on the
+    /// transcribe thread. Pass `None`/null `cb` to clear.
+    pub fn crispasr_session_set_progress_callback(
+        s: *mut CrispasrSession,
+        cb: CrispasrProgressCallback,
+        user_data: *mut c_void,
+    );
 
     /// VAD-driven session transcribe. Runs Silero VAD on the PCM buffer,
     /// merges short / overlong speech slices, stitches them into one
@@ -313,6 +389,30 @@ extern "C" {
     /// Shared known-model registry lookup by filename (exact then fuzzy).
     pub fn crispasr_registry_list_backends_abi(out_csv: *mut c_char, out_cap: c_int) -> c_int;
 
+    /// Describe the exact canonical artifact bundle downloaded by `-m auto`.
+    /// Returns its artifact count, 0 on miss, or a negative argument/buffer error.
+    pub fn crispasr_registry_default_bundle_info_abi(
+        backend: *const c_char,
+        out_backend: *mut c_char,
+        backend_cap: c_int,
+        out_license: *mut c_char,
+        license_cap: c_int,
+        out_requires_acceptance: *mut c_int,
+    ) -> c_int;
+
+    /// Read one default-bundle artifact by index. 0 = success.
+    pub fn crispasr_registry_default_bundle_artifact_abi(
+        backend: *const c_char,
+        index: c_int,
+        out_kind: *mut c_int,
+        out_filename: *mut c_char,
+        filename_cap: c_int,
+        out_url: *mut c_char,
+        url_cap: c_int,
+        out_size: *mut c_char,
+        size_cap: c_int,
+    ) -> c_int;
+
     // --- Streaming (PLAN #62) — rolling-window decoder for whisper today ---
     pub fn crispasr_session_stream_open(
         s: *mut CrispasrSession,
@@ -394,6 +494,20 @@ extern "C" {
         i_seg: c_int,
         i_word: c_int,
     ) -> f32;
+    // Whisper's per-segment no-speech probability (the <|nospeech|> token
+    // posterior) in [0, 1]. Only the whisper backend populates it; other
+    // backends and out-of-range indices return the -1.0 sentinel ("no data").
+    pub fn crispasr_session_result_segment_no_speech_prob(
+        r: *mut CrispasrSessionResult,
+        i_seg: c_int,
+    ) -> f32;
+
+    // Raw per-frame CTC logits (Omni CTC backend, opted in via
+    // `crispasr_session_set_return_logits`). Frame-major, pre-softmax:
+    // `logits[t * n_logit_vocab + v]`; the pointer is NULL when none captured.
+    pub fn crispasr_session_result_n_logit_frames(r: *mut CrispasrSessionResult) -> c_int;
+    pub fn crispasr_session_result_n_logit_vocab(r: *mut CrispasrSessionResult) -> c_int;
+    pub fn crispasr_session_result_logits(r: *mut CrispasrSessionResult) -> *const c_float;
 
     pub fn crispasr_session_result_free(r: *mut CrispasrSessionResult);
     pub fn crispasr_session_close(s: *mut CrispasrSession);
@@ -412,6 +526,12 @@ extern "C" {
     // qwen3-tts VoiceDesign: natural-language voice description.
     pub fn crispasr_session_set_instruct(s: *mut CrispasrSession, instruct: *const c_char)
         -> c_int;
+    // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears.
+    // -2 = the active backend has no phonemes-in call (kokoro and piper do).
+    pub fn crispasr_session_set_tts_phonemes(
+        s: *mut CrispasrSession,
+        phonemes: *const c_char,
+    ) -> c_int;
     // qwen3-tts variant detection (returns 0/1; 0 also covers "not qwen3-tts").
     pub fn crispasr_session_is_custom_voice(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_session_is_voice_design(s: *mut CrispasrSession) -> c_int;
@@ -420,7 +540,59 @@ extern "C" {
         text: *const c_char,
         out_n_samples: *mut c_int,
     ) -> *mut f32;
+    // Speech-to-Speech — audio in -> audio out via a single model pass. Supported
+    // on S2S-capable backends (lfm2-audio, mini-omni2, sidon, voxcpm2-vae). Returns
+    // malloc'd f32 PCM (free with `crispasr_pcm_free`); `out_text`, if non-null,
+    // receives the malloc'd intermediate transcript (free with
+    // `crispasr_session_translate_text_free`). Returns null on failure / unsupported.
+    pub fn crispasr_session_speech_to_speech(
+        s: *mut CrispasrSession,
+        in_samples: *const f32,
+        n_in_samples: c_int,
+        out_text: *mut *mut c_char,
+        out_n_samples: *mut c_int,
+    ) -> *mut f32;
+    // UNMARKED synthesis (no watermark/disclosure). Hard-refused unless
+    // `crispasr_session_accept_marking_responsibility` was called first. Returns
+    // malloc'd f32 PCM (free with `crispasr_pcm_free`); null on refusal/failure.
+    pub fn crispasr_session_synthesize_raw(
+        s: *mut CrispasrSession,
+        text: *const c_char,
+        out_n_samples: *mut c_int,
+    ) -> *mut f32;
+    // Attest that the integrator accepts AI-content marking/disclosure
+    // responsibility (EU AI Act Art. 50). REQUIRED before `synthesize_raw`.
+    pub fn crispasr_session_accept_marking_responsibility(
+        s: *mut CrispasrSession,
+        attestation: *const c_char,
+    ) -> c_int;
+    // Declare whose voice a PRESET voice is: "real_person" | "synthetic" |
+    // "unknown". A preset can be an identifiable individual, which makes its
+    // output a deep fake under Art. 3(60) without any cloning. Returns 0, -1 on
+    // a bad session, -2 on an unrecognised value.
+    pub fn crispasr_session_set_speaker_identity(
+        s: *mut CrispasrSession,
+        identity: *const c_char,
+    ) -> c_int;
+    // Sample rate the backend expects for input PCM (16000 for Whisper-family,
+    // the model's native rate otherwise; 0 on error). Pair with s2s/synthesize to
+    // feed input at the right rate.
+    pub fn crispasr_session_input_sample_rate(s: *mut CrispasrSession) -> c_int;
+    // #332: output-side counterparts. output_sample_rate is the rate of the
+    // PCM synthesize / speech_to_speech return (0 = backend has no audio
+    // output); the channel getters are 1 (mono) for every current backend.
+    pub fn crispasr_session_output_sample_rate(s: *mut CrispasrSession) -> c_int;
+    pub fn crispasr_session_input_channels(s: *mut CrispasrSession) -> c_int;
+    pub fn crispasr_session_output_channels(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_pcm_free(pcm: *mut f32);
+    // Embed the AI-content watermark into f32 mono PCM, in place. The other
+    // half of `synthesize_raw`: opting out of automatic marking obliges the
+    // caller to mark the result, and this is what they mark it with.
+    // `alpha <= 0` selects the robust, reliably detectable default.
+    pub fn crispasr_watermark_embed(pcm: *mut f32, n_samples: c_int, alpha: c_float);
+    // Confidence in [0, 1] that `pcm` carries the watermark. A weak diagnostic:
+    // the spread-spectrum null mean is 0.5, not 0 (see docs/eu-ai-act.md §6.7).
+    pub fn crispasr_watermark_detect(pcm: *const c_float, n_samples: c_int) -> c_float;
     // Drop the kokoro per-session phoneme cache. No-op for non-kokoro
     // backends. Returns 0 on success, -1 if `s` is null. (PLAN #56 #5)
     pub fn crispasr_session_kokoro_clear_phoneme_cache(s: *mut CrispasrSession) -> c_int;
@@ -434,9 +606,15 @@ extern "C" {
         s: *mut CrispasrSession,
         lang: *const c_char,
     ) -> c_int;
+    pub fn crispasr_session_set_tts_reference_language(
+        s: *mut CrispasrSession,
+        lang: *const c_char,
+    ) -> c_int;
     pub fn crispasr_session_set_punctuation(s: *mut CrispasrSession, enable: c_int) -> c_int;
-    pub fn crispasr_session_set_punc_model(s: *mut CrispasrSession, punc_model: *const c_char)
-        -> c_int;
+    pub fn crispasr_session_set_punc_model(
+        s: *mut CrispasrSession,
+        punc_model: *const c_char,
+    ) -> c_int;
     pub fn crispasr_session_set_hotwords(
         s: *mut CrispasrSession,
         hotwords: *const c_char,
@@ -488,10 +666,17 @@ extern "C" {
         penalty: c_float,
     ) -> c_int;
     pub fn crispasr_session_set_tts_steps(s: *mut CrispasrSession, steps: c_int) -> c_int;
+    pub fn crispasr_session_set_tts_num_candidates(s: *mut CrispasrSession, n: c_int) -> c_int;
     pub fn crispasr_session_set_top_p(s: *mut CrispasrSession, top_p: c_float) -> c_int;
+    pub fn crispasr_session_set_top_k(s: *mut CrispasrSession, top_k: c_int) -> c_int;
+    pub fn crispasr_session_set_do_sample(s: *mut CrispasrSession, enable: c_int) -> c_int;
     pub fn crispasr_session_set_min_p(s: *mut CrispasrSession, min_p: c_float) -> c_int;
     pub fn crispasr_session_set_repetition_penalty(s: *mut CrispasrSession, r: c_float) -> c_int;
     pub fn crispasr_session_set_cfg_weight(s: *mut CrispasrSession, cfg_weight: c_float) -> c_int;
+    pub fn crispasr_session_set_tts_noise_temp(
+        s: *mut CrispasrSession,
+        noise_temp: c_float,
+    ) -> c_int;
     pub fn crispasr_session_set_exaggeration(
         s: *mut CrispasrSession,
         exaggeration: c_float,
@@ -500,6 +685,7 @@ extern "C" {
     pub fn crispasr_session_set_length_scale(s: *mut CrispasrSession, scale: c_float) -> c_int;
     pub fn crispasr_session_set_best_of(s: *mut CrispasrSession, n: c_int) -> c_int;
     pub fn crispasr_session_set_beam_size(s: *mut CrispasrSession, n: c_int) -> c_int;
+    pub fn crispasr_session_set_return_logits(s: *mut CrispasrSession, enable: c_int) -> c_int;
     pub fn crispasr_session_set_grammar_text(
         s: *mut CrispasrSession,
         gbnf_text: *const c_char,
@@ -847,4 +1033,28 @@ extern "C" {
         i_word: c_int,
         i_alt: c_int,
     ) -> c_float;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards the hand-maintained mirrors of the APPEND-ONLY structs in
+    // src/crispasr_c_api.cpp. The C side reads every field unconditionally,
+    // so a short layout here is an out-of-bounds read even for methods
+    // that ignore the trailing fields (#332).
+    #[test]
+    fn diarize_abi_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<CrispasrDiarizeSegAbi>(), 24);
+        assert_eq!(size_of::<CrispasrDiarizeOptsAbi>(), 48);
+        assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, slice_t0_cs), 8);
+        assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, pyannote_model_path), 16);
+        assert_eq!(
+            offset_of!(CrispasrDiarizeOptsAbi, foxnose_embedder_path),
+            24
+        );
+        assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, min_speakers), 32);
+        assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, num_speakers), 40);
+    }
 }

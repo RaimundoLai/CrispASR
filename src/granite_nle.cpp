@@ -28,6 +28,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "core/bpe.h"
@@ -40,6 +41,8 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <chrono>
@@ -299,7 +302,7 @@ struct granite_nle_context {
 static bool granite_nle_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("GRANITE_NLE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_GRANITE_NLE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -538,7 +541,7 @@ extern "C" struct granite_nle_context* granite_nle_init_from_file(const char* pa
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -701,6 +704,7 @@ extern "C" struct granite_nle_context* granite_nle_init_from_file(const char* pa
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -1270,7 +1274,7 @@ extern "C" float* granite_nle_run_encoder(struct granite_nle_context* ctx, const
     // debugging). The graph path also populates ctx->last_ctc_logits and
     // ctx->last_bpe_logits.
     bool use_graph = true;
-    if (const char* e = std::getenv("GRANITE_DISABLE_ENCODER_GRAPH"))
+    if (const char* e = crispasr_env::get("CRISPASR_GRANITE_DISABLE_ENCODER_GRAPH"))
         if (e[0] != '0' && e[0] != '\0')
             use_graph = false;
     if (use_graph) {
@@ -1852,7 +1856,7 @@ extern "C" float* granite_nle_run_llm_editing(struct granite_nle_context* ctx, c
                 s / (n_text * vocab));
     }
 
-    if (const char* p = std::getenv("GRANITE_NLE_EDIT_DUMP")) {
+    if (const char* p = crispasr_env::get("CRISPASR_GRANITE_NLE_EDIT_DUMP")) {
         FILE* fp = std::fopen(p, "wb");
         if (fp) {
             std::fwrite(result, sizeof(float), (size_t)vocab * n_text, fp);

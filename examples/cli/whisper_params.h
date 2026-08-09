@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits> // INT_MIN (att_context_* sentinels) — issue #257
 #include <string>
 #include <thread>
 #include <vector>
@@ -102,6 +103,72 @@ struct whisper_params {
     int vad_speech_pad_ms = 30;
     float vad_samples_overlap = 0.1f;
     bool vad_stitch = false;
+    // #227: a --vad-import file whose chunk length differs from this run WARNS
+    // by default and is used anyway -- refusing would break existing scripts
+    // and clients that upgraded into the check. Opt in to a hard failure with
+    // --vad-import-strict (CLI) or the vad_import_strict form field (server);
+    // both surfaces share this field and must stay in agreement.
+    bool vad_import_strict = false;
+    // #227: --vad-export-raw exports RAW VAD speech segments instead of chunk
+    // boundaries. These are model- AND chunk-length-independent, so one export
+    // can be imported by any run and is re-chunked per run. Non-breaking:
+    // --vad-export keeps its chunk-boundary behaviour.
+    bool vad_export_raw = false;
+    // Issue #227: reuse VAD segment boundaries across ASR runs. --vad-export
+    // writes the computed slices to a JSON file; --vad-import reads slices from
+    // one instead of running VAD (skips the VAD model entirely).
+    std::string vad_export_file = "";
+    std::string vad_import_file = "";
+    // Server-side (#227) equivalents. The HTTP API can't take file paths — that
+    // would be an arbitrary read/write on the server host — so boundaries are
+    // returned inline in the response (`vad_export=true`) and supplied inline as
+    // the serialized JSON (`vad_import=<json>`). Same wire format as the CLI's
+    // files; both use crispasr_{serialize,parse}_vad_slices.
+    bool vad_export_inline = false;
+    std::string vad_import_json = "";
+
+    // §248 source separation. --separate routes to the separation dispatcher
+    // (crispasr_separate_cli) BEFORE any transcribe backend is built; the model
+    // arch (mel-band-roformer / htdemucs) is auto-detected from the GGUF.
+    bool separate = false;
+    std::string stems;          // comma-separated stem subset; empty/"all" = every stem
+    std::string sep_output_dir; // output dir for stems; empty = alongside input
+
+    // Pitch (F0) estimation. --pitch routes to the pitch dispatcher
+    // (crispasr_pitch_cli) BEFORE any transcribe backend is built; the model
+    // arch (crepe) is auto-detected from the GGUF.
+    // Chord recognition. --chords routes to the chord dispatcher
+    // (crispasr_chords_cli) BEFORE any transcribe backend is built, mirroring
+    // --pitch. The BTC weights are CC-BY-NC-SA, so this path needs
+    // --accept-license cc-by-nc-sa-4.0 to auto-download.
+    bool chords = false;
+    std::string chords_format; // "text" (default) or "json"
+
+    // Piano transcription. --piano routes to the piano dispatcher
+    // (crispasr_piano_cli) BEFORE any transcribe backend is built, for the same
+    // reason as --chords: the output is note EVENTS (onset/offset/midi/
+    // velocity), not text segments. Reaching it through transcribe() renders
+    // each note as text like "C4 v=80", which is lossy.
+    bool piano = false;
+    std::string piano_format; // "text" (default) or "json"
+
+    // Beat / downbeat tracking. --beats routes to the beat dispatcher
+    // (crispasr_beats_cli) BEFORE any transcribe backend is built, for the
+    // same reason as --chords: the output is a beat grid, not text segments.
+    bool beats = false;
+    std::string beats_format; // "text" (default) or "json"
+
+    // Guitar tablature. --tab routes to the tab dispatcher (crispasr_tab_cli)
+    // BEFORE any transcribe backend is built, for the same reason as --chords:
+    // the output is a per-frame per-string grid of fret SCORES, not text
+    // segments. The CLI display argmaxes it; real consumers take the
+    // log-probabilities through the C ABI and run their own constrained decoder.
+    bool tab = false;
+    std::string tab_format; // "text" (default) or "json"
+
+    bool pitch = false;
+    std::string pitch_format;   // "text" (default) or "json"
+    float pitch_hop_ms = 10.0f; // CREPE reference hop
 
     std::string backend;
     std::string source_lang;
@@ -112,6 +179,7 @@ struct whisper_params {
     int flush_after = 0;
     bool show_alternatives = false;
     int32_t n_alternatives = 3;
+    bool return_logits = false;
     std::string aligner_model;
     // PLAN issue #62: when true, the CTC forced aligner runs even on
     // backends that already produce native timestamps — replacing
@@ -131,7 +199,32 @@ struct whisper_params {
     // README). `--no-auto-aligner` reverts to the pre-default native
     // DTW path (no second forward pass, no ~442 MB download).
     bool no_auto_aligner = false;
+    // Issue #311: machine-reliable strict failure semantics for explicitly
+    // requested auxiliary pipeline stages. By default CrispASR degrades
+    // gracefully (a VAD/aligner/punc model that fails to load is skipped with
+    // a stderr warning and a 0 exit code). Integrations that treat these stages
+    // as *required task properties* need a zero exit to actually mean "every
+    // requested stage succeeded". These opt-in flags make a failed-to-load /
+    // failed-to-produce required stage return a NON-ZERO exit instead.
+    //
+    //  * `strict_pipeline` (--strict-pipeline): require every stage that was
+    //    explicitly requested on this command line (VAD if --vad/-vm, word
+    //    timestamps if -am/--force-aligner, punctuation if --punc-model).
+    //  * the per-stage flags force one specific requirement regardless.
+    //
+    // A stage that RAN successfully but legitimately produced nothing (VAD ran
+    // and detected no speech) is NOT a failure. Direct local model paths are
+    // used as-is and never fall back to auto-download.
+    bool strict_pipeline = false;
+    bool require_vad = false;
+    bool require_word_timestamps = false;
+    bool require_punctuation = false;
     int32_t max_new_tokens = 512;
+    // Whether the user passed --max-new-tokens. Backends whose sensible default
+    // differs from 512 (e.g. moss-diarize wants 1024) forward the CLI value only
+    // when this is set, so an unset default never SHRINKS a backend below its own
+    // (#292). Mirrors chunk_seconds_explicit.
+    bool max_new_tokens_explicit = false;
     float frequency_penalty = 0.0f;
     int32_t chunk_seconds = 30;
     bool chunk_seconds_explicit = false; // true when user passed --chunk-seconds
@@ -148,8 +241,22 @@ struct whisper_params {
     bool warmup = false;    // run a short dummy transcribe after init to amortize first-call overhead (PLAN #80e)
     bool no_warmup = false; // --no-warmup: skip the always-on server warmup (e.g. crashes on some Vulkan drivers, #165)
     std::string parakeet_decoder; // "tdt" (default), "ctc" — selects parakeet decode head
-    std::string hotwords;         // comma-separated hotword list (PLAN #98)
-    float hotwords_boost = 2.0f;  // per-token log-prob boost for hotword prefix matches
+    // Issue #257: parakeet/canary local-attention window (encoder frames, 1 = ~80 ms)
+    // — NeMo change_attention_model("rel_pos_local_attn", [L,R]); bounds long-audio
+    // encoder memory to O(T·window). INT_MIN = unset (use the model default);
+    // negative = full attention. Set via --att-context "L,R".
+    int att_context_left = INT_MIN;
+    int att_context_right = INT_MIN;
+    std::string hotwords;        // comma-separated hotword list (PLAN #98)
+    float hotwords_boost = 2.0f; // per-token log-prob boost for hotword prefix matches
+    // Free-form hotword/context text injected into the vibevoice-asr prompt
+    // (only backend that reads this so far). Matches the `context_info` param
+    // in microsoft/VibeVoice's vibevoice_asr_processor.py.
+    std::string context;
+    // #205: granite-speech incremental decoding — seed the assistant turn with a
+    // previously-decoded transcript so the model continues from it instead of
+    // re-decoding (model-card `prefix_text`). Output is the continuation only.
+    std::string prefix_text;
     std::string lid_backend;
     std::string lid_model;
     // Post-ASR text LID: when set, after transcription completes, run
@@ -168,6 +275,19 @@ struct whisper_params {
     std::string enroll_speaker;     // enrollment mode: save embedding as this name
     std::string titanet_model;      // TitaNet GGUF path or "auto"
     float speaker_threshold = 0.7f; // cosine similarity threshold for matching
+    // Closed roster for identification (issue #266): comma-separated names
+    // of enrolled participants the deployer asserts are present in THIS
+    // recording. Matching runs per global speaker cluster and only against
+    // these profiles; there is no open "identify anyone in the db" mode
+    // (that would be remote biometric identification under the EU AI Act,
+    // Annex III 1(a)). REQUIRED for --speaker-db matching.
+    std::string expect_speakers;
+    // The named-profile DB (--enroll-speaker / --speaker-db) persists
+    // voiceprints linked to real names — biometric special-category data
+    // under GDPR Art. 9. It is OFF by default: the deployer must affirm a
+    // lawful basis + explicit consent via --speaker-db-consent before
+    // enrollment or matching will run.
+    bool speaker_db_consent = false;
 
     // Embedding-based diarization clustering (issue #107 P3). When set,
     // after --diarize-method pyannote runs, each speech segment is
@@ -178,6 +298,32 @@ struct whisper_params {
     std::string diarize_embedder;           // model path or "auto"
     float diarize_cluster_threshold = 0.5f; // cosine merge threshold
     int diarize_max_speakers = 8;           // upper bound for cluster count
+    int diarize_num_speakers = 0;           // >0 pins the count (foxnose)
+    // Set when the user passed --diarize-max-speakers explicitly, so a
+    // per-method default never SHRINKS or GROWS a value they chose. Same
+    // contract as max_new_tokens_explicit (#292).
+    bool diarize_max_speakers_explicit = false;
+    // Set when the user passed --diarize-cluster-threshold explicitly. The
+    // embedder path otherwise estimates the speaker count with spectral
+    // clustering (#326) and the cosine threshold is not consulted at all;
+    // honouring it only when asked for keeps that knob working for anyone who
+    // tuned it, without letting its default decide the answer.
+    bool diarize_cluster_threshold_explicit = false;
+
+    // Set by the unified runner: foxnose diarization happens in one global
+    // pass after transcription, so the per-slice path must stand down.
+    bool diarize_foxnose_global = false;
+
+    // #324: `--diarize-method foxnose` consumes --diarize-embedder itself, as
+    // the WeSpeaker model for its own spectral clustering. The generic
+    // TitaNet remap must therefore NOT also try to load that path — it is a
+    // different architecture and fails with a confusing
+    // "block_repeats/kernels array size mismatch". There are three call sites
+    // (cli.cpp, crispasr_run.cpp, crispasr_server.cpp); they all ask here so a
+    // fourth cannot silently drift.
+    bool diarize_embedder_is_foxnose() const {
+        return diarize_method == "foxnose" || diarize_method == "foxnose-diarize";
+    }
     bool stream = false;
     bool mic = false;
     bool stream_continuous = false;
@@ -186,9 +332,19 @@ struct whisper_params {
     std::string server_host = "127.0.0.1";
     int32_t server_port = 8080;
     std::string server_api_keys;
+    // --server-workers N (>1): load N independent backend instances so
+    // "pure-ASR" requests (explicit language, no aligner, no punctuation/
+    // truecaser) run concurrently instead of serializing on one model. Costs
+    // N× model memory. 1 = single shared instance (default, unchanged). The
+    // CRISPASR_SERVER_WORKERS env var, when set, overrides this. See
+    // docs/concurrency.md.
+    int32_t server_workers = 1;
     // --ws-port: real-time WebSocket ASR streaming on a second port.
     //   -1 = disabled (default), 0 = server_port + 1, N = port N.
     int32_t server_ws_port = -1;
+    // --wyoming-port: Wyoming protocol (Home Assistant Assist) TCP server.
+    //   -1 = disabled (default), N = port N.
+    int32_t wyoming_port = -1;
     int32_t stream_step_ms = 3000;
     int32_t stream_length_ms = 10000;
     int32_t stream_keep_ms = 200;
@@ -244,6 +400,11 @@ struct whisper_params {
     // CRISPASR_FIRERED_VAD_DEBUG env var directly).
     bool firered_vad_debug = false;
     bool auto_download = false;
+    // Attests acceptance of a RESTRICTED model licence (cc-by-nc-*, gemma,
+    // llama*, lfm1.0, other): the exact SPDX-ish tag, or "all". Separate from
+    // --i-have-rights, which attests SPEAKER CONSENT for voice cloning — one
+    // flag must not grant two unrelated permissions.
+    std::string accept_license;
     bool dry_run_resolve = false;
     bool dry_run_ignore_cache = false;
     std::string cache_dir;
@@ -267,7 +428,41 @@ struct whisper_params {
     std::string tts_ref_text;
     std::string tts_ref_asr;  // ASR backend for auto-transcribing ref audio (default: whisper)
     std::string tts_instruct; // VoiceDesign: natural-language voice description
+
+    // #316: bypass the G2P and feed these phonemes to the TTS backend verbatim.
+    // The phoneme string is the boundary between text processing and the
+    // acoustic model, so being able to drive it directly is what lets you tell a
+    // G2P bug from a model bug — and it is how you reproduce another
+    // implementation's pronunciation exactly. Honoured by kokoro; backends
+    // without a phonemes-in entry point report it rather than silently
+    // synthesizing the text.
+    // CLI: --tts-phonemes "<IPA>"
+    std::string tts_phonemes;
     bool tts_trim_silence = false;
+
+    // --make-ref: create a TADA voice reference GGUF from --voice <audio.wav>
+    // + --ref-text "transcript". Requires tada-encoder.gguf + tada-aligner-*.gguf.
+    bool make_ref = false;
+    std::string make_ref_output;  // output path (default: tada-ref-custom.gguf)
+    std::string make_ref_aligner; // aligner GGUF path (auto-discovered if empty)
+    std::string make_ref_encoder; // encoder GGUF path (auto-discovered if empty)
+
+    // Forced alignment / word timestamps via the TADA aligner (reuses the
+    // make-ref encoder+aligner). Input: --voice <audio> + --ref-text "<text>".
+    bool align = false;
+    std::string align_output;         // output path (default: stdout)
+    std::string align_format = "srt"; // srt | json | plain
+
+    // Issue #217: standalone CTC forced alignment mode.
+    // Input: audio file + text (--ref-text or --text-file).
+    // Runs the CTC aligner (canary-ctc / wav2vec2 / qwen3-fa) without
+    // requiring an ASR model or transcription step.
+    bool align_only = false;
+    std::string text_file; // path to .txt or .srt (text extracted, timestamps stripped)
+    // Output granularity: "word" = one entry per aligned word; "segment" =
+    // one entry per input SRT cue (or per non-empty .txt line), re-timed
+    // from the word alignment; "auto" = segment for .srt input, word otherwise.
+    std::string align_granularity = "auto"; // auto | word | segment
 
     // AudioSeal neural watermark model (optional upgrade from spread-spectrum).
     // When set, loads the GGUF and uses it for watermark embed/detect
@@ -278,6 +473,12 @@ struct whisper_params {
     // When set, reads the WAV file, runs watermark detection, prints
     // the result, and exits. Exposes the detection API for end users.
     std::string detect_watermark_file;
+
+    // --print-speaker-identity PATH: standalone verb. Resolves whose voice a
+    // model or voice pack produces and prints it, then exits. One source of
+    // truth for the answer — a script that restated the verdicts would be a
+    // third copy to drift from the C++ table.
+    std::string print_speaker_identity_file;
 
     // C2PA (Content Credentials) signing — compile-time gated on
     // CRISPASR_HAVE_C2PA. Paths to self-signed or CA-issued X.509 cert
@@ -293,10 +494,68 @@ struct whisper_params {
     bool tts_voice_clone_consent = false;
     std::string tts_consent_attestation;
 
+    // --consent-log <path> / CRISPASR_CONSENT_LOG. When set, every [CONSENT]
+    // record is ALSO appended as one JSON object per line. Default off: turning
+    // on a persistent record of who attested what is the operator's decision,
+    // and it is their artefact to retain and erase, not ours. Tamper-resistance
+    // comes from where they put the file (append-only perms, WORM, a SIEM) —
+    // see crispasr_consent_record.h.
+    std::string consent_log;
+
+    // Set when THIS run baked `tts_voice` from a user-supplied recording (the
+    // TADA inline-clone path bakes a .wav into a temp .gguf and rewrites
+    // tts_voice to point at it). Without this the rewrite erased the only
+    // evidence the voice was a clone, and the consent + spoken-disclosure gates
+    // — which classified by filename suffix — both scored the most explicit
+    // cloning command in the CLI as "not a clone".
+    // See crispasr_voice_clone_policy.h.
+    bool tts_voice_baked_from_wav = false;
+    // The RECORDING that bake started from, before tts_voice was rewritten to
+    // point at the baked pack. Consent was given for this file, so this is what
+    // the audit record must hash — the pack is a derived artefact, and hashing
+    // it would bind the record to something the speaker never saw.
+    std::string tts_voice_source_recording;
+
+    // Operator override for whose voice a PRESET voice is: "real_person",
+    // "synthetic" or "unknown"/empty. Outranks the pack's declaration and the
+    // backend's default (crispasr_speaker_identity.h).
+    //
+    // real_person turns on the Art. 50(4) spoken disclosure for a non-cloned
+    // voice, and deliberately does NOT turn on the --i-have-rights gate: the
+    // donor's consent to the model being trained is a licensing matter settled
+    // upstream that this operator cannot attest to.
+    // CLI: --speaker-identity   Server: "speaker_identity"
+    std::string tts_speaker_identity;
+
     // Skip the spoken AI-disclosure prefix on voice-cloned output.
     // Machine-readable provenance (watermark + C2PA) is always retained.
     // CLI: --no-spoken-disclaimer   Server: "spoken_disclaimer": false
     bool tts_no_spoken_disclaimer = false;
+
+    // Turn off the imperceptible AI-content watermark on TTS output.
+    // Equivalent to the CRISPASR_NO_WATERMARK env var; both emit a one-time
+    // warning that AI-usage marking responsibility then rests with the operator.
+    // On by default — see docs/issue-260/PLAN.md for the regulatory background.
+    // CLI: --no-watermark
+    bool tts_no_watermark = false;
+
+    // Explicit attestation that the operator accepts AI-content marking/disclosure
+    // responsibility. REQUIRED to honor ANY provenance opt-out (--no-watermark or
+    // --no-spoken-disclaimer); without it those opt-outs are hard-refused. Mirrors
+    // the voice-clone --i-have-rights consent gate.
+    // CLI: --accept-marking-responsibility
+    // Server: request field "marking_attestation": "<text>" (per-request spoken
+    //   disclaimer opt-out), or the launch flag for a server-level --no-watermark.
+    bool tts_marking_responsibility_accepted = false;
+    std::string tts_marking_attestation;
+
+    // Disable C2PA Content Credentials signing on synthesized output. A provenance
+    // opt-out like --no-watermark: REQUIRES tts_marking_responsibility_accepted,
+    // else refused. On the CLI the watertight rule still forces the audio watermark
+    // on when C2PA is off, so output is never fully unmarked; on the server the
+    // operator takes on the marking duty for every response.
+    // CLI/server launch: --no-c2pa
+    bool tts_no_c2pa = false;
 
     // Server mode: directory containing voice profiles for /v1/audio/speech.
     // Each profile is a sibling pair: <name>.wav + <name>.txt (the WAV is
@@ -327,13 +586,29 @@ struct whisper_params {
     float tts_min_p = -1.0f;
     int tts_top_k = -1;
     float tts_repetition_penalty = -1.0f;
-    float tts_cfg_scale = -1.0f;    // chatterbox cfg_weight, f5 cfg_strength
-    int tts_num_steps = -1;         // chatterbox cfm_steps, f5 ode_steps
+    int tts_do_sample = -1;         // tada talker sampling: -1 unset, 0 greedy, 1 sample
+    int tts_num_candidates = -1;    // tada per-token flow-matching candidates (quality/speed)
+    float tts_cfg_scale = -1.0f;    // chatterbox cfg_weight, f5 cfg_strength, tada acoustic_cfg
+    int tts_num_steps = -1;         // chatterbox cfm_steps, f5 ode_steps, tada num_flow_matching_steps
     float tts_noise_scale = -1.0f;  // piper VITS variance
     float tts_noise_w = -1.0f;      // piper stochastic duration predictor
+    float tts_noise_temp = -1.0f;   // tada FM noise temperature (InferenceOptions.noise_temp)
     float tts_exaggeration = -1.0f; // chatterbox expressiveness
     int tts_speaker_id = -1;        // piper multi-speaker model
     int tts_max_speech_tokens = -1; // chatterbox max AR tokens
+    int tts_min_speech_tokens = -1; // moss-tts min AR audio frames (exact-window fill)
+
+    // CLI: --tts-play plays synthesised output on the local default speaker.
+    // --tts-play-device N selects a non-default device by index (-1 = default).
+    // Playback uses the same watermarked PCM that is written to --tts-output.
+    bool tts_play = false;
+    int tts_play_device = -1;
+
+    // --tts-stream: stream synthesized audio to stdout as raw signed-16-bit
+    // little-endian mono PCM (at the backend's sample rate), emitting each
+    // sentence chunk as it is produced instead of writing one WAV at the end.
+    // For piping into a player, e.g. `… --tts-stream | ffplay -f s16le -ar 48000 -`.
+    bool tts_stream = false;
 
     // G2P phonemizer dictionary source:
     //   ""           → auto (OLaPh MIT preferred, then open-dict-data CC-BY-SA)

@@ -109,12 +109,18 @@ fn has_built_lib(build_dir: &Path, lib_name: &str) -> bool {
         // Legacy `whisper` alias produced by the same target.
         build_dir.join("src").join("libwhisper.dylib"),
         build_dir.join("src").join("libwhisper.so"),
-        // MSVC multi-config: import lib lives under `src/Release/`.
+        // MSVC multi-config (Visual Studio generator, e.g. the release
+        // bundle): import lib lives under `src/Release/`.
         build_dir
             .join("src")
             .join("Release")
             .join(format!("{lib_name}.lib")),
         build_dir.join("src").join("Release").join("whisper.lib"),
+        // Single-config on Windows (Ninja / NMake, e.g. `build-windows.bat`):
+        // the import lib lands directly under `src/` with no `Release/` level,
+        // so a local source build is consumable via CRISPASR_SYS_LIB_DIR too.
+        build_dir.join("src").join(format!("{lib_name}.lib")),
+        build_dir.join("src").join("whisper.lib"),
         // Flat layouts (e.g., users who pointed CRISPASR_SYS_LIB_DIR at a
         // directory that already contains the libs without the `src/`
         // prefix).
@@ -153,6 +159,18 @@ fn run(cmd: &mut Command, what: &str) {
     }
 }
 
+/// True if `tool` can be run on PATH (used to opt into Ninja / ccache only when
+/// they exist, since build.rs runs on downstream consumers' machines).
+fn tool_available(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn configure_and_build(src_root: &Path) -> PathBuf {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let build_dir = out_dir.join("crispasr-build");
@@ -168,6 +186,62 @@ fn configure_and_build(src_root: &Path) -> PathBuf {
         .arg("-DCRISPASR_BUILD_EXAMPLES=OFF")
         .arg("-DCRISPASR_BUILD_SERVER=OFF")
         .arg("-DCMAKE_BUILD_TYPE=Release");
+
+    // Prefer the Ninja generator when it's available (parallel by default and
+    // faster than Make). Only on the *first* configure: the generator is baked
+    // into CMakeCache.txt and cmake aborts on a mismatch when reusing a build
+    // dir. CMAKE_GENERATOR (read natively by cmake) lets a user force a choice.
+    let cache_exists = build_dir.join("CMakeCache.txt").exists();
+    if !cache_exists && env::var_os("CMAKE_GENERATOR").is_none() && tool_available("ninja") {
+        configure.arg("-G").arg("Ninja");
+    }
+
+    // Use ccache as the compiler launcher when present — a large rebuild speedup,
+    // and a no-op when absent. Opt out with CRISPASR_NO_CCACHE=1.
+    if env::var_os("CRISPASR_NO_CCACHE").is_none() && tool_available("ccache") {
+        configure
+            .arg("-DCMAKE_C_COMPILER_LAUNCHER=ccache")
+            .arg("-DCMAKE_CXX_COMPILER_LAUNCHER=ccache");
+    }
+
+    // ggml defaults GGML_NATIVE=ON (`-march=native`), which is wrong whenever
+    // the compile host is not the machine the binary will run on — and it
+    // hard-fails under Rosetta 2: clang's host-CPU probe reports the Apple
+    // Silicon die (`apple-m2`) while targeting x86_64, which cc rejects with
+    // `error: unknown target CPU`. Disable it for any host≠target cross build
+    // and for every x86_64 macOS build (a Rosetta toolchain looks like a
+    // native x86_64 host, so the cross check alone can't catch it; real Intel
+    // Mac builds are distribution artifacts that must not be tuned to the
+    // build box either). ggml's per-ISA defaults (AVX2/FMA/F16C on x86) still
+    // apply, so the result is portable without dropping to scalar kernels.
+    // Set CRISPASR_FORCE_GGML_NATIVE=1 to opt back in.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let cross_build = target_arch != std::env::consts::ARCH;
+    if env::var_os("CRISPASR_FORCE_GGML_NATIVE").is_none()
+        && (cross_build || (target_os == "macos" && target_arch == "x86_64"))
+    {
+        configure.arg("-DGGML_NATIVE=OFF");
+    }
+
+    // ggml's own cmake auto-detects ccache/sccache as a compiler launcher.
+    // Under the Ninja generator, sccache fails on the GGML_METAL_EMBED_LIBRARY
+    // assembly object (ninja emits depfile rules for the .s compile; sccache
+    // cannot produce the .d and aborts the build). The explicit ccache
+    // launcher above is unaffected, so just disable ggml's auto-detection.
+    configure.arg("-DGGML_CCACHE=OFF");
+
+    // The session/back-end library is consumed with raw PCM input; the
+    // optional .opus/.amr file-decode extras would link Homebrew/system
+    // dylibs by absolute path (libopusfile, libopencore-amr, ...) and break
+    // the library on machines without them. Keep the build self-contained.
+    configure
+        .arg("-DCRISPASR_OPUS=OFF")
+        .arg("-DCRISPASR_AMR=OFF");
+
+    // Rebrandable library file name (CRISPASR_LIB_NAME env, also used for the
+    // link-lib directive) — keeps downstream bundles free of the project name.
+    configure.arg(format!("-DCRISPASR_LIB_OUTPUT_NAME={}", link_lib_name()));
 
     if cfg!(feature = "cuda") {
         configure.arg("-DGGML_CUDA=ON");
@@ -188,6 +262,11 @@ fn configure_and_build(src_root: &Path) -> PathBuf {
         .arg(&build_dir)
         .arg("--config")
         .arg("Release")
+        // Build in parallel (matches the README's `-j$(nproc)`); without this the
+        // default Makefiles generator compiles crispasr-lib one TU at a time (#203).
+        // `--parallel` with no number uses the host core count and still honours
+        // CMAKE_BUILD_PARALLEL_LEVEL, so consumers can cap it (CI / low-RAM).
+        .arg("--parallel")
         .arg("--target")
         .arg("crispasr-lib");
     run(&mut build, "cmake build");
@@ -216,6 +295,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CRISPASR_SYS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CRISPASR_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CRISPASR_LIB_NAME");
+    println!("cargo:rerun-if-env-changed=CRISPASR_FORCE_GGML_NATIVE");
+
+    // docs.rs has neither the CrispASR sources nor a prebuilt libcrispasr.
+    // Building a *library* crate never invokes the system linker, so we can
+    // compile the FFI rlib without emitting any link directives — this lets
+    // the docs.rs build (and any consumer that only type-checks) succeed.
+    if env::var_os("DOCS_RS").is_some() {
+        return;
+    }
 
     let lib_name = link_lib_name();
 
@@ -246,7 +334,23 @@ fn main() {
         return;
     }
 
-    // (4) Build it ourselves.
+    // (4) Build it ourselves — but only if the CrispASR C/C++ sources are
+    // actually present. When this crate is pulled from crates.io the parent
+    // directory is the registry cache (no CMakeLists.txt), so cmake would
+    // fail with a cryptic error. Emit an actionable one instead, pointing at
+    // the two supported ways to consume the crate from the registry.
+    if !src_root.join("CMakeLists.txt").exists() {
+        panic!(
+            "crispasr-sys: no prebuilt libcrispasr found and the CrispASR C/C++ \
+             sources are not present at {} (expected a CMakeLists.txt).\n\
+             When depending on this crate from crates.io, either:\n  \
+             • set CRISPASR_LIB_DIR to a directory holding a prebuilt \
+             libcrispasr, or\n  \
+             • depend on it via git so build.rs can build it from source:\n      \
+             crispasr = {{ git = \"https://github.com/CrispStrobe/CrispASR\" }}",
+            src_root.display()
+        );
+    }
     let build_dir = configure_and_build(src_root);
     add_build_dir_search(&build_dir);
     emit_runtime_rpath(&build_dir);

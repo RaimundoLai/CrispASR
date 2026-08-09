@@ -5,21 +5,101 @@
 
 #include "firered_vad.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+
+// §193 Accelerate cblas_sgemm for all cpu_linear calls.
+// Set FIRERED_VAD_FORCE_SCALAR=1 to validate scalar fallback.
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+static bool firered_vad_use_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (crispasr_env::get("CRISPASR_FIRERED_VAD_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `FIRERED_VAD_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool firered_vad_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_FIRERED_VAD_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// #305: the DFSMN convs and the fbank FFT were single-threaded (the matmuls
+// already use Accelerate BLAS). Parallelize them over their independent axis
+// (channel P / frame t). Opt out with CRISPASR_FIRERED_VAD_SERIAL=1.
+static int firered_vad_nthreads() {
+    static int v = -1;
+    if (v < 0) {
+        if (crispasr_env::get("CRISPASR_FIRERED_VAD_SERIAL") != nullptr) {
+            v = 1;
+        } else {
+            unsigned hw = std::thread::hardware_concurrency();
+            v = (hw == 0) ? 1 : (int)std::min(hw, 8u);
+        }
+    }
+    return v;
+}
+
+// Run fn(begin, end) over a partition of [0, n) across threads. fn must be safe
+// to call concurrently on disjoint sub-ranges (all callers write disjoint cells).
+template <class F> static void firered_parallel_for(int n, F&& fn) {
+    const int nt = std::min(firered_vad_nthreads(), n);
+    if (nt <= 1) {
+        fn(0, n);
+        return;
+    }
+    std::vector<std::thread> pool;
+    pool.reserve(nt - 1);
+    const int chunk = (n + nt - 1) / nt;
+    for (int t = 1; t < nt; t++) {
+        const int a = t * chunk, b = std::min(n, a + chunk);
+        if (a >= b)
+            break;
+        pool.emplace_back([&fn, a, b]() { fn(a, b); });
+    }
+    fn(0, std::min(n, chunk)); // this thread takes the first chunk
+    for (auto& th : pool)
+        th.join();
+}
+
+struct firered_vad_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit firered_vad_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~firered_vad_bench_stage() {
+        if (!firered_vad_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  firered_vad_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // Model
@@ -73,7 +153,20 @@ static void read_f32(ggml_tensor* t, std::vector<float>& out) {
 }
 
 // Linear: out[i] = sum_j w[i*K+j] * x[j] + b[i], for each time step
+// out[T,N] = x[T,K] @ w[N,K]^T + b[N]  (w is row-major [N,K])
 static void cpu_linear(const float* x, const float* w, const float* b, float* out, int T, int K, int N) {
+#if defined(HAVE_ACCELERATE)
+    if (!firered_vad_use_scalar()) {
+        // w stored as [N,K] → CblasTrans to get x[T,K] @ w^T[K,N] → out[T,N]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, N, K, 1.0f, x, K, w, K, 0.0f, out, N);
+        if (b) {
+            for (int t = 0; t < T; t++)
+                for (int n = 0; n < N; n++)
+                    out[t * N + n] += b[n];
+        }
+        return;
+    }
+#endif
     for (int t = 0; t < T; t++) {
         for (int n = 0; n < N; n++) {
             double s = 0;
@@ -110,17 +203,19 @@ static void cpu_fsmn(const float* x, float* out, const float* lb_w, const float*
     int lb_pad = (N1 - 1) * S1;
     int lb_out_len = T + lb_pad; // T + (N1-1)*S1
     std::vector<float> lb_conv(P * lb_out_len, 0.0f);
-    for (int p = 0; p < P; p++) {
-        for (int t_out = 0; t_out < lb_out_len; t_out++) {
-            float s = 0;
-            for (int k = 0; k < N1; k++) {
-                int t_in = t_out - lb_pad + k * S1; // input index with padding offset
-                if (t_in >= 0 && t_in < T)
-                    s += lb_w[p * N1 + k] * x_pt[p * T + t_in];
+    firered_parallel_for(P, [&](int p0, int p1) {
+        for (int p = p0; p < p1; p++) {
+            for (int t_out = 0; t_out < lb_out_len; t_out++) {
+                float s = 0;
+                for (int k = 0; k < N1; k++) {
+                    int t_in = t_out - lb_pad + k * S1; // input index with padding offset
+                    if (t_in >= 0 && t_in < T)
+                        s += lb_w[p * N1 + k] * x_pt[p * T + t_in];
+                }
+                lb_conv[p * lb_out_len + t_out] = s;
             }
-            lb_conv[p * lb_out_len + t_out] = s;
         }
-    }
+    });
     // Trim: lookback[:,:,:-(N1-1)*S1] if (N1-1)*S1 > 0, else full
     // lb_out_len - lb_pad = T, so we take first T elements
     // → lb_trimmed[p][t] = lb_conv[p * lb_out_len + t] for t < T
@@ -137,17 +232,19 @@ static void cpu_fsmn(const float* x, float* out, const float* lb_w, const float*
         int la_pad = (N2 - 1) * S2;
         int la_out_len = T + la_pad;
         std::vector<float> la_conv(P * la_out_len, 0.0f);
-        for (int p = 0; p < P; p++) {
-            for (int t_out = 0; t_out < la_out_len; t_out++) {
-                float s = 0;
-                for (int k = 0; k < N2; k++) {
-                    int t_in = t_out - la_pad + k * S2;
-                    if (t_in >= 0 && t_in < T)
-                        s += la_w[p * N2 + k] * x_pt[p * T + t_in];
+        firered_parallel_for(P, [&](int p0, int p1) {
+            for (int p = p0; p < p1; p++) {
+                for (int t_out = 0; t_out < la_out_len; t_out++) {
+                    float s = 0;
+                    for (int k = 0; k < N2; k++) {
+                        int t_in = t_out - la_pad + k * S2;
+                        if (t_in >= 0 && t_in < T)
+                            s += la_w[p * N2 + k] * x_pt[p * T + t_in];
+                    }
+                    la_conv[p * la_out_len + t_out] = s;
                 }
-                la_conv[p * la_out_len + t_out] = s;
             }
-        }
+        });
         // Python: memory += F.pad(lookahead[:, :, N2*S2:], (0, S2))
         // la_conv has la_out_len elements. Skip first N2*S2 elements.
         // Remaining: la_out_len - N2*S2 = T + (N2-1)*S2 - N2*S2 = T - S2
@@ -198,7 +295,6 @@ static void compute_fbank_vad(const float* pcm, int n_samples, std::vector<float
         window[i] = powf(h, 0.85f);
     }
     features.resize(n_frames * n_mels);
-    std::vector<float> fre(n_fft), fim(n_fft);
     auto fft = [](float* r, float* im, int n) {
         for (int i = 1, j = 0; i < n; i++) {
             int b = n >> 1;
@@ -232,32 +328,37 @@ static void compute_fbank_vad(const float* pcm, int n_samples, std::vector<float
     // Scale float32 (-1..1) to int16 range (-32768..32767) before fbank.
     const float scale_to_i16 = 32768.0f;
 
-    for (int t = 0; t < n_frames; t++) {
-        int off = t * hop;
-        std::vector<float> fr(win);
-        float dc = 0;
-        for (int i = 0; i < win; i++) {
-            fr[i] = ((off + i < n_samples) ? pcm[off + i] : 0.0f) * scale_to_i16;
-            dc += fr[i];
+    // Frames are independent (disjoint features[] writes); give each thread its
+    // own FFT scratch. Bit-identical to the serial loop (#305).
+    firered_parallel_for(n_frames, [&](int t0, int t1) {
+        std::vector<float> fre(n_fft), fim(n_fft);
+        for (int t = t0; t < t1; t++) {
+            int off = t * hop;
+            std::vector<float> fr(win);
+            float dc = 0;
+            for (int i = 0; i < win; i++) {
+                fr[i] = ((off + i < n_samples) ? pcm[off + i] : 0.0f) * scale_to_i16;
+                dc += fr[i];
+            }
+            dc /= win;
+            for (int i = 0; i < win; i++)
+                fr[i] -= dc;
+            for (int i = win - 1; i > 0; i--)
+                fr[i] -= preemph * fr[i - 1];
+            fr[0] -= preemph * fr[0];
+            std::fill(fre.begin(), fre.end(), 0.0f);
+            std::fill(fim.begin(), fim.end(), 0.0f);
+            for (int i = 0; i < win; i++)
+                fre[i] = fr[i] * window[i];
+            fft(fre.data(), fim.data(), n_fft);
+            for (int m = 0; m < n_mels; m++) {
+                float s = 0;
+                for (int k = 0; k < bins; k++)
+                    s += (fre[k] * fre[k] + fim[k] * fim[k]) * mel_fb[m * bins + k];
+                features[t * n_mels + m] = logf(std::max(s, 1.1920929e-7f));
+            }
         }
-        dc /= win;
-        for (int i = 0; i < win; i++)
-            fr[i] -= dc;
-        for (int i = win - 1; i > 0; i--)
-            fr[i] -= preemph * fr[i - 1];
-        fr[0] -= preemph * fr[0];
-        std::fill(fre.begin(), fre.end(), 0.0f);
-        std::fill(fim.begin(), fim.end(), 0.0f);
-        for (int i = 0; i < win; i++)
-            fre[i] = fr[i] * window[i];
-        fft(fre.data(), fim.data(), n_fft);
-        for (int m = 0; m < n_mels; m++) {
-            float s = 0;
-            for (int k = 0; k < bins; k++)
-                s += (fre[k] * fre[k] + fim[k] * fim[k]) * mel_fb[m * bins + k];
-            features[t * n_mels + m] = logf(std::max(s, 1.1920929e-7f));
-        }
-    }
+    });
 }
 
 // ===========================================================================
@@ -287,7 +388,7 @@ extern "C" struct firered_vad_context* firered_vad_init(const char* model_path) 
     gguf_free(gctx);
 
     // Load weights
-    ggml_backend_t backend = ggml_backend_init_best();
+    ggml_backend_t backend = crispasr_init_gpu_backend();
     if (!backend) {
         delete ctx;
         return nullptr;
@@ -366,10 +467,15 @@ extern "C" int firered_vad_detect(struct firered_vad_context* ctx, const float* 
     auto& m = ctx->model;
     auto& hp = m.hp;
 
+    firered_vad_bench_stage _bs_total("detect_total");
+
     // Compute fbank
     std::vector<float> features;
     int n_frames = 0;
-    compute_fbank_vad(samples, n_samples, features, n_frames);
+    {
+        firered_vad_bench_stage _bs("feature_extraction");
+        compute_fbank_vad(samples, n_samples, features, n_frames);
+    }
     if (n_frames <= 0)
         return -1;
 

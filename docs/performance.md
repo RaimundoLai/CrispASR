@@ -36,10 +36,10 @@ allocated via `ggml_backend_alloc_ctx_tensors`. The cache is a 4D tensor
 | pocket_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Llama-1B backbone |
 | tada_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Per-token flow matching |
 | zonos_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | CFG-guided, 9-codebook DAC |
-| kugelaudio | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | 7B Qwen2.5 + DiT diffusion |
+| kugelaudio | `core_attn::kv_self_attn` | — | `ggml_gallocr` (direct, §209) + sched for VAE | 7B Qwen2.5 + DiT diffusion. LM/diffusion compute directly on ctx->backend (avoids the §206 weight-less-first-op cross-backend-copy bug); only the VAE decoder stays on the sched (its `ggml_pad` is Metal-unsupported → CPU fallback) |
 | voxcpm2_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Flow-matching diffusion |
 | vibevoice | `core_attn::kv_self_attn` | Conv cache | `ggml_backend_sched` | σ-VAE streaming |
-| **lfm2_audio** | `core_attn::kv_self_attn` | **Conv state cache** | `ggml_backend_sched` | **Hybrid conv+attn backbone** |
+| **lfm2_audio** | `core_attn::kv_self_attn` | **Conv state cache** | `ggml_gallocr` (direct, §206) | **Hybrid conv+attn backbone; backbone computes directly on ctx->backend — not the sched — to avoid the weight-less-first-op cross-backend-copy bug** |
 | **nemotron** | cache_last_channel + cache_last_time | **Conv + attn cache** | `ggml_backend_sched` | **Cache-aware streaming FastConformer** |
 | bark_tts | None (3× non-cached forward) | — | `ggml_backend_sched` | Could benefit from KV cache |
 | chatterbox | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | T3 AR + S3Gen flow |
@@ -106,4 +106,72 @@ The LFM2 backbone uses two distinct cache types:
 | Q4_K KV+conv | ~31s | ~45s | 15× |
 | F16 gallocr | ~2m20s | — | Reduced sys overhead |
 | Q4_K gallocr+256MB | ~1m8s | — | Best CPU perf |
-| GPU (projected) | ~5-10s | ~10s | Needs CUDA/Metal |
+| GPU (M1 Metal, §206) | ~15s | — | Correct now (gallocr direct compute); AR decode is dispatch-bound so currently ~slower than threaded CPU. GPU-decode graph caching is the perf follow-up. |
+
+## CrispASR vs transcribe.cpp — Head-to-Head Benchmark
+
+Systematic evaluation against [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp)
+(ASR-only, ggml-based, 16 model families, 60+ variants) on Kaggle P100 (sm_60, CUDA 12.8).
+
+Test audio: `jfk.wav` (11s, 16 kHz mono). WER computed against reference transcript.
+RTF = real-time factor (lower = faster; < 1.0 means faster than real-time).
+
+### GPU mode (both engines on CUDA, P100 sm_60) — v16, 2026-07-11
+
+| Family | CA RTF | TC RTF | CA WER | TC WER | Notes |
+|--------|--------|--------|--------|--------|-------|
+| SenseVoice Small | **0.016** | 0.019 | 0% | 0% | CA 1.2x faster |
+| Whisper base | **0.022** | 0.020 | 0% | 0% | Parity |
+| Canary 1B v2 | **0.045** | 0.049 | 0% | 0% | CA 1.1x faster |
+| FunASR Nano 2512 | **0.045** | 0.140 | 0% | 100% | CA 3x faster; TC GPU bug |
+| Cohere Transcribe | **0.045** | FAIL | 0% | — | CA wins; TC crashes on GPU |
+| Moonshine Tiny | 0.051 | **0.012** | 9.1% | 0% | TC 4.3x; head_dim=36 no fast flash kernel |
+| Whisper Large v3 Turbo | 0.061 | **0.050** | 0% | 0% | TC 1.2x faster |
+| Qwen3-ASR 0.6B | **0.086** | 0.115 | 0% | 0% | CA 1.3x faster |
+| Parakeet TDT 0.6B | 0.100 | **0.030** | 0% | 0% | TC 3.3x; CPU cblas TDT decoder |
+| Moonshine Streaming Tiny | 0.238 | **0.012** | 0% | 0% | TC 20x; sliding-window masks |
+| Nemotron 3.5 ASR 0.6B | 0.345 | **0.053** | 0% | 0% | TC 6.5x; CPU cblas RNNT decoder |
+
+### CPU mode (both engines, no GPU) — v13
+
+| Family | CA RTF | TC RTF | CA WER | TC WER |
+|--------|--------|--------|--------|--------|
+| Moonshine Tiny | 0.069 | **0.068** | 9.1% | 0% |
+| SenseVoice Small | 0.156 | **0.118** | 0% | 0% |
+| Whisper base | 0.233 | **0.135** | 0% | 0% |
+| Moonshine Streaming Tiny | 0.244 | **0.032** | 0% | 0% |
+| Parakeet TDT 0.6B | 0.385 | **0.266** | 0% | 0% |
+| FunASR Nano 2512 | 0.417 | **0.232** | 0% | 0% |
+| Canary 1B v2 | 0.526 | **0.384** | 0% | 0% |
+| Qwen3-ASR 0.6B | 0.625 | **0.459** | 0% | 0% |
+| Nemotron 3.5 ASR 0.6B | 0.625 | **0.232** | 0% | 0% |
+| Cohere Transcribe | 0.909 | **0.803** | 0% | 0% |
+| Whisper Large v3 Turbo | 5.000 | **2.294** | 0% | 0% |
+
+### transcribe.cpp-only models (CrispASR coverage gaps)
+
+| Family | TC RTF | TC WER | Notes |
+|--------|--------|--------|-------|
+| GigaAM v3 E2E-CTC | 0.074 | 27.3% | Russian-focused + EN; no CrispASR equivalent |
+
+### Key findings
+
+- **GPU**: CrispASR wins 6/11, ties 1, loses 4. Wins on SenseVoice, Whisper,
+  Canary, FunASR, Cohere, Qwen3. Loses on Parakeet (CPU cblas decoder), Nemotron
+  (CPU cblas RNNT), Moonshine (encoder im2col), Moonshine Streaming (architectural).
+  Both require `-DGGML_CUDA_NO_VMM=ON` on Kaggle for `CUDA::cuda_driver` resolution.
+- **CPU**: transcribe.cpp 1.3-3x faster across the board — leaner runtime with
+  less dispatch overhead. CrispASR's unified backend path includes VAD, segment
+  merging, and post-processing that transcribe.cpp skips.
+- **WER**: Both engines produce identical transcripts (0% WER) on 7/9 models.
+  Moonshine Tiny shows a minor Q4_K vs Q8_0 quant difference.
+  FunASR Nano has a transcribe.cpp GPU inference bug (100% WER on GPU, 0% on CPU).
+- **Feature gap**: transcribe.cpp is ASR-only; CrispASR adds TTS, S2S, diarization,
+  LID, forced alignment, translation, and streaming — with GPU acceleration.
+- **Architecture**: transcribe.cpp optimises for per-model performance with
+  architecture-specific dispatch; CrispASR trades some per-model speed for a
+  unified backend that supports 40+ model families across ASR/TTS/S2S/LID/MT.
+
+Benchmark script: `tools/kaggle/transcribe-cpp-bench/transcribe_cpp_bench.py`
+Kernel: `chr1s4/crispasr-vs-transcribe-cpp-bench`
+Results: `cstr/crispasr-kaggle-progress` dataset, prefix `transcribe-cpp-bench/`

@@ -15,11 +15,14 @@ static int g_cpu_n_threads = 4;
 // KV cache: manual std::vector<float> per layer (CPU side).
 
 #include "voxcpm2_tts.h"
+#include "voxcpm2_vae.h"
 #include "core/attention.h"
 #include "core/conv.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/torch_rng.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -30,9 +33,14 @@ static int g_cpu_n_threads = 4;
 #define M_PI 3.14159265358979323846
 #endif
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -40,26 +48,57 @@ static int g_cpu_n_threads = 4;
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `VOXCPM2_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool voxcpm2_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_VOXCPM2_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct voxcpm2_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit voxcpm2_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~voxcpm2_bench_stage() {
+        if (!voxcpm2_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  voxcpm2_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Utility helpers
 // ---------------------------------------------------------------------------
 
 static bool vox_env_bool(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     return v && *v && std::strcmp(v, "0") != 0;
 }
 
 // Like vox_env_bool but defaults to true (opt-out instead of opt-in).
 static bool vox_env_bool_default_on(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     if (!v || !*v)
         return true;                 // unset → on
     return std::strcmp(v, "0") != 0; // "0" → off, anything else → on
 }
+
+// VOXCPM2_FORCE_SCALAR=1  — bypass Accelerate GEMM paths in the VAE encoder
+// (useful for benchmarking or debugging on Apple without recompiling).
+static bool s_vox_force_scalar = vox_env_bool("CRISPASR_VOXCPM2_FORCE_SCALAR");
 
 static double vox_now_ms() {
     using namespace std::chrono;
@@ -67,13 +106,21 @@ static double vox_now_ms() {
 }
 
 // ---------------------------------------------------------------------------
-// Shared CPU backend for tiny ggml graph matmuls. Note: tried switching to
-// ggml_backend_init_best (Metal/CUDA) here but the current matmul_mv_ggml
-// allocates input tensors in a CPU-side mem buffer that Metal can't read
-// → SIGSEGV on first kernel dispatch. The proper fix is the per-step graph
-// refactor (build_locdit_graph, build_tslm_step_graph) with
-// ggml_backend_tensor_set / ggml_backend_alloc_ctx_tensors — those WILL
-// pick up Metal automatically once they're in place.
+// Dedicated CPU backend for the remaining tiny scalar-ish helper matmuls
+// (matmul_mv_ggml et al.). These allocate their inputs in a CPU-side mem buffer
+// (ggml_init no_alloc=false), so they MUST stay on this CPU backend — a Metal
+// backend cannot dereference those host pointers.
+//
+// §176n (2026-07-12): the heavy pipeline no longer depends on that. The per-step
+// FUSED graphs (build_tslm_step_graph / build_ralm_step_graph / build_locdit_graph
+// + the VAE encode/decode graphs) are gated `VOXCPM2_USE_GRAPH=1` (default ON) and
+// run on `ctx->backend` via ggml_gallocr + ggml_backend_tensor_set, so they DO
+// pick up Metal automatically when use_gpu is set. Verified on M1: basic +
+// voice-clone synthesis run fully on Metal (VAE-encode graph, AR loop, VAE
+// decode), no SIGSEGV, ASR round-trip correct, ~3.75x faster than CPU. The old
+// "init_best here → SIGSEGV" note referred to routing THESE CPU helpers through
+// Metal, which is neither needed nor a win (30 tiny matvecs/step would be
+// launch-bound). See PLAN §176n / LEARNINGS.
 // ---------------------------------------------------------------------------
 
 static ggml_backend_t g_cpu_backend = nullptr;
@@ -337,9 +384,16 @@ struct voxcpm2_context {
     float cfg_value = 2.0f;
     int max_len = 2000;
     uint32_t seed = 0;
+    bool vae_only = false;
 
     // RNG for CFM noise generation (seeded per synthesis call)
     mt19937_state rng;
+
+    // Single-entry VAE-encode memo (see vae_encode_cached)
+    const float* vae_cache_pcm = nullptr;
+    int vae_cache_n_samples = -1;
+    int vae_cache_T = 0;
+    std::vector<float> vae_cache_feat;
 
     // Helper: return gpu_weights for graph build (GPU-resident) or weights
     // for legacy paths (always CPU-accessible).
@@ -348,6 +402,7 @@ struct voxcpm2_context {
     // VOXCPM2_USE_GRAPH backend pool.
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    bool owns_backend_cpu = false;
     std::vector<uint8_t> compute_meta;
     ggml_gallocr_t galloc = nullptr;
 
@@ -400,6 +455,14 @@ struct voxcpm2_context {
     ggml_backend_buffer_t vae_wn_ggml_buf = nullptr;
     std::map<std::string, ggml_tensor*> vae_wn_ggml_tensors;
 
+    // Sibling arena + backend buffer for the VAE *encoder* WN weights (PLAN
+    // §181). The encoder's GGUF tensor names ("vae.enc.*") don't collide with
+    // the decoder's ("vae.dec.*"), so its resolved ggml_tensor* live in the
+    // same `vae_wn_ggml_tensors` map but in this separate buffer/ctx, built
+    // lazily by vae_wn_init_ggml_enc() for the VOXCPM2_USE_GRAPH=1 encoder.
+    ggml_context* vae_wn_enc_ggml_ctx = nullptr;
+    ggml_backend_buffer_t vae_wn_enc_ggml_buf = nullptr;
+
     // Pre-permuted ConvTranspose1d weights for decomposed col2im path
     ggml_context* vae_perm_ctx = nullptr;
     ggml_backend_buffer_t vae_perm_buf = nullptr;
@@ -448,6 +511,10 @@ struct voxcpm2_context {
     ggml_tensor* ralm_kv_v = nullptr;
     int ralm_kv_max_ctx = 0;
     bool ralm_kv_synced = false;
+};
+
+struct voxcpm2_vae_context {
+    voxcpm2_context* impl = nullptr;
 };
 
 // Stream struct
@@ -1145,7 +1212,7 @@ static std::vector<float> ralm_step_graph(voxcpm2_context* ctx, const float* hid
     }
 
     if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: ralm_step graph compute failed\n");
@@ -1423,10 +1490,16 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
     int Lk = 0;
     bool bucketed = false;
     // VOXCPM2_NO_BUCKET=1 forces the dynamic (non-bucketed) graph path,
-    // which uses ggml_cpy for KV writes instead of ggml_set_rows. This
-    // works around a NaN bug where ggml_set_rows on CUDA corrupts the
-    // KV cache on the second AR step (#164).
-    static const bool no_bucket = vox_env_bool("VOXCPM2_NO_BUCKET");
+    // which uses ggml_cpy for KV writes instead of ggml_set_rows. The
+    // bucketed path is also disabled by default on CUDA because
+    // ggml_set_rows corrupts the KV cache on the second AR step on CUDA
+    // (#164). Set VOXCPM2_BUCKET_CUDA=1 to re-enable buckets on CUDA
+    // (e.g. for benchmarking), or VOXCPM2_NO_BUCKET=1 to disable on all
+    // backends.
+    static const bool env_no_bucket = vox_env_bool("CRISPASR_VOXCPM2_NO_BUCKET");
+    static const bool env_bucket_cuda = vox_env_bool("CRISPASR_VOXCPM2_BUCKET_CUDA");
+    const bool is_cuda = (strncmp(ggml_backend_name(ctx->backend), "CUDA", 4) == 0);
+    const bool no_bucket = env_no_bucket || (is_cuda && !env_bucket_cuda);
     const int needed_lk = pos + 1;
     const int bucket_idx = no_bucket ? -1 : tslm_pick_bucket(needed_lk);
     if (bucket_idx >= 0) {
@@ -1485,7 +1558,7 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
     }
 
     if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: tslm_step graph compute failed\n");
@@ -1495,7 +1568,7 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
     // Per-node NaN checker (#164 diagnosis). Walks every graph node after
     // compute and reports the first op that produced NaN/Inf. Gated on
     // VOXCPM2_NAN_CHECK=1 (expensive — reads every tensor back to CPU).
-    static const bool nan_check = vox_env_bool("VOXCPM2_NAN_CHECK");
+    static const bool nan_check = vox_env_bool("CRISPASR_VOXCPM2_NAN_CHECK");
     if (nan_check) {
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
             ggml_tensor* nd = ggml_graph_node(gf, i);
@@ -2075,7 +2148,7 @@ static std::vector<float> locenc_forward_graph(voxcpm2_context* ctx, const float
     ggml_backend_tensor_set(t_pos, positions.data(), 0, positions.size() * sizeof(int32_t));
 
     if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: locenc graph compute failed\n");
@@ -2604,7 +2677,7 @@ static std::vector<float> locdit_forward_graph(voxcpm2_context* ctx, const float
     ggml_backend_tensor_set(t_pos, positions.data(), 0, positions.size() * sizeof(int32_t));
 
     if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: locdit graph compute failed\n");
@@ -2632,7 +2705,7 @@ static std::vector<float> locdit_forward_graph(voxcpm2_context* ctx, const float
 
 static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu, const float* cond_raw, int steps,
                                           float cfg, ggml_backend_t cpu_be, const float* initial_noise = nullptr) {
-    const bool bench = vox_env_bool("VOXCPM2_BENCH");
+    const bool bench = vox_env_bool("CRISPASR_VOXCPM2_BENCH");
     const double t_cfm0 = bench ? vox_now_ms() : 0;
     double sum_locdit = 0;
 
@@ -2651,11 +2724,11 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
     // (build_locdit_graph + locdit_forward_graph) instead of the
     // ~30 per-matmul tiny graphs. Same algebra; one graph build/alloc
     // per locdit call instead of one per matmul.
-    const bool use_graph = vox_env_bool_default_on("VOXCPM2_USE_GRAPH");
+    const bool use_graph = vox_env_bool_default_on("CRISPASR_VOXCPM2_USE_GRAPH");
     // VOXCPM2_FA_CPU=1 forces LocDiT/LocEnc to CPU — required on P100
     // where flash_attn_ext F16 accumulator overflows on mu-conditioned
     // attention from the second AR step onwards (#164).
-    static const bool fa_cpu = vox_env_bool("VOXCPM2_FA_CPU");
+    static const bool fa_cpu = vox_env_bool("CRISPASR_VOXCPM2_FA_CPU");
     auto locdit_call = [&](const float* x_tc, const float* mu_in, float t_cur, const float* cond_in,
                            float dt_in) -> std::vector<float> {
         if (use_graph && !fa_cpu) {
@@ -2681,6 +2754,26 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
     // CFG zero-star: first N steps skip computation (use zero velocity)
     int zero_init_steps = std::max(1, (int)(steps * 0.04f)); // = 1 for steps<=25
 
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond LocDiT forward only every K denoise steps and reuse the cached
+    // uncond velocity in between; the cond forward stays fresh every step; the FIRST
+    // CFG-active step and the LAST step always recompute. This uses a slightly stale
+    // uncond, so it CHANGES the output and stays gated OFF by default (K=1 = exact).
+    // The cond/uncond forwards here are already two separate locdit_call()s, so K>1
+    // simply skips the uncond call. Only active when K>1 && cfg>1, so at the default
+    // the legacy branch below is byte-for-byte unchanged. Gated
+    // CRISPASR_VOXCPM2_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_VOXCPM2_CFG_INTERVAL");
+        const int k = e ? atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool interval_on = cfg_interval > 1 && cfg > 1.0f;
+    std::vector<float> v_uncond_cache_tc; // last computed uncond velocity [T,C]; reused between recomputes
+    if (interval_on && std::getenv("CRISPASR_VOXCPM2_CFG_INTERVAL_DEBUG"))
+        fprintf(stderr, "voxcpm2_tts: interval-CFG K=%d (uncond recomputed every %d steps; first+last always)\n",
+                cfg_interval, cfg_interval);
+
     float dt_scalar = 0.0f; // non-mean-mode
 
     for (int step = 1; step <= steps; step++) {
@@ -2702,8 +2795,19 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
 
             double tl = bench ? vox_now_ms() : 0;
             std::vector<float> v_cond_tc = locdit_call(x_tc.data(), mu, t_cur, cond_raw, dt_scalar);
-            std::vector<float> zero_mu(ctx->hp.tslm_d_model, 0.0f);
-            std::vector<float> v_uncond_tc = locdit_call(x_tc.data(), zero_mu.data(), t_cur, cond_raw, dt_scalar);
+            // Interval-CFG: recompute uncond on the first CFG-active step, the last
+            // step, and every K-th step; otherwise reuse the cached uncond velocity.
+            std::vector<float> v_uncond_tc;
+            const bool recompute_unc = !interval_on || v_uncond_cache_tc.empty() || (step == zero_init_steps + 1) ||
+                                       (step == steps) || (((step - zero_init_steps - 1) % cfg_interval) == 0);
+            if (recompute_unc) {
+                std::vector<float> zero_mu(ctx->hp.tslm_d_model, 0.0f);
+                v_uncond_tc = locdit_call(x_tc.data(), zero_mu.data(), t_cur, cond_raw, dt_scalar);
+                if (interval_on)
+                    v_uncond_cache_tc = v_uncond_tc;
+            } else {
+                v_uncond_tc = v_uncond_cache_tc; // reuse stale uncond (the approximation)
+            }
             if (bench)
                 sum_locdit += vox_now_ms() - tl;
 
@@ -2809,7 +2913,8 @@ static float stop_score(voxcpm2_context* ctx, const float* lm_hidden, ggml_backe
 //              .block.{2,3,4}.3.{weight_g,weight_v,bias} — 1x1 conv
 //   layer.8  : final Snake1d (.alpha)
 //   layer.9  : final Conv1d(32,1,k=7)         [weight_g,weight_v,bias]
-//   sr_cond.{2-7}.scale_embed / bias_embed    — [channels, 4], bucket=3 for 48kHz
+//   sr_cond.{2-7}.scale_embed / bias_embed    — GGML ne=[channels,4]
+//                                                (PyTorch [4,channels]), bucket=3 for 48kHz
 //
 // GGUF tensor layout: weight_v stored as [k, in_ch, out_ch] (ne[0]=k, ne[1]=in_ch, ne[2]=out_ch)
 //                     weight_g stored as [out_ch] (scalar per output channel)
@@ -2917,14 +3022,45 @@ static void causal_conv1d(const float* weight, const float* bias, const float* x
     int in_per_grp = in_ch / groups;
     int out_per_grp = out_ch / groups;
 
-    // Depthwise (groups == in_ch == out_ch, in_per_grp == 1) gets the
-    // simple loop — there's nothing to vectorise on ic_inner. Same for
-    // 1x1 conv: weight stride across ic is 1 already, so the inner loop
-    // is contiguous in weight (x is still strided but transpose overhead
-    // dominates the small inner work). All other cases (the dilated k=7
-    // residual-unit convs at the deep upsample blocks) benefit from
-    // laying weight as [k, oc, ic_inner] + transposing x to [t, ic_inner]
-    // so the inner ic dot product is contiguous + NEON-auto-vectorisable.
+#if defined(HAVE_ACCELERATE)
+    // Dense (groups==1): im2col + SGEMM via Accelerate AMX (~100 GFLOP/s on M1).
+    // Override with VOXCPM2_FORCE_SCALAR=1 to benchmark the scalar path.
+    if (groups == 1 && !s_vox_force_scalar) {
+        int K = in_ch * ksize;
+        if (ksize == 1 && stride == 1 && pad == 0) {
+            // col == x_in: direct GEMM, zero allocation
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, out_ch, T_out, K, 1.0f, weight, K, x_in, T_out, 0.0f,
+                        x_out, T_out);
+        } else {
+            std::vector<float> col((size_t)K * T_out, 0.0f);
+            for (int ic = 0; ic < in_ch; ic++) {
+                for (int k = 0; k < ksize; k++) {
+                    const float* x_row = x_in + (size_t)ic * T_in;
+                    float* col_row = col.data() + (size_t)(ic * ksize + k) * T_out;
+                    for (int ot = 0; ot < T_out; ot++) {
+                        int it = ot * stride - pad + k * dilation;
+                        if (it >= 0 && it < T_in)
+                            col_row[ot] = x_row[it];
+                    }
+                }
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, out_ch, T_out, K, 1.0f, weight, K, col.data(), T_out,
+                        0.0f, x_out, T_out);
+        }
+        if (bias) {
+            for (int oc = 0; oc < out_ch; oc++) {
+                float b_val = bias[oc];
+                float* row = x_out + (size_t)oc * T_out;
+                for (int ot = 0; ot < T_out; ot++)
+                    row[ot] += b_val;
+            }
+        }
+        return;
+    }
+#endif
+
+    // Depthwise (in_per_grp == 1): simple scalar loop — nothing to vectorise.
+    // Grouped with in_per_grp > 1 and ksize > 1: transpose x+w for cache-friendly ic.
     const bool use_transpose = (in_per_grp > 1 && ksize > 1);
     if (!use_transpose) {
 #if defined(_OPENMP)
@@ -3049,6 +3185,54 @@ static void causal_conv1d(const float* weight, const float* bias, const float* x
 static void causal_transposed_conv1d(const float* weight, const float* bias, const float* x_in, float* x_out, int in_ch,
                                      int out_ch, int ksize, int T_in, int stride) {
     int T_out = T_in * stride;
+
+#if defined(HAVE_ACCELERATE)
+    // Transposed conv = GEMM (P = W2 @ x_in) + col2im overlap-add scatter.
+    //   P[oc*ksize + k, it] = sum_ic weight[ic, oc, k] * x_in[ic, it]
+    //   x_out[oc, it*stride + k] += P[oc*ksize + k, it]   (keep pos < T_out)
+    // The GEMM (M=out_ch*ksize, N=T_in, K=in_ch) runs on Accelerate AMX
+    // (~100 GFLOP/s on M1); the scatter is memory-bound and cheap.
+    // Override with VOXCPM2_FORCE_SCALAR=1 to use the transpose-trick path below.
+    if (!s_vox_force_scalar) {
+        int M = out_ch * ksize;
+        // W2[(oc*ksize + k), ic] from weight[(ic*out_ch + oc)*ksize + k]
+        std::vector<float> W2((size_t)M * in_ch);
+#if defined(_OPENMP)
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+        for (int oc = 0; oc < out_ch; oc++) {
+            for (int k = 0; k < ksize; k++) {
+                float* dst = W2.data() + (size_t)(oc * ksize + k) * in_ch;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    dst[ic] = weight[((size_t)ic * out_ch + oc) * ksize + k];
+                }
+            }
+        }
+        std::vector<float> P((size_t)M * T_in);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, T_in, in_ch, 1.0f, W2.data(), in_ch, x_in, T_in, 0.0f,
+                    P.data(), T_in);
+        // col2im scatter (one oc per thread → no write races between threads).
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (int oc = 0; oc < out_ch; oc++) {
+            float* out_row = x_out + (size_t)oc * T_out;
+            float b_val = bias ? bias[oc] : 0.0f;
+            for (int ot = 0; ot < T_out; ot++)
+                out_row[ot] = b_val;
+            for (int k = 0; k < ksize; k++) {
+                const float* p_row = P.data() + (size_t)(oc * ksize + k) * T_in;
+                for (int it = 0; it < T_in; it++) {
+                    int pos = it * stride + k;
+                    if (pos < T_out)
+                        out_row[pos] += p_row[it];
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     (void)ksize; // no offset needed: take first T_in*S of the no-padding output
 
     // Inner ic loop in the natural layout reads x[ic*T_in+it] (stride T_in)
@@ -3119,7 +3303,7 @@ static void causal_transposed_conv1d(const float* weight, const float* bias, con
 // ---------------------------------------------------------------------------
 static const float* vae_tensor_f32(const std::map<std::string, ggml_tensor*>& tensors, const std::string& name) {
     auto it = tensors.find(name);
-    if (it == tensors.end() || !it->second)
+    if (it == tensors.end() || !it->second || it->second->type != GGML_TYPE_F32)
         return nullptr;
     return (const float*)it->second->data;
 }
@@ -3206,8 +3390,8 @@ static void vae_residual_unit(voxcpm2_context* ctx, const std::string& prefix, c
 // so we don't cache the graph itself — only the weight bridge.
 // ===========================================================================
 
-static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std::vector<float>>& patches,
-                                     ggml_backend_t cpu_be); // fwd-decl for fallback
+static std::vector<float> vae_decode_cpu(voxcpm2_context* ctx,
+                                         const std::vector<std::vector<float>>& patches); // fwd-decl for graph fallback
 
 // ---------------------------------------------------------------------------
 // Snake1d as a ggml subgraph.
@@ -3298,6 +3482,43 @@ static ggml_tensor* causal_transposed_conv1d_ggml(ggml_context* ctx0, ggml_tenso
     const int out_ch = (int)y->ne[1];
     y = ggml_view_2d(ctx0, y, T_out, out_ch, y->nb[1], /*offset*/ 0);
     y = ggml_cont(ctx0, y);
+    if (bias) {
+        ggml_tensor* b2d = ggml_reshape_2d(ctx0, bias, 1, (int)bias->ne[0]);
+        y = ggml_add(ctx0, y, b2d);
+    }
+    return y;
+}
+
+// ---------------------------------------------------------------------------
+// Strided Conv1d with LEFT-only padding, as a ggml subgraph. Mirrors the
+// encoder's CPU `vae_strided_conv1d`: Python does
+//   F.pad(x, (left_pad, 0)); Conv1d(stride=s, padding=0)
+// where `left_pad = 2*ceil(s/2) - (s%2)` is SMALLER than the usual causal
+// `(K-1)*d`, so `causal_conv1d_ggml` can't express it.
+//
+// ggml has no Metal-supported asymmetric pad op (ggml-metal rejects any
+// nonzero left-pad on GGML_OP_PAD). But ggml_conv_1d's `p` pads SYMMETRICALLY
+// (both sides by `p`), and for output position j the gathered window starts
+// at original index `j*s - p` regardless of right-side padding. So a
+// symmetric-pad-`left_pad` conv reproduces the left-pad-only conv EXACTLY for
+// its first T_out columns (the extra trailing columns only see right-pad
+// zeros and are discarded) — identical trick to causal_conv1d_ggml.
+//
+// `weight` ne: [K, in_ch, out_ch]; `x` ne: [T_in, in_ch]; bias [out_ch] or
+// nullptr. Output ne: [T_out, out_ch] with T_out = (T_in + left_pad - K)/s + 1.
+// ---------------------------------------------------------------------------
+static ggml_tensor* vae_strided_conv1d_ggml(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias,
+                                            int stride, int left_pad) {
+    const int K = (int)weight->ne[0];
+    const int T_in = (int)x->ne[0];
+    const int T_out = (T_in + left_pad - K) / stride + 1;
+    ggml_tensor* y = ggml_conv_1d(ctx0, weight, x, stride, /*p*/ left_pad, /*d*/ 1);
+    // y ne[0] = (T_in + 2*left_pad - K)/stride + 1 >= T_out; keep first T_out.
+    const int out_ch = (int)y->ne[1];
+    if ((int)y->ne[0] > T_out) {
+        y = ggml_view_2d(ctx0, y, T_out, out_ch, y->nb[1], /*offset*/ 0);
+        y = ggml_cont(ctx0, y);
+    }
     if (bias) {
         ggml_tensor* b2d = ggml_reshape_2d(ctx0, bias, 1, (int)bias->ne[0]);
         y = ggml_add(ctx0, y, b2d);
@@ -3498,23 +3719,14 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
 
     for (const auto& sr_pfx : sr_names) {
         // Each SR cond produces two [C] tensors: .sr_scale and .sr_bias.
-        // GGUF scale_embed PyTorch shape is (C, 4) with bucket innermost in
-        // PyTorch's C-order. The GGUF loader stores this with ggml
-        // ne=[C, 4] — i.e. C innermost in memory (PyTorch's "outer" dim
-        // becomes ggml's "inner" because ggml ne is reversed from PyTorch
-        // shape report by gguf-py). So C = ne[0], NOT ne[1].
-        // The legacy `se[c*4 + bucket]` access pattern below ALSO assumes
-        // the memory layout has bucket innermost (i.e. (C, 4) row-major),
-        // but since ne is reversed-but-the-data-is-the-same, both views
-        // see the same flat bytes. The legacy loop uses Cc (channel count
-        // from upstream) directly, sidestepping the ne-ordering ambiguity.
+        // PyTorch nn.Embedding stores this as [4 buckets, C channels]. GGUF
+        // reverses the reported dimensions to ne=[C, 4] while preserving the
+        // flat bytes, so each bucket is one contiguous C-element row.
         auto it_s = T.find(sr_pfx + ".scale_embed");
         auto it_b = T.find(sr_pfx + ".bias_embed");
         if (it_s == T.end() || !it_s->second)
             continue;
-        // Take the larger of the two ne dims — robust to either ne ordering.
-        // For (C, 4) ne=[4, C] or [C, 4], C is always the non-4 dim.
-        int C = (int)std::max(it_s->second->ne[0], it_s->second->ne[1]);
+        int C = (int)it_s->second->ne[0];
         ggml_tensor* ts = ggml_new_tensor_1d(ctx->vae_wn_ggml_ctx, GGML_TYPE_F32, C);
         ggml_set_name(ts, (sr_pfx + ".sr_scale").c_str());
         M[sr_pfx + ".sr_scale"] = ts;
@@ -3582,22 +3794,20 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
         }
     }
 
-    // SR conditioning: scale_embed/bias_embed PyTorch shape (C, 4) — bucket
-    // is the innermost axis in memory (PyTorch C-order). The legacy
-    // `se[c*4 + bucket]` flat read confirms this layout regardless of how
-    // gguf-py / ggml ne report the shape. C is the non-4 dim.
+    // SR conditioning: PyTorch nn.Embedding weights are [4 buckets, C], so a
+    // bucket is the contiguous row at bucket*C in the preserved flat data.
     const int sr_bucket = 3;
     for (const auto& sr_pfx : sr_names) {
         auto it_s = T.find(sr_pfx + ".scale_embed");
         if (it_s == T.end() || !it_s->second)
             continue;
-        int C = (int)std::max(it_s->second->ne[0], it_s->second->ne[1]);
+        int C = (int)it_s->second->ne[0];
         const float* se = (const float*)it_s->second->data;
         std::vector<float> sc(C);
         for (int c = 0; c < C; c++)
-            sc[c] = se[(size_t)c * 4 + sr_bucket];
+            sc[c] = se[(size_t)sr_bucket * C + c];
         ggml_backend_tensor_set(M[sr_pfx + ".sr_scale"], sc.data(), 0, sc.size() * sizeof(float));
-        if (vox_env_bool("VOXCPM2_VAE_TRACE")) {
+        if (vox_env_bool("CRISPASR_VOXCPM2_VAE_TRACE")) {
             fprintf(stderr, "voxcpm2 VAE-trace [init] %-30s ne=[%lld,%lld] C=%d sc[0]=%.6f\n", sr_pfx.c_str(),
                     (long long)it_s->second->ne[0], (long long)it_s->second->ne[1], C, sc[0]);
         }
@@ -3607,7 +3817,7 @@ static bool vae_wn_init_ggml(voxcpm2_context* ctx) {
             const float* be = (const float*)it_b->second->data;
             std::vector<float> bv(C);
             for (int c = 0; c < C; c++)
-                bv[c] = be[(size_t)c * 4 + sr_bucket];
+                bv[c] = be[(size_t)sr_bucket * C + c];
             ggml_backend_tensor_set(M[sr_pfx + ".sr_bias"], bv.data(), 0, bv.size() * sizeof(float));
         }
     }
@@ -3671,7 +3881,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     if (!vae_wn_init_ggml(ctx)) {
         if (ctx->verbosity >= 1)
             fprintf(stderr, "voxcpm2: vae_wn_init_ggml failed; falling back to CPU vae_decode\n");
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
 
     const int feat_dim = 64;
@@ -3686,13 +3896,15 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     // dispatch assertion in ggml-vulkan.cpp fires. Fall back to the CPU path
     // which has no such limit — the VAE is <5% of total synthesis time anyway.
     const int64_t out_samples = (int64_t)T_lat * 1920;
-    if (out_samples > 500000 && !ggml_backend_is_cpu(ctx->backend)) {
+    const char* backend_name = ggml_backend_name(ctx->backend);
+    const bool is_cuda = backend_name && std::strncmp(backend_name, "CUDA", 4) == 0;
+    if (out_samples > 500000 && !ggml_backend_is_cpu(ctx->backend) && !is_cuda) {
         if (ctx->verbosity >= 1)
             fprintf(stderr,
                     "voxcpm2: VAE output too long for GPU dispatch "
                     "(%lld samples, %d patches); using CPU\n",
                     (long long)out_samples, n_patches);
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
 
     // Pack patches into a flat [T_lat, feat_dim] host buffer.
@@ -3722,7 +3934,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     };
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0) {
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
 
@@ -3760,7 +3972,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     cur = causal_conv1d_ggml(ctx0, cur, Wget("vae.dec.layer.0"), Bias("vae.dec.layer.0"),
                              /*dilation*/ 1, /*depthwise*/ true);
 
-    const bool trace = vox_env_bool("VOXCPM2_VAE_TRACE");
+    const bool trace = vox_env_bool("CRISPASR_VOXCPM2_VAE_TRACE");
     if (trace) {
         ggml_set_name(cur, "g_after_layer0");
         ggml_set_output(cur);
@@ -3868,24 +4080,24 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
         fprintf(stderr, "voxcpm2: vae_decode_graph gallocr alloc failed; falling back to CPU\n");
         ggml_free(ctx0);
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
 
     ggml_tensor* t_latents = ggml_graph_get_tensor(gf, "latents");
     if (!t_latents) {
         fprintf(stderr, "voxcpm2: vae_decode_graph missing latents tensor; falling back to CPU\n");
         ggml_free(ctx0);
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
     ggml_backend_tensor_set(t_latents, latents_host.data(), 0, latents_host.size() * sizeof(float));
 
     if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: vae_decode_graph compute failed; falling back to CPU\n");
         ggml_free(ctx0);
-        return vae_decode(ctx, patches, ctx->backend_cpu);
+        return vae_decode_cpu(ctx, patches);
     }
 
     ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm");
@@ -3894,7 +4106,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     std::vector<float> pcm(n_out);
     ggml_backend_tensor_get(pcm_t, pcm.data(), 0, pcm.size() * sizeof(float));
 
-    if (vox_env_bool("VOXCPM2_VAE_TRACE")) {
+    if (vox_env_bool("CRISPASR_VOXCPM2_VAE_TRACE")) {
         auto dump_tensor = [&](const char* name) {
             ggml_tensor* t = ggml_graph_get_tensor(gf, name);
             if (!t)
@@ -3948,20 +4160,16 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
 //   layer.2-7: upsample blocks (rates [8,6,5,2,2,2])
 //   layer.8  : final Snake1d
 //   layer.9  : final out-conv (k=7, last_ch->1)
-//   sr_cond.{2-7}.scale_embed / bias_embed : [channels, 4], bucket=3 for 48kHz
+//   sr_cond.{2-7}.scale_embed / bias_embed : GGML ne=[channels,4]
+//                                             (PyTorch [4,channels]), bucket=3 for 48kHz
 //
 // When VAE weights are absent, returns silence of the correct duration.
 // ---------------------------------------------------------------------------
 
-static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std::vector<float>>& patches,
-                                     ggml_backend_t /*cpu_be*/) {
+static std::vector<float> vae_decode_cpu(voxcpm2_context* ctx, const std::vector<std::vector<float>>& patches) {
     int n_patches = (int)patches.size();
     if (n_patches == 0)
         return {};
-
-    if (vox_env_bool_default_on("VOXCPM2_USE_GRAPH")) {
-        return vae_decode_graph(ctx, patches);
-    }
 
     int feat_dim = 64;
     int P = (int)ctx->hp.patch_frames; // 4
@@ -4027,7 +4235,7 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     int Cc = feat_dim;
     std::vector<float> h;
 
-    const bool vae_trace = vox_env_bool("VOXCPM2_VAE_TRACE");
+    const bool vae_trace = vox_env_bool("CRISPASR_VOXCPM2_VAE_TRACE");
     auto trace_dump = [&](const char* name, const std::vector<float>& v, int Cv, int Tv) {
         if (!vae_trace)
             return;
@@ -4103,7 +4311,7 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     trace_dump("after_layer1", h, Cc, Tc);
 
     // --- Layers 2-7: upsample blocks ---
-    const bool bench_vae = vox_env_bool("VOXCPM2_BENCH");
+    const bool bench_vae = vox_env_bool("CRISPASR_VOXCPM2_BENCH");
     for (int b = 0; b < n_up_blocks; b++) {
         int layer_idx = b + 2; // layers 2 through 7
         int up = up_rates[b];
@@ -4111,9 +4319,8 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
         double t_block0 = bench_vae ? vox_now_ms() : 0;
         double t_block_up = 0, t_block_res = 0;
 
-        // SR conditioning: scale_embed and bias_embed are [channels, 4]
-        // GGUF layout [channels, 4] -> ne[0]=4, ne[1]=channels
-        // scale_embed[c, bucket] = data[bucket + c*4]
+        // SR conditioning embeddings are PyTorch [4 buckets, channels]. The
+        // selected bucket is one contiguous Cc-element row in GGUF data.
         // Apply: x[c, t] = x[c, t] * scale[c] + bias[c]
         {
             std::string sr_pfx = "vae.dec.sr_cond." + std::to_string(layer_idx);
@@ -4124,8 +4331,8 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
 #pragma omp parallel for schedule(static)
 #endif
                 for (int c = 0; c < Cc; c++) {
-                    float sc = se[(size_t)c * 4 + sr_bucket];
-                    float bi = be ? be[(size_t)c * 4 + sr_bucket] : 0.0f;
+                    float sc = se[(size_t)sr_bucket * Cc + c];
+                    float bi = be ? be[(size_t)sr_bucket * Cc + c] : 0.0f;
                     float* hc = h.data() + (size_t)c * Tc;
                     for (int t = 0; t < Tc; t++) {
                         hc[t] = hc[t] * sc + bi;
@@ -4267,6 +4474,17 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
     return pcm;
 }
 
+// Dispatcher: routes to the ggml graph path or the legacy CPU path.
+// All fallback sites inside vae_decode_graph call vae_decode_cpu directly
+// to avoid the mutual recursion that caused STATUS_STACK_OVERFLOW (#164).
+static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std::vector<float>>& patches,
+                                     ggml_backend_t /*cpu_be*/) {
+    if (vox_env_bool_default_on("CRISPASR_VOXCPM2_USE_GRAPH")) {
+        return vae_decode_graph(ctx, patches);
+    }
+    return vae_decode_cpu(ctx, patches);
+}
+
 // ===========================================================================
 // VAE encoder — used by voice cloning. Encodes 16 kHz mono PCM into latent
 // patches [T_patches, P=4, D=64] for the reference prefix in TSLM prefill.
@@ -4291,22 +4509,55 @@ static std::vector<float> vae_decode(voxcpm2_context* ctx, const std::vector<std
 static void vae_strided_conv1d(const float* weight, const float* bias, const float* x_in, float* x_out, int in_ch,
                                int out_ch, int ksize, int T_in, int stride, int left_pad) {
     int T_out = (T_in + left_pad - ksize) / stride + 1;
+    if (T_out <= 0)
+        return;
+
+#if defined(HAVE_ACCELERATE)
+    // im2col + SGEMM via Accelerate AMX (~100 GFLOP/s on M1).
+    // Override with VOXCPM2_FORCE_SCALAR=1 to use the scalar fallback below.
+    if (!s_vox_force_scalar) {
+        int K = in_ch * ksize;
+        std::vector<float> col((size_t)K * T_out, 0.0f);
+        for (int ic = 0; ic < in_ch; ic++) {
+            for (int k = 0; k < ksize; k++) {
+                const float* x_row = x_in + (size_t)ic * T_in;
+                float* col_row = col.data() + (size_t)(ic * ksize + k) * T_out;
+                int it_base = k - left_pad;
+                for (int ot = 0; ot < T_out; ot++) {
+                    int it = it_base + ot * stride;
+                    if (it >= 0 && it < T_in)
+                        col_row[ot] = x_row[it];
+                }
+            }
+        }
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, out_ch, T_out, K, 1.0f, weight, K, col.data(), T_out,
+                    0.0f, x_out, T_out);
+        if (bias) {
+            for (int oc = 0; oc < out_ch; oc++) {
+                float b_val = bias[oc];
+                float* row = x_out + (size_t)oc * T_out;
+                for (int ot = 0; ot < T_out; ot++)
+                    row[ot] += b_val;
+            }
+        }
+        return;
+    }
+#endif
+
+    // Scalar fallback (cache-unfriendly for large in_ch but correct on all platforms).
 #if defined(_OPENMP)
 #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int oc = 0; oc < out_ch; oc++) {
         for (int ot = 0; ot < T_out; ot++) {
-            float b_val = bias ? bias[oc] : 0.0f;
-            float acc = b_val;
+            float acc = bias ? bias[oc] : 0.0f;
             int it_start = ot * stride - left_pad;
             for (int k = 0; k < ksize; k++) {
                 int it = it_start + k;
                 if (it < 0 || it >= T_in)
                     continue;
                 for (int ic = 0; ic < in_ch; ic++) {
-                    float xv = x_in[(size_t)ic * T_in + it];
-                    float wv = weight[(size_t)oc * in_ch * ksize + (size_t)ic * ksize + k];
-                    acc += xv * wv;
+                    acc += x_in[(size_t)ic * T_in + it] * weight[(size_t)oc * in_ch * ksize + (size_t)ic * ksize + k];
                 }
             }
             x_out[(size_t)oc * T_out + ot] = acc;
@@ -4365,40 +4616,35 @@ static int vae_enc_block(voxcpm2_context* ctx, int blk_idx, int in_ch, int out_c
 // (matching Python `feat.view(D, -1, P).permute(1, 2, 0)`).
 // On failure (encoder weights missing) returns an empty vector and sets
 // *out_T_patches = 0.
-// Process-wide VAE encode cache. The diff harness calls extract_stage once per
-// stage and several stages need ref_feat — the encoder takes ~30 s on CPU so
-// re-running it 5-10 times serialises into multiple minutes. Cache keyed on
-// (ctx, ref pointer, ref length).
-struct vox_vae_cache_key {
-    voxcpm2_context* ctx;
-    const float* pcm;
-    int n_samples;
-    bool operator==(const vox_vae_cache_key& o) const {
-        return ctx == o.ctx && pcm == o.pcm && n_samples == o.n_samples;
-    }
-};
-
 static std::vector<float> vae_encode_uncached(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                               int* out_T_patches);
+// VOXCPM2_USE_GRAPH=1 GPU encoder (PLAN §181) + its dispatcher; defined after
+// vae_encode_uncached so the CPU fallback / Tier-0 diff target is in scope.
+static std::vector<float> vae_encode_graph(voxcpm2_context* ctx, const float* pcm, int n_samples, int* out_T_patches);
+static std::vector<float> vae_encode_dispatch(voxcpm2_context* ctx, const float* pcm, int n_samples,
+                                              int* out_T_patches);
 
+// Per-context VAE encode cache. The diff harness calls extract_stage once per
+// stage and several stages need ref_feat — the encoder takes ~30 s on CPU so
+// re-running it 5-10 times serialises into multiple minutes. Cache keyed on
+// (ref pointer, ref length) and stored in the context so its lifetime matches
+// it (a stale entry can't outlive the context and hit a later one that reuses
+// the same addresses — same single-model assumption as PR #244).
 static const std::vector<float>& vae_encode_cached(voxcpm2_context* ctx, const float* pcm, int n_samples,
                                                    int* out_T_patches) {
-    static vox_vae_cache_key cached_key{nullptr, nullptr, -1};
-    static std::vector<float> cached;
-    static int cached_T = 0;
-    vox_vae_cache_key key{ctx, pcm, n_samples};
-    if (!(key == cached_key)) {
-        cached = vae_encode_uncached(ctx, pcm, n_samples, &cached_T);
-        cached_key = key;
+    if (ctx->vae_cache_pcm != pcm || ctx->vae_cache_n_samples != n_samples) {
+        ctx->vae_cache_feat = vae_encode_dispatch(ctx, pcm, n_samples, &ctx->vae_cache_T);
+        ctx->vae_cache_pcm = pcm;
+        ctx->vae_cache_n_samples = n_samples;
     }
     if (out_T_patches) {
-        *out_T_patches = cached_T;
+        *out_T_patches = ctx->vae_cache_T;
     }
-    return cached;
+    return ctx->vae_cache_feat;
 }
 
 static std::vector<float> vae_encode(voxcpm2_context* ctx, const float* pcm, int n_samples, int* out_T_patches) {
-    return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    return vae_encode_dispatch(ctx, pcm, n_samples, out_T_patches);
 }
 
 static std::vector<float> vae_encode_uncached(voxcpm2_context* ctx, const float* pcm, int n_samples,
@@ -4496,6 +4742,381 @@ static std::vector<float> vae_encode_uncached(voxcpm2_context* ctx, const float*
                 latent_dim);
     }
     return out;
+}
+
+// ===========================================================================
+// VOXCPM2_USE_GRAPH=1 VAE *encoder* — full ggml cgraph (PLAN §181)
+//
+// Mirrors `vae_encode_uncached` exactly (the trusted, ASR-verbatim CPU ground
+// truth) but emits one cgraph so the encoder runs on ctx->backend like every
+// other VoxCPM2 stage. Until now the encoder was the only CPU-only stage; on
+// Linux/CUDA/Vulkan (no Accelerate) it fell through to a scalar loop measured
+// at 672 s for an 11 s reference. CPU fallback kept for any failure.
+// ===========================================================================
+
+// Encoder counterpart of vae_wn_init_ggml: reconstruct WN conv weights, snake
+// alpha + 1/(alpha+1e-9) reciprocals, and per-conv biases into a dedicated
+// backend buffer. Resolved tensors land in the shared vae_wn_ggml_tensors map
+// under "vae.enc.*" keys (no collision with the decoder's "vae.dec.*").
+static bool vae_wn_init_ggml_enc(voxcpm2_context* ctx) {
+    if (ctx->vae_wn_enc_ggml_buf) {
+        return true; // already built
+    }
+    if (!ctx->backend) {
+        return false;
+    }
+    const auto& T = ctx->tensors;
+    if (T.find("vae.enc.conv0.weight_g") == T.end()) {
+        return false;
+    }
+    const auto& hp = ctx->hp;
+    const int d_model = (int)hp.vae_enc_dim;           // 128
+    const int latent_dim = (int)hp.vae_enc_latent_dim; // 64
+    const int n_blocks = (int)hp.vae_enc_n_blocks;     // 4
+
+    struct WnEntry {
+        std::string key, g_name, v_name;
+        int out_ch, in_ch, ksize;
+    };
+    std::vector<WnEntry> wn_entries;
+    std::vector<std::string> alpha_names; // full alpha tensor names
+    std::vector<std::string> bias_names;
+
+    // conv0: dense, in=1, out=d_model, k=7
+    wn_entries.push_back({"vae.enc.conv0", "vae.enc.conv0.weight_g", "vae.enc.conv0.weight_v", d_model, 1, 7});
+    bias_names.push_back("vae.enc.conv0.bias");
+
+    int cur_C = d_model;
+    for (int b = 0; b < n_blocks; b++) {
+        const int out_C = cur_C * 2;
+        const int stride = (int)hp.vae_enc_rates[b];
+        const std::string blk = "vae.enc.blk." + std::to_string(b);
+        for (int r = 0; r < 3; r++) {
+            const std::string rp = blk + ".res." + std::to_string(r);
+            alpha_names.push_back(rp + ".0.alpha");
+            alpha_names.push_back(rp + ".2.alpha");
+            // .1 depthwise k=7 (out=in=cur_C, groups=cur_C)
+            wn_entries.push_back({rp + ".1", rp + ".1.weight_g", rp + ".1.weight_v", cur_C, 1, 7});
+            bias_names.push_back(rp + ".1.bias");
+            // .3 1x1 dense cur_C -> cur_C
+            wn_entries.push_back({rp + ".3", rp + ".3.weight_g", rp + ".3.weight_v", cur_C, cur_C, 1});
+            bias_names.push_back(rp + ".3.bias");
+        }
+        // snake before strided downsample
+        alpha_names.push_back(blk + ".sub.3.alpha");
+        // strided downsample: dense, cur_C -> out_C, k=2*stride
+        wn_entries.push_back(
+            {blk + ".sub.4", blk + ".sub.4.weight_g", blk + ".sub.4.weight_v", out_C, cur_C, 2 * stride});
+        bias_names.push_back(blk + ".sub.4.bias");
+        cur_C = out_C;
+    }
+    // fc_mu: dense, cur_C -> latent_dim, k=3
+    wn_entries.push_back({"vae.enc.fc_mu", "vae.enc.fc_mu.weight_g", "vae.enc.fc_mu.weight_v", latent_dim, cur_C, 3});
+    bias_names.push_back("vae.enc.fc_mu.bias");
+
+    const size_t n_tensors_estimate = wn_entries.size() + 2 * alpha_names.size() + bias_names.size() + 8;
+    ggml_init_params ip = {
+        /*.mem_size   =*/ggml_tensor_overhead() * n_tensors_estimate,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ctx->vae_wn_enc_ggml_ctx = ggml_init(ip);
+    if (!ctx->vae_wn_enc_ggml_ctx) {
+        return false;
+    }
+
+    auto& M = ctx->vae_wn_ggml_tensors;
+    for (const auto& e : wn_entries) {
+        // Same shape logic as vae_wn_init_ggml: depthwise → ne=[K,1,C];
+        // 1x1 → ne=[1,in,out]; dense k>1 → ne=[K,in,out]. wn_reconstruct emits
+        // flat [out,in,K] = ggml ne=[K,in,out], matching ggml_conv_1d.
+        ggml_tensor* t;
+        if (e.in_ch == 1 && e.ksize > 1) {
+            t = ggml_new_tensor_3d(ctx->vae_wn_enc_ggml_ctx, GGML_TYPE_F32, e.ksize, 1, e.out_ch);
+        } else if (e.ksize == 1) {
+            t = ggml_new_tensor_3d(ctx->vae_wn_enc_ggml_ctx, GGML_TYPE_F32, 1, e.in_ch, e.out_ch);
+        } else {
+            t = ggml_new_tensor_3d(ctx->vae_wn_enc_ggml_ctx, GGML_TYPE_F32, e.ksize, e.in_ch, e.out_ch);
+        }
+        if (!t) {
+            return false;
+        }
+        ggml_set_name(t, e.key.c_str());
+        M[e.key] = t;
+    }
+    for (const auto& name : alpha_names) {
+        auto it = T.find(name);
+        if (it == T.end() || !it->second)
+            continue;
+        int C = (int)ggml_nelements(it->second);
+        ggml_tensor* t = ggml_new_tensor_1d(ctx->vae_wn_enc_ggml_ctx, GGML_TYPE_F32, C);
+        if (!t)
+            return false;
+        ggml_set_name(t, (name + ".inv").c_str());
+        M[name + ".inv"] = t;
+        ggml_tensor* ta = ggml_new_tensor_1d(ctx->vae_wn_enc_ggml_ctx, GGML_TYPE_F32, C);
+        if (!ta)
+            return false;
+        ggml_set_name(ta, name.c_str());
+        M[name] = ta;
+    }
+    for (const auto& name : bias_names) {
+        auto it = T.find(name);
+        if (it == T.end() || !it->second)
+            continue;
+        int C = (int)ggml_nelements(it->second);
+        ggml_tensor* t = ggml_new_tensor_1d(ctx->vae_wn_enc_ggml_ctx, GGML_TYPE_F32, C);
+        if (!t)
+            return false;
+        ggml_set_name(t, name.c_str());
+        M[name] = t;
+    }
+
+    ctx->vae_wn_enc_ggml_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx->vae_wn_enc_ggml_ctx, ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ctx->vae_wn_enc_ggml_buf) {
+        ggml_free(ctx->vae_wn_enc_ggml_ctx);
+        ctx->vae_wn_enc_ggml_ctx = nullptr;
+        return false;
+    }
+
+    // Populate. WN convs.
+    for (const auto& e : wn_entries) {
+        const float* g = vae_tensor_f32(T, e.g_name);
+        const float* v = vae_tensor_f32(T, e.v_name);
+        if (!g || !v)
+            continue;
+        std::vector<float> w = wn_reconstruct(g, v, e.out_ch, e.in_ch, e.ksize);
+        ggml_backend_tensor_set(M[e.key], w.data(), 0, w.size() * sizeof(float));
+    }
+    // Snake: inv_alpha = 1/(alpha+1e-9) + GPU copy of alpha (#164).
+    for (const auto& name : alpha_names) {
+        auto it = T.find(name);
+        if (it == T.end() || !it->second)
+            continue;
+        int C = (int)ggml_nelements(it->second);
+        const float* a = (const float*)it->second->data;
+        std::vector<float> inv(C);
+        for (int i = 0; i < C; i++)
+            inv[i] = 1.0f / (a[i] + 1e-9f);
+        ggml_backend_tensor_set(M[name + ".inv"], inv.data(), 0, inv.size() * sizeof(float));
+        ggml_backend_tensor_set(M[name], a, 0, (size_t)C * sizeof(float));
+    }
+    // Biases.
+    for (const auto& name : bias_names) {
+        auto it = T.find(name);
+        if (it == T.end() || !it->second)
+            continue;
+        int C = (int)ggml_nelements(it->second);
+        const float* bptr = (const float*)it->second->data;
+        ggml_backend_tensor_set(M[name], bptr, 0, (size_t)C * sizeof(float));
+    }
+
+    if (ctx->verbosity >= 1) {
+        size_t total = 0;
+        for (const auto& e : wn_entries)
+            total += ggml_nbytes(M[e.key]);
+        fprintf(stderr, "voxcpm2: vae_wn ENC ggml buffer ready (%zu conv weights, %.1f MB)\n", wn_entries.size(),
+                total / (1024.0 * 1024.0));
+    }
+    return true;
+}
+
+static std::vector<float> vae_encode_graph(voxcpm2_context* ctx, const float* pcm, int n_samples, int* out_T_patches) {
+    if (out_T_patches) {
+        *out_T_patches = 0;
+    }
+    const auto& Tens = ctx->tensors;
+    const auto& hp = ctx->hp;
+
+    if (vae_tensor_f32(Tens, "vae.enc.conv0.weight_g") == nullptr) {
+        return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    }
+
+    const int P = (int)hp.patch_frames;            // 4
+    const int d_model = (int)hp.vae_enc_dim;       // 128
+    const int n_blocks = (int)hp.vae_enc_n_blocks; // 4
+
+    int hop = 1;
+    for (int b = 0; b < n_blocks; b++)
+        hop *= (int)hp.vae_enc_rates[b];
+    const int patch_len = P * hop;
+    if (n_samples <= 0 || patch_len <= 0) {
+        return {};
+    }
+    const int padded_n = ((n_samples + patch_len - 1) / patch_len) * patch_len;
+
+    // Workgroup guard (#164): conv0 runs on the full padded length. Very long
+    // refs can overflow Vulkan/Metal dispatch limits; the encoder is a small
+    // slice of synthesis time, so fall back to CPU for pathological lengths.
+    const char* backend_name = ggml_backend_name(ctx->backend);
+    const bool is_cuda = backend_name && std::strncmp(backend_name, "CUDA", 4) == 0;
+    if (padded_n > 500000 && !ggml_backend_is_cpu(ctx->backend) && !is_cuda) {
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "voxcpm2: VAE encode input too long for GPU dispatch (%d samples); using CPU\n", padded_n);
+        return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    }
+
+    if (!vae_wn_init_ggml_enc(ctx)) {
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "voxcpm2: vae_wn_init_ggml_enc failed; falling back to CPU vae_encode\n");
+        return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ctx->compute_meta.size(),
+        /*.mem_buffer =*/ctx->compute_meta.data(),
+        /*.no_alloc   =*/true,
+    };
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0) {
+        return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    }
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    ggml_tensor* in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, padded_n, 1);
+    ggml_set_name(in, "pcm_in");
+    ggml_set_input(in);
+
+    auto& M = ctx->vae_wn_ggml_tensors;
+    auto Wget = [&](const std::string& key) -> ggml_tensor* {
+        auto it = M.find(key);
+        return it == M.end() ? nullptr : it->second;
+    };
+    auto Bias = [&](const std::string& prefix) -> ggml_tensor* { return Wget(prefix + ".bias"); };
+    auto Alpha = [&](const std::string& prefix) -> ggml_tensor* { return Wget(prefix + ".alpha"); };
+    auto InvAlpha = [&](const std::string& prefix) -> ggml_tensor* { return Wget(prefix + ".alpha.inv"); };
+
+    static const int dilations[] = {1, 3, 9};
+    const bool trace = vox_env_bool("CRISPASR_VOXCPM2_VAE_TRACE");
+
+    // conv0: dense in=1, out=d_model, k=7
+    ggml_tensor* cur = causal_conv1d_ggml(ctx0, in, Wget("vae.enc.conv0"), Bias("vae.enc.conv0"),
+                                          /*dilation*/ 1, /*depthwise*/ false);
+    if (trace) {
+        ggml_set_name(cur, "ge_after_conv0");
+        ggml_set_output(cur);
+    }
+
+    for (int b = 0; b < n_blocks; b++) {
+        const int stride = (int)hp.vae_enc_rates[b];
+        const std::string blk = "vae.enc.blk." + std::to_string(b);
+        // 3 residual units (depthwise, dilation 1/3/9)
+        for (int r = 0; r < 3; r++) {
+            const std::string rp = blk + ".res." + std::to_string(r);
+            ggml_tensor* residual = cur;
+            if (Alpha(rp + ".0") && InvAlpha(rp + ".0"))
+                cur = snake1d_ggml(ctx0, cur, Alpha(rp + ".0"), InvAlpha(rp + ".0"));
+            cur = causal_conv1d_ggml(ctx0, cur, Wget(rp + ".1"), Bias(rp + ".1"), dilations[r], /*depthwise*/ true);
+            if (Alpha(rp + ".2") && InvAlpha(rp + ".2"))
+                cur = snake1d_ggml(ctx0, cur, Alpha(rp + ".2"), InvAlpha(rp + ".2"));
+            cur = causal_conv1d_ggml(ctx0, cur, Wget(rp + ".3"), Bias(rp + ".3"), /*dilation*/ 1, /*depthwise*/ false);
+            cur = ggml_add(ctx0, cur, residual);
+        }
+        // snake before downsample
+        if (Alpha(blk + ".sub.3") && InvAlpha(blk + ".sub.3"))
+            cur = snake1d_ggml(ctx0, cur, Alpha(blk + ".sub.3"), InvAlpha(blk + ".sub.3"));
+        // strided downsample (dense, left-pad = 2*ceil(s/2) - s%2)
+        const int left_pad = 2 * ((stride + 1) / 2) - (stride % 2);
+        cur = vae_strided_conv1d_ggml(ctx0, cur, Wget(blk + ".sub.4"), Bias(blk + ".sub.4"), stride, left_pad);
+        if (trace) {
+            std::string nm = "ge_block_" + std::to_string(b);
+            ggml_set_name(cur, nm.c_str());
+            ggml_set_output(cur);
+        }
+    }
+
+    // fc_mu: dense, cur_C -> latent_dim, k=3
+    cur = causal_conv1d_ggml(ctx0, cur, Wget("vae.enc.fc_mu"), Bias("vae.enc.fc_mu"), /*dilation*/ 1,
+                             /*depthwise*/ false);
+    ggml_set_name(cur, "mu");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
+        fprintf(stderr, "voxcpm2: vae_encode_graph gallocr alloc failed; falling back to CPU\n");
+        ggml_free(ctx0);
+        return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    }
+    ggml_tensor* t_in = ggml_graph_get_tensor(gf, "pcm_in");
+    if (!t_in) {
+        ggml_free(ctx0);
+        return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    }
+    // x ne=[padded_n, 1]: element (t,0) at flat index t. Zero-pad the tail.
+    std::vector<float> x_host((size_t)padded_n, 0.0f);
+    std::memcpy(x_host.data(), pcm, (size_t)std::min(n_samples, padded_n) * sizeof(float));
+    ggml_backend_tensor_set(t_in, x_host.data(), 0, x_host.size() * sizeof(float));
+
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    }
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "voxcpm2: vae_encode_graph compute failed; falling back to CPU\n");
+        ggml_free(ctx0);
+        return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
+    }
+
+    ggml_tensor* mu_t = ggml_graph_get_tensor(gf, "mu");
+    const int cur_T = (int)mu_t->ne[0]; // T_lat
+    const int D = (int)mu_t->ne[1];     // latent_dim (== 64)
+    std::vector<float> mu_host((size_t)cur_T * D);
+    ggml_backend_tensor_get(mu_t, mu_host.data(), 0, mu_host.size() * sizeof(float));
+    ggml_free(ctx0);
+
+    // Reshape: ggml mu ne=[T_lat, D] (flat = d*cur_T + t) → [T_patches, P, D].
+    // Matches vae_encode_uncached's `out[(tp*P+pf)*D + d] = mu_out[d*cur_T + t]`.
+    const int T_patches = cur_T / P;
+    if (out_T_patches) {
+        *out_T_patches = T_patches;
+    }
+    std::vector<float> out((size_t)T_patches * P * D);
+    for (int tp = 0; tp < T_patches; tp++) {
+        for (int pf = 0; pf < P; pf++) {
+            int t = tp * P + pf;
+            for (int d = 0; d < D; d++) {
+                out[((size_t)tp * P + pf) * D + d] = mu_host[(size_t)d * cur_T + t];
+            }
+        }
+    }
+    if (ctx->verbosity >= 1) {
+        fprintf(stderr, "voxcpm2: VAE encoded (graph) %d samples → %d patches (P=%d, D=%d)\n", n_samples, T_patches, P,
+                D);
+    }
+    return out;
+}
+
+// Dispatcher: VOXCPM2_USE_GRAPH (default ON) → GPU encoder, else CPU. The
+// VOXCPM2_VAE_ENC_DIFF env runs BOTH and reports cosine + max|Δ| (Tier-0).
+static std::vector<float> vae_encode_dispatch(voxcpm2_context* ctx, const float* pcm, int n_samples,
+                                              int* out_T_patches) {
+    const bool use_graph = vox_env_bool_default_on("CRISPASR_VOXCPM2_USE_GRAPH");
+
+    if (vox_env_bool("CRISPASR_VOXCPM2_VAE_ENC_DIFF")) {
+        int Tg = 0, Tc = 0;
+        std::vector<float> g = vae_encode_graph(ctx, pcm, n_samples, &Tg);
+        std::vector<float> c = vae_encode_uncached(ctx, pcm, n_samples, &Tc);
+        double dot = 0, ng = 0, nc = 0, maxd = 0;
+        size_t n = std::min(g.size(), c.size());
+        for (size_t i = 0; i < n; i++) {
+            dot += (double)g[i] * (double)c[i];
+            ng += (double)g[i] * (double)g[i];
+            nc += (double)c[i] * (double)c[i];
+            double d = std::abs((double)g[i] - (double)c[i]);
+            if (d > maxd)
+                maxd = d;
+        }
+        double cos = (ng > 0 && nc > 0) ? dot / (std::sqrt(ng) * std::sqrt(nc)) : 0.0;
+        fprintf(stderr, "voxcpm2 VAE-ENC-DIFF: graph_T=%d cpu_T=%d n=%zu (g=%zu c=%zu) cos=%.8f max|delta|=%.6e\n", Tg,
+                Tc, n, g.size(), c.size(), cos, maxd);
+        if (out_T_patches)
+            *out_T_patches = use_graph ? Tg : Tc;
+        return use_graph ? g : c;
+    }
+
+    if (use_graph)
+        return vae_encode_graph(ctx, pcm, n_samples, out_T_patches);
+    return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
 }
 
 // ---------------------------------------------------------------------------
@@ -4778,6 +5399,134 @@ static std::vector<int32_t> vox_tokenize(const vox_tokenizer& tok, const std::st
 // Model loading — two-pass GGUF
 // ---------------------------------------------------------------------------
 
+static bool vox_is_vae_tensor(const char* name, void*) {
+    return name && std::strncmp(name, "vae.", 4) == 0;
+}
+
+static bool vox_vae_metadata_array_matches(gguf_context* meta, const char* key, const int* expected,
+                                           size_t expected_count) {
+    const int k = gguf_find_key(meta, key);
+    if (k < 0)
+        return true; // Older full-model conversions use the official defaults.
+    if (gguf_get_kv_type(meta, k) != GGUF_TYPE_ARRAY || (size_t)gguf_get_arr_n(meta, k) != expected_count)
+        return false;
+
+    const gguf_type type = gguf_get_arr_type(meta, k);
+    if (type == GGUF_TYPE_INT32) {
+        const int32_t* values = (const int32_t*)gguf_get_arr_data(meta, k);
+        for (size_t i = 0; i < expected_count; ++i) {
+            if (values[i] != expected[i])
+                return false;
+        }
+        return true;
+    }
+    if (type == GGUF_TYPE_UINT32) {
+        const uint32_t* values = (const uint32_t*)gguf_get_arr_data(meta, k);
+        for (size_t i = 0; i < expected_count; ++i) {
+            if (values[i] != (uint32_t)expected[i])
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+// The native AudioVAE kernels currently implement the fixed VoxCPM2 V2
+// architecture. Validate every tensor they dereference before inference: the
+// legacy kernels intentionally tolerate optional tensors for full-TTS
+// compatibility, but an isolated upscaler must not silently turn a partial or
+// malformed conversion into plausible-looking degraded audio (or read beyond a
+// wrongly shaped tensor).
+static bool vox_validate_vae_weights(const std::map<std::string, ggml_tensor*>& tensors) {
+    auto need = [&](const std::string& name, size_t elements, int kernel = -1) -> bool {
+        auto it = tensors.find(name);
+        if (it == tensors.end() || !it->second) {
+            fprintf(stderr, "voxcpm2-vae: required tensor '%s' is missing\n", name.c_str());
+            return false;
+        }
+        const ggml_tensor* t = it->second;
+        if (t->type != GGML_TYPE_F32) {
+            fprintf(stderr, "voxcpm2-vae: tensor '%s' must be F32 (got %s)\n", name.c_str(), ggml_type_name(t->type));
+            return false;
+        }
+        if (ggml_nelements(t) < 0 || (size_t)ggml_nelements(t) != elements) {
+            fprintf(stderr, "voxcpm2-vae: tensor '%s' has %lld elements; expected %zu\n", name.c_str(),
+                    (long long)ggml_nelements(t), elements);
+            return false;
+        }
+        if (kernel >= 0 && t->ne[0] != kernel) {
+            fprintf(stderr, "voxcpm2-vae: tensor '%s' has kernel width %lld; expected %d\n", name.c_str(),
+                    (long long)t->ne[0], kernel);
+            return false;
+        }
+        return true;
+    };
+    auto need_alpha = [&](const std::string& name, int channels) { return need(name, (size_t)channels); };
+    auto need_conv = [&](const std::string& prefix, int out_channels, int in_channels, int kernel) {
+        return need(prefix + ".weight_g", (size_t)out_channels) &&
+               need(prefix + ".weight_v", (size_t)out_channels * in_channels * kernel, kernel) &&
+               need(prefix + ".bias", (size_t)out_channels);
+    };
+    auto need_sr_embedding = [&](const std::string& name, int channels) {
+        if (!need(name, (size_t)channels * 4))
+            return false;
+        const ggml_tensor* t = tensors.at(name);
+        if (t->ne[0] != channels || t->ne[1] != 4) {
+            fprintf(stderr, "voxcpm2-vae: tensor '%s' has shape [%lld,%lld]; expected [%d,4]\n", name.c_str(),
+                    (long long)t->ne[0], (long long)t->ne[1], channels);
+            return false;
+        }
+        return true;
+    };
+
+    if (!need_conv("vae.enc.conv0", 128, 1, 7))
+        return false;
+    int channels = 128;
+    static const int encoder_rates[] = {2, 5, 8, 8};
+    for (int b = 0; b < 4; ++b) {
+        const std::string block = "vae.enc.blk." + std::to_string(b);
+        for (int r = 0; r < 3; ++r) {
+            const std::string residual = block + ".res." + std::to_string(r);
+            if (!need_alpha(residual + ".0.alpha", channels) || !need_conv(residual + ".1", channels, 1, 7) ||
+                !need_alpha(residual + ".2.alpha", channels) || !need_conv(residual + ".3", channels, channels, 1))
+                return false;
+        }
+        if (!need_alpha(block + ".sub.3.alpha", channels) ||
+            !need_conv(block + ".sub.4", channels * 2, channels, 2 * encoder_rates[b]))
+            return false;
+        channels *= 2;
+    }
+    if (!need_conv("vae.enc.fc_mu", 64, channels, 3))
+        return false;
+
+    if (!need_conv("vae.dec.layer.0", 64, 1, 7) || !need_conv("vae.dec.layer.1", 2048, 64, 1))
+        return false;
+    static const int decoder_rates[] = {8, 6, 5, 2, 2, 2};
+    static const int decoder_channels[] = {1024, 512, 256, 128, 64, 32};
+    channels = 2048;
+    for (int b = 0; b < 6; ++b) {
+        const int out_channels = decoder_channels[b];
+        const int layer_index = b + 2;
+        const std::string layer = "vae.dec.layer." + std::to_string(layer_index);
+        const std::string sr = "vae.dec.sr_cond." + std::to_string(layer_index);
+        if (!need_sr_embedding(sr + ".scale_embed", channels) || !need_sr_embedding(sr + ".bias_embed", channels) ||
+            !need_alpha(layer + ".block.0.alpha", channels) || !need(layer + ".block.1.weight_g", (size_t)channels) ||
+            !need(layer + ".block.1.weight_v", (size_t)channels * out_channels * 2 * decoder_rates[b],
+                  2 * decoder_rates[b]) ||
+            !need(layer + ".block.1.bias", (size_t)out_channels))
+            return false;
+        for (int r = 0; r < 3; ++r) {
+            const std::string residual = layer + ".block." + std::to_string(r + 2);
+            if (!need_alpha(residual + ".0.alpha", out_channels) || !need_conv(residual + ".1", out_channels, 1, 7) ||
+                !need_alpha(residual + ".2.alpha", out_channels) ||
+                !need_conv(residual + ".3", out_channels, out_channels, 1))
+                return false;
+        }
+        channels = out_channels;
+    }
+    return need_alpha("vae.dec.layer.8.alpha", channels) && need_conv("vae.dec.layer.9", 1, channels, 7);
+}
+
 static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     using namespace core_gguf;
 
@@ -4827,7 +5576,7 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     hp.ref_audio_start_token = kv_u32(meta, "voxcpm2.ref_audio_start_token", hp.ref_audio_start_token);
     hp.ref_audio_end_token = kv_u32(meta, "voxcpm2.ref_audio_end_token", hp.ref_audio_end_token);
 
-    hp.patch_frames = kv_u32(meta, "voxcpm2.patch_frames", hp.patch_frames);
+    hp.patch_frames = kv_u32(meta, "voxcpm2.patch_size", kv_u32(meta, "voxcpm2.patch_frames", hp.patch_frames));
     hp.patch_dim = kv_u32(meta, "voxcpm2.vae.patch_dim", hp.patch_dim);
 
     // VAE encoder dimensions (architectural constants; default to AudioVAEConfig
@@ -4836,8 +5585,29 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     hp.vae_enc_latent_dim = kv_u32(meta, "voxcpm2.vae.latent_dim", hp.vae_enc_latent_dim);
     hp.vae_enc_sample_rate = kv_u32(meta, "voxcpm2.vae.sample_rate", hp.vae_enc_sample_rate);
 
+    if (ctx->vae_only) {
+        const uint32_t feat_dim = kv_u32(meta, "voxcpm2.feat_dim", 64);
+        const uint32_t decoder_dim = kv_u32(meta, "voxcpm2.vae.decoder_dim", 2048);
+        const uint32_t output_rate = kv_u32(meta, "voxcpm2.vae.out_sample_rate", 48000);
+        static const int encoder_rates[] = {2, 5, 8, 8};
+        static const int decoder_rates[] = {8, 6, 5, 2, 2, 2};
+        static const int sr_boundaries[] = {20000, 30000, 40000};
+        const bool supported = hp.patch_frames == 4 && feat_dim == 64 && hp.vae_enc_dim == 128 &&
+                               hp.vae_enc_latent_dim == 64 && decoder_dim == 2048 && hp.vae_enc_sample_rate == 16000 &&
+                               output_rate == 48000 &&
+                               vox_vae_metadata_array_matches(meta, "voxcpm2.vae.encoder_rates", encoder_rates, 4) &&
+                               vox_vae_metadata_array_matches(meta, "voxcpm2.vae.decoder_rates", decoder_rates, 6) &&
+                               vox_vae_metadata_array_matches(meta, "voxcpm2.vae.sr_bin_boundaries", sr_boundaries, 3);
+        if (!supported) {
+            fprintf(stderr, "voxcpm2-vae: unsupported AudioVAE architecture; expected VoxCPM2 V2 "
+                            "(16 kHz input, 48 kHz output, 64-D latent, patch size 4)\n");
+            free_metadata(meta);
+            return false;
+        }
+    }
+
     // Tokenizer: try GGUF string arrays first, then vocab blob tensor
-    {
+    if (!ctx->vae_only) {
         auto tokens = kv_str_array(meta, "tokenizer.ggml.tokens");
         if (!tokens.empty()) {
             ctx->tokenizer.id_to_token = tokens;
@@ -4865,7 +5635,10 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
         }
     }
     WeightLoad wl;
-    if (!load_weights(path, weight_backend, "voxcpm2", wl))
+    const bool loaded = ctx->vae_only
+                            ? load_weights_filtered(path, weight_backend, vox_is_vae_tensor, nullptr, "voxcpm2-vae", wl)
+                            : load_weights(path, weight_backend, "voxcpm2", wl);
+    if (!loaded)
         return false;
 
     ctx->ggml_ctx = wl.ctx;
@@ -4874,6 +5647,22 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
 
     auto& T = ctx->tensors;
     vox_weights& W = ctx->weights;
+
+    if (ctx->vae_only) {
+        if (!vox_validate_vae_weights(T))
+            return false;
+        for (const auto& [name, tensor] : T) {
+            (void)tensor;
+            if (!vox_is_vae_tensor(name.c_str(), nullptr)) {
+                fprintf(stderr, "voxcpm2-vae: internal loader error: admitted non-VAE tensor '%s'\n", name.c_str());
+                return false;
+            }
+        }
+        if (ctx->verbosity >= 1) {
+            fprintf(stderr, "voxcpm2-vae: loaded %zu AudioVAE tensors only (16 kHz -> 48 kHz)\n", T.size());
+        }
+        return true;
+    }
 
     // Infer n_kv for LocEnc/LocDiT from K weight shapes when not in metadata.
     // K weight: ne[0]=d_model (input), ne[1]=n_kv*head_dim (output)
@@ -5187,7 +5976,7 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
     int d_dit = (int)hp.locdit_d_model;
     int P_frames = (int)hp.patch_frames;
     int feat_dim_vae = 64;
-    const bool use_graph = vox_env_bool_default_on("VOXCPM2_USE_GRAPH");
+    const bool use_graph = vox_env_bool_default_on("CRISPASR_VOXCPM2_USE_GRAPH");
 
     // 1. Tokenise (vox_tokenize already appends audio_start_token).
     std::vector<int32_t> text_tokens = vox_tokenize(ctx->tokenizer, text);
@@ -5199,11 +5988,14 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
     out.have_ref =
         (ref_samples != nullptr && ref_n_samples > 0 && hp.ref_audio_start_token != 0 && hp.ref_audio_end_token != 0);
     if (out.have_ref) {
+        double t0_vae = vox_now_ms();
         out.ref_feat = vae_encode(ctx, ref_samples, ref_n_samples, &out.T_ref);
         if (out.T_ref <= 0) {
             fprintf(stderr, "voxcpm2: VAE encoder produced 0 patches — falling back to zero-shot\n");
             out.have_ref = false;
             out.ref_feat.clear();
+        } else if (ctx->verbosity >= 1) {
+            fprintf(stderr, "voxcpm2: prefill VAE encode %.1f ms (%d patches)\n", vox_now_ms() - t0_vae, out.T_ref);
         }
     }
 
@@ -5230,6 +6022,7 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
     out.N_pos = (int)out.all_tokens.size();
 
     // 4. Per-position embed: combined_embed[t] = text_mask*embed_tokens + audio_mask*enc_to_lm(locenc(audio_feat[t])).
+    double t0_locenc = vox_now_ms();
     out.combined_embed.assign((size_t)out.N_pos * d_tslm, 0.0f);
     out.feat_embed_pos.assign((size_t)out.N_pos * d_tslm, 0.0f);
     for (int t = 0; t < out.N_pos; t++) {
@@ -5255,6 +6048,10 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
             }
             get_row_f32(ctx->weights.tslm_token_embd, id, out.combined_embed.data() + (size_t)t * d_tslm);
         }
+    }
+    if (out.have_ref && ctx->verbosity >= 1) {
+        fprintf(stderr, "voxcpm2: prefill locenc %.1f ms (%d patches, %.1f ms/patch)\n", vox_now_ms() - t0_locenc,
+                out.T_ref, out.T_ref > 0 ? (vox_now_ms() - t0_locenc) / out.T_ref : 0.0);
     }
     return out;
 }
@@ -5284,8 +6081,14 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     int P_frames = (int)hp.patch_frames;
     int feat_dim_vae = 64;
 
+    voxcpm2_bench_stage _bs_synth("synthesize");
+
     // 1. Build prefill inputs (tokens + masks + combined embeds + ref feats).
-    vox_prefill_inputs pi = build_prefill_inputs(ctx, std::string(text), ref_samples, ref_n_samples, cpu_be);
+    vox_prefill_inputs pi;
+    {
+        voxcpm2_bench_stage _bs("build_prefill");
+        pi = build_prefill_inputs(ctx, std::string(text), ref_samples, ref_n_samples, cpu_be);
+    }
     if (pi.N_pos == 0) {
         fprintf(stderr, "voxcpm2: empty token sequence\n");
         return nullptr;
@@ -5418,7 +6221,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
 
     // Per-substep accumulators gated on VOXCPM2_BENCH=1. Cheap (one
     // vox_now_ms / step) but skips the prints when not requested.
-    const bool bench = vox_env_bool("VOXCPM2_BENCH");
+    const bool bench = vox_env_bool("CRISPASR_VOXCPM2_BENCH");
     double sum_cfm = 0, sum_locenc = 0, sum_enc_to_lm = 0;
     double sum_tslm = 0, sum_fsq = 0, sum_fusion = 0, sum_ralm = 0, sum_stop = 0;
 
@@ -5429,7 +6232,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     // through the graph (no further CPU↔backend traffic). Resetting
     // tslm_kv_synced here ensures every synthesis call re-syncs from the
     // fresh prefill cache.
-    const bool use_graph_tslm = vox_env_bool_default_on("VOXCPM2_USE_GRAPH");
+    const bool use_graph_tslm = vox_env_bool_default_on("CRISPASR_VOXCPM2_USE_GRAPH");
     ctx->tslm_kv_synced = false;
     ctx->ralm_kv_synced = false;
 
@@ -5460,7 +6263,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
 
         // 1c. LocEnc on predicted patch
         tb = bench ? vox_now_ms() : 0;
-        static const bool fa_cpu_le = vox_env_bool("VOXCPM2_FA_CPU");
+        static const bool fa_cpu_le = vox_env_bool("CRISPASR_VOXCPM2_FA_CPU");
         std::vector<float> enc_out = (use_graph_tslm && !fa_cpu_le) ? locenc_forward_graph(ctx, patch_tf.data())
                                                                     : locenc_forward(ctx, patch_tf.data(), cpu_be);
         if (bench)
@@ -5654,7 +6457,11 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
 
     // 7. VAE decode
     double t0_vae = vox_now_ms();
-    std::vector<float> pcm = vae_decode(ctx, patches, cpu_be);
+    std::vector<float> pcm;
+    {
+        voxcpm2_bench_stage _bs("vae_decode");
+        pcm = vae_decode(ctx, patches, cpu_be);
+    }
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "voxcpm2: VAE decode %.1f ms -> %zu samples @48kHz\n", vox_now_ms() - t0_vae, pcm.size());
         fprintf(stderr, "voxcpm2: total %.1f ms\n", vox_now_ms() - t0_total);
@@ -5692,8 +6499,9 @@ struct voxcpm2_context_params voxcpm2_context_default_params(void) {
     return p;
 }
 
-struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct voxcpm2_context_params params) {
-    if (!path_model)
+static struct voxcpm2_context* voxcpm2_init_internal(const char* path_model, struct voxcpm2_context_params params,
+                                                     bool vae_only) {
+    if (!path_model || !*path_model)
         return nullptr;
 
     auto* ctx = new voxcpm2_context();
@@ -5705,6 +6513,7 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
     ctx->cfg_value = params.cfg_value > 0.0f ? params.cfg_value : 2.0f;
     ctx->max_len = params.max_len > 0 ? params.max_len : 2000;
     ctx->seed = params.seed;
+    ctx->vae_only = vae_only;
 
     // Backend pool. With `use_gpu`, init_best picks Metal / Vulkan / CUDA.
     // On Apple Silicon, Metal allocates in unified-memory "shared" mode, so
@@ -5715,14 +6524,18 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
     // we load weights to CPU for legacy paths and create GPU mirror copies
     // for graph-build functions, giving both worlds native-speed access
     // with no cross-backend copies at compute time.
-    ctx->backend_cpu = get_cpu_backend();
+    // The standalone VAE owns a separate CPU backend. This keeps its thread
+    // configuration and lifecycle independent when a full VoxCPM2 TTS
+    // context is loaded in the same process.
+    ctx->backend_cpu = vae_only ? ggml_backend_cpu_init() : get_cpu_backend();
+    ctx->owns_backend_cpu = vae_only;
     if (!ctx->backend_cpu) {
         fprintf(stderr, "voxcpm2: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
     if (params.use_gpu) {
-        ctx->backend = ggml_backend_init_best();
+        ctx->backend = crispasr_init_gpu_backend();
         if (!ctx->backend) {
             if (params.verbosity >= 1) {
                 fprintf(stderr, "voxcpm2: best backend unavailable, falling back to CPU\n");
@@ -5736,13 +6549,13 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
     // Detect whether the GPU backend's buffer is host-visible. If not,
     // weights will be loaded to CPU and mirrored to GPU (see below).
     bool needs_gpu_mirror = false;
-    if (ctx->backend != ctx->backend_cpu) {
+    if (!ctx->vae_only && ctx->backend != ctx->backend_cpu) {
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx->backend);
         needs_gpu_mirror = (buft && !ggml_backend_buft_is_host(buft));
     }
 
     if (!vox_load_weights(ctx, path_model)) {
-        fprintf(stderr, "voxcpm2: failed to load '%s'\n", path_model);
+        fprintf(stderr, "%s: failed to load '%s'\n", ctx->vae_only ? "voxcpm2-vae" : "voxcpm2", path_model);
         voxcpm2_free(ctx);
         return nullptr;
     }
@@ -5935,6 +6748,10 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
     return ctx;
 }
 
+struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct voxcpm2_context_params params) {
+    return voxcpm2_init_internal(path_model, params, false);
+}
+
 void voxcpm2_free(struct voxcpm2_context* ctx) {
     if (!ctx)
         return;
@@ -5998,6 +6815,14 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
         ggml_free(ctx->vae_wn_ggml_ctx);
         ctx->vae_wn_ggml_ctx = nullptr;
     }
+    if (ctx->vae_wn_enc_ggml_buf) {
+        ggml_backend_buffer_free(ctx->vae_wn_enc_ggml_buf);
+        ctx->vae_wn_enc_ggml_buf = nullptr;
+    }
+    if (ctx->vae_wn_enc_ggml_ctx) {
+        ggml_free(ctx->vae_wn_enc_ggml_ctx);
+        ctx->vae_wn_enc_ggml_ctx = nullptr;
+    }
     ctx->vae_wn_ggml_tensors.clear();
     if (ctx->galloc) {
         ggml_gallocr_free(ctx->galloc);
@@ -6021,13 +6846,134 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
         ggml_free(ctx->ggml_ctx);
         ctx->ggml_ctx = nullptr;
     }
-    // backend_cpu is the global g_cpu_backend — process-wide, do not free.
-    // backend can be a per-context Metal handle (from init_best); free that.
+    // Full TTS contexts use the process-wide g_cpu_backend. Standalone VAE
+    // contexts own their CPU backend so simultaneous TTS + upscaler sessions
+    // do not share mutable backend configuration.
     if (ctx->backend && ctx->backend != ctx->backend_cpu) {
         ggml_backend_free(ctx->backend);
     }
+    if (ctx->owns_backend_cpu && ctx->backend_cpu) {
+        ggml_backend_free(ctx->backend_cpu);
+    }
     ctx->backend = nullptr;
+    ctx->backend_cpu = nullptr;
     delete ctx;
+}
+
+struct voxcpm2_vae_context_params voxcpm2_vae_context_default_params(void) {
+    struct voxcpm2_vae_context_params p;
+    p.n_threads = 4;
+    p.verbosity = 1;
+    p.use_gpu = false;
+    return p;
+}
+
+struct voxcpm2_vae_context* voxcpm2_vae_init_from_file(const char* path_model,
+                                                       struct voxcpm2_vae_context_params params) {
+    voxcpm2_context_params p = voxcpm2_context_default_params();
+    p.n_threads = params.n_threads;
+    p.verbosity = params.verbosity;
+    p.use_gpu = params.use_gpu;
+
+    voxcpm2_context* impl = voxcpm2_init_internal(path_model, p, true);
+    if (!impl)
+        return nullptr;
+    auto* ctx = new (std::nothrow) voxcpm2_vae_context();
+    if (!ctx) {
+        voxcpm2_free(impl);
+        return nullptr;
+    }
+    ctx->impl = impl;
+    return ctx;
+}
+
+void voxcpm2_vae_free(struct voxcpm2_vae_context* ctx) {
+    if (!ctx)
+        return;
+    voxcpm2_free(ctx->impl);
+    delete ctx;
+}
+
+static int voxcpm2_vae_max_input_samples() {
+    // Encoder residuals keep several 128-channel, full-input-length
+    // activations alive at once; decoder residuals have a similarly large
+    // constant working set. Cost is linear rather than Sidon's O(T^2), but a
+    // multi-minute single call can still request many GiB before computation
+    // starts. Sixty seconds is already an utterance-scale ~3 GiB worst-case
+    // CPU working set. Longer material should be split, or explicitly opted in
+    // after considering available RAM/VRAM.
+    static constexpr int default_max = 60 * 16000;
+    const char* value = crispasr_env::get("CRISPASR_VOXCPM2_VAE_MAX_SAMPLES");
+    if (!value || !*value)
+        return default_max;
+
+    errno = 0;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (errno == 0 && end != value && *end == '\0' && parsed > 0 && parsed <= INT_MAX / 3)
+        return (int)parsed;
+    return default_max;
+}
+
+float* voxcpm2_vae_upscale(struct voxcpm2_vae_context* ctx, const float* samples, int n_samples, int* out_n_samples) {
+    if (out_n_samples)
+        *out_n_samples = 0;
+    if (!ctx || !ctx->impl || !samples || n_samples <= 0 || n_samples > INT_MAX / 3 || !out_n_samples)
+        return nullptr;
+
+    const int max_samples = voxcpm2_vae_max_input_samples();
+    if (n_samples > max_samples) {
+        fprintf(stderr,
+                "voxcpm2-vae: input too long - %d samples (%.1f s at 16 kHz) exceeds the %d-sample cap; "
+                "split the audio or raise CRISPASR_VOXCPM2_VAE_MAX_SAMPLES if sufficient memory is available.\n",
+                n_samples, (double)n_samples / 16000.0, max_samples);
+        return nullptr;
+    }
+
+    voxcpm2_context* impl = ctx->impl;
+    int n_patches = 0;
+    std::vector<float> encoded;
+    {
+        voxcpm2_bench_stage _bs("vae_upscale_encode");
+        encoded = vae_encode(impl, samples, n_samples, &n_patches);
+    }
+    const int patch_frames = (int)impl->hp.patch_frames;
+    const int latent_dim = (int)impl->hp.vae_enc_latent_dim;
+    const size_t patch_values = (size_t)patch_frames * latent_dim;
+    if (n_patches <= 0 || patch_values == 0 || encoded.size() != (size_t)n_patches * patch_values) {
+        fprintf(stderr, "voxcpm2-vae: encoder produced an invalid latent shape\n");
+        return nullptr;
+    }
+
+    std::vector<std::vector<float>> patches((size_t)n_patches);
+    for (int i = 0; i < n_patches; i++) {
+        const float* first = encoded.data() + (size_t)i * patch_values;
+        patches[(size_t)i].assign(first, first + patch_values);
+    }
+
+    std::vector<float> pcm;
+    {
+        voxcpm2_bench_stage _bs("vae_upscale_decode");
+        pcm = vae_decode(impl, patches, impl->backend_cpu);
+    }
+    const size_t exact_samples = (size_t)n_samples * 3;
+    if (pcm.size() < exact_samples) {
+        fprintf(stderr, "voxcpm2-vae: decoder returned %zu samples, expected at least %zu\n", pcm.size(),
+                exact_samples);
+        return nullptr;
+    }
+    pcm.resize(exact_samples); // remove encoder patch-alignment padding
+
+    float* result = (float*)std::malloc(pcm.size() * sizeof(float));
+    if (!result)
+        return nullptr;
+    std::memcpy(result, pcm.data(), pcm.size() * sizeof(float));
+    *out_n_samples = (int)pcm.size();
+    return result;
+}
+
+void voxcpm2_vae_pcm_free(float* pcm) {
+    std::free(pcm);
 }
 
 void voxcpm2_set_n_threads(struct voxcpm2_context* ctx, int n_threads) {
@@ -6156,7 +7102,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         hooks.layer_last_capture = n_layers - 1;
         hooks.layer_last_out = &layer_last_buf;
 
-        const char* use_ref_env = std::getenv("VOXCPM2_USE_REF");
+        const char* use_ref_env = crispasr_env::get("CRISPASR_VOXCPM2_USE_REF");
         bool use_ref = (use_ref_env && std::atoi(use_ref_env) != 0 && ref_samples && ref_n_samples > 0);
 
         std::vector<uint8_t> audio_mask_ref;
@@ -6221,7 +7167,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         const int N_CAP = 8;
         int d = (int)ctx->hp.tslm_d_model;
 
-        const char* use_ref_env = std::getenv("VOXCPM2_USE_REF");
+        const char* use_ref_env = crispasr_env::get("CRISPASR_VOXCPM2_USE_REF");
         bool use_ref = (use_ref_env && std::atoi(use_ref_env) != 0 && ref_samples && ref_n_samples > 0);
 
         std::vector<float> all_pos;
@@ -6462,7 +7408,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         *out_n = total;
         float* out = (float*)std::malloc((size_t)total * sizeof(float));
 
-        const char* use_ref_env = std::getenv("VOXCPM2_USE_REF");
+        const char* use_ref_env = crispasr_env::get("CRISPASR_VOXCPM2_USE_REF");
         bool use_ref = (use_ref_env && std::atoi(use_ref_env) != 0 && ref_samples && ref_n_samples > 0);
 
         if (use_ref) {
@@ -6500,7 +7446,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         *out_n = total;
         float* out = (float*)std::calloc(total, sizeof(float));
 
-        const char* use_ref_env = std::getenv("VOXCPM2_USE_REF");
+        const char* use_ref_env = crispasr_env::get("CRISPASR_VOXCPM2_USE_REF");
         bool use_ref = (use_ref_env && std::atoi(use_ref_env) != 0 && ref_samples && ref_n_samples > 0);
         if (use_ref) {
             // Direct VAE encode — no need for full prefill state for locenc_in.
@@ -6531,7 +7477,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         *out_n = total;
         float* out = (float*)std::malloc((size_t)total * sizeof(float));
 
-        const char* use_ref_env = std::getenv("VOXCPM2_USE_REF");
+        const char* use_ref_env = crispasr_env::get("CRISPASR_VOXCPM2_USE_REF");
         bool use_ref = (use_ref_env && std::atoi(use_ref_env) != 0 && ref_samples && ref_n_samples > 0);
 
         if (use_ref) {
@@ -6587,7 +7533,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         int d_dit = (int)ctx->hp.locdit_d_model;
         int T_tok = (int)token_ids.size();
 
-        const char* use_ref_env = std::getenv("VOXCPM2_USE_REF");
+        const char* use_ref_env = crispasr_env::get("CRISPASR_VOXCPM2_USE_REF");
         bool use_ref = (use_ref_env && std::atoi(use_ref_env) != 0 && ref_samples && ref_n_samples > 0);
 
         std::vector<float> all_pos;
@@ -6861,7 +7807,7 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         if (stage == "vae_only_graph") {
             pcm = vae_decode_graph(ctx, patches);
         } else {
-            pcm = vae_decode(ctx, patches, ctx->backend_cpu);
+            pcm = vae_decode_cpu(ctx, patches);
         }
         *out_n = (int)pcm.size();
         float* out = (float*)std::malloc(pcm.size() * sizeof(float));

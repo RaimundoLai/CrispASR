@@ -1,34 +1,34 @@
 name: CI
 
+# This is the upstream llama.cpp/ggml CI matrix, carried in-tree because ggml
+# is de-vendored into the `ggml/` submodule (CrispStrobe/ggml) — which already
+# runs this same matrix in its OWN repo. In CrispASR we only want it to fire
+# when the ggml submodule itself moves, so we DON'T:
+#   * re-run the whole 40-leg matrix on every `src/**` C++ edit — the upstream
+#     `**/*.cpp` / `**/*.h` globs matched our entire tree, so a one-line format
+#     fix spun up the full ggml CI (issue #231 triage surfaced this);
+#   * fire on our release `v*` tags — release.yml owns tags, and build.yml's own
+#     `release:` job (`if: startsWith(github.ref, 'refs/tags/v')`) would race it
+#     and attach ggml artifacts to our GitHub release.
+# CrispASR's own cross-platform build lives in ci.yml; this matrix is a safety
+# net for ggml-submodule bumps only. Use `workflow_dispatch` to run it manually.
 on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
-    paths: ['.github/workflows/build.yml',
-            '**/CMakeLists.txt',
-            '**/Makefile',
-            '**/*.mk',
-            '**/*.cmake',
-            '**/*.in',
-            '**/*.h',
-            '**/*.hpp',
-            '**/*.c',
-            '**/*.cpp',
-            '**/*.cu',
-            '**/*.cuh',
-            '**/*.cl',
-            '**/*.swift',
-            '**/*.m',
-            '**/*.mm',
-            '**/*.metal',
-            '**/*.comp',
-            '**/*.java',
-            '**/*.xcscheme']
+    paths:
+      - 'ggml'          # the submodule gitlink itself (a bump changes this path)
+      - 'ggml/**'
+      - '.gitmodules'
+      - '.github/workflows/build.yml'
 
   pull_request:
     types: [opened, synchronize, reopened]
+    paths:
+      - 'ggml'
+      - 'ggml/**'
+      - '.gitmodules'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
       create_release:
@@ -81,6 +81,7 @@ jobs:
       - name: Checkout with full history
         uses: actions/checkout@v6
         with:
+          submodules: recursive
           fetch-depth: 0
 
       - name: Determine tag name
@@ -135,6 +136,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Dependencies
         run: |
@@ -154,6 +157,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Dependencies
         run: |
@@ -178,6 +183,8 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2.16
@@ -235,6 +242,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Dependencies
         run: |
@@ -245,7 +254,10 @@ jobs:
         run: |
           cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }}
           make
-          ctest -L gh --output-on-failure
+          # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
+          # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
+          # while checking whether the test added for #322 actually ran; it did not).
+          ctest -L "gh|unit" -E live --output-on-failure --timeout 300
 
   ubuntu-22-gcc-arm64:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
@@ -260,6 +272,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Dependencies
         run: |
@@ -270,7 +284,10 @@ jobs:
         run: |
           cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a
           make
-          ctest -L gh --output-on-failure
+          # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
+          # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
+          # while checking whether the test added for #322 actually ran; it did not).
+          ctest -L "gh|unit" -E live --output-on-failure --timeout 300
 
   ubuntu-22-clang:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
@@ -280,17 +297,28 @@ jobs:
       fail-fast: false
       matrix:
         build: [Debug, Release]
+        # `arch` MUST be a real matrix dimension. It used to be two bare `include:`
+        # entries with no key shared with `build:`, which GitHub merges into every
+        # combination — so the LAST one won and every "ubuntu-22-clang" job silently
+        # ran on ubuntu-22.04-arm. clang-on-x86 was therefore never tested, and the
+        # arm64 runs were mislabelled, which is what sent the core_adaln
+        # investigation chasing "clang" and then AVX-512 on x86 for three rounds
+        # (the real cause was aarch64 SVE). `include:` here now only MAPS arch ->
+        # runner, which is what it is for.
+        arch: [amd64, arm64]
         include:
-          - runner: ubuntu-22.04
-            arch: amd64
-          - runner: ubuntu-22.04-arm
-            arch: arm64
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
 
     runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Dependencies
         run: |
@@ -301,7 +329,10 @@ jobs:
         run: |
           cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
           make
-          ctest -L gh --output-on-failure
+          # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
+          # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
+          # while checking whether the test added for #322 actually ran; it did not).
+          ctest -L "gh|unit" -E live --output-on-failure --timeout 300
 
   ubuntu-22-gcc-sanitized:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
@@ -317,6 +348,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -331,12 +364,19 @@ jobs:
             sed -i "s|archive.ubuntu.com|azure.archive.ubuntu.com|g" /etc/apt/sources.list
             sed -i "s|security.ubuntu.com|azure.archive.ubuntu.com|g" /etc/apt/sources.list
             for i in 1 2 3 4 5; do apt update && break || sleep 10; done
-            apt install -y build-essential cmake git
+            # python3: test-release-workflow is a python test and this container
+            # (unlike the runner) had none, so it failed with "/usr/bin/env:
+            # 'python3': No such file or directory" the moment the unit tier
+            # started running here.
+            apt install -y build-essential cmake git curl python3
             cmake . -DCMAKE_BUILD_TYPE=Debug \
               -DWHISPER_SANITIZE_${{ matrix.sanitizer }}=ON \
               -DGGML_OPENMP=OFF
             make
-            ctest -L gh --output-on-failure'
+            # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
+            # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
+            # while checking whether the test added for #322 actually ran; it did not).
+            ctest -L "gh|unit" -E live --output-on-failure --timeout 300'
 
   windows-msys2:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
@@ -353,6 +393,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Setup ${{ matrix.sys }}
         uses: msys2/setup-msys2@v2
@@ -408,6 +450,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@v3
@@ -507,6 +551,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v8
@@ -592,6 +638,8 @@ jobs:
     steps:
       - name: Clone repository
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install Ninja
         id: install_ninja
@@ -795,9 +843,13 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Setup emsdk
         uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.2  # 6.0.3 regressed WASM ISel (voxtral_tts crash); pin last-good
 
       - name: Verify
         run: emcc -v
@@ -818,6 +870,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Configure
         run: |
@@ -864,6 +918,17 @@ jobs:
           path: crispasr-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
           name: crispasr-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
 
+      # Attach the xcframework to the GitHub Release on tag pushes. release.yml
+      # has no iOS job, so this is the only place the Apple xcframework reaches
+      # the release page (prior releases shipped it as a CI artifact only).
+      - name: Attach xcframework to release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.determine-tag.outputs.tag_name }}
+          files: crispasr-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
+          fail_on_unmatched_files: true
+
   android:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
@@ -873,6 +938,7 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
+          submodules: recursive
           path: crispasr
 
       - name: Install Java
@@ -901,6 +967,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: set up JDK 11
         uses: actions/setup-java@v5
@@ -927,6 +995,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install Java
         uses: actions/setup-java@v5
@@ -1029,6 +1099,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Test quantize
         run: |
@@ -1054,6 +1126,7 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
         with:
+          submodules: recursive
           fetch-depth: 0
 
       - name: ccache
@@ -1116,6 +1189,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Set environment variables
         id: set_vars
@@ -1142,6 +1217,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Build
         shell: bash
@@ -1176,6 +1253,8 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Prewarm apt (retry through transient mirror flake)
         if: runner.os == 'Linux'
@@ -1206,6 +1285,8 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Prewarm apt (retry through transient mirror flake)
         if: runner.os == 'Linux'
@@ -1243,6 +1324,8 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Prewarm apt (retry through transient mirror flake)
         if: runner.os == 'Linux'
@@ -1273,6 +1356,8 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Prewarm apt (retry through transient mirror flake)
         if: runner.os == 'Linux'
@@ -1303,6 +1388,8 @@ jobs:
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Prewarm apt (retry through transient mirror flake)
         if: runner.os == 'Linux'

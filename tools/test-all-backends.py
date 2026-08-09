@@ -366,7 +366,7 @@ REGISTRY: tuple[Backend, ...] = (
     # orpheus: Llama-3.2-3B talker + SNAC 24 kHz codec. Auto-download
     # pulls both. --voice tara is the default English speaker.
     Backend("orpheus",   "Orpheus 3B-FT (TTS)",  "orpheus-3b-0.1-ft-q8_0.gguf",
-            "cstr/orpheus-3b-base-GGUF", "orpheus-3b-0.1-ft-q8_0.gguf",
+            "cstr/orpheus-3b-0.1-ft-GGUF", "orpheus-3b-0.1-ft-q8_0.gguf",
             timeout_s=600, approx_size_mb=3500,
             capabilities=("tts-roundtrip", "temperature")),
     # lex-au-orpheus-de: lex-au's German fine-tune of Orpheus-3B.
@@ -512,8 +512,8 @@ REGISTRY: tuple[Backend, ...] = (
             capabilities=("tts-roundtrip", "temperature")),
     # parler-tts: Parler TTS Mini v1.1 — T5 encoder + DAC-based AR decoder.
     # 44.1 kHz output. Voice described via natural-language --instruct.
-    Backend("parler-tts", "Parler TTS Mini v1.1 (TTS)", "parler-mini-v1.1-q8_0.gguf",
-            "cstr/parler-tts-mini-v1.1-GGUF", "parler-mini-v1.1-q8_0.gguf",
+    Backend("parler-tts", "Parler TTS Mini v1.1 (TTS)", "parler-tts-mini-v1.1-q8_0.gguf",
+            "cstr/parler-tts-mini-v1.1-GGUF", "parler-tts-mini-v1.1-q8_0.gguf",
             timeout_s=600, approx_size_mb=1000,
             capabilities=("tts-roundtrip", "temperature")),
     # zonos: Zyphra Zonos v0.1 — GGUF repo not yet uploaded to HF.

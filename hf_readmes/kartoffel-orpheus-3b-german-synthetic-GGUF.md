@@ -96,7 +96,7 @@ For **auto-download** simply pass `-m auto`:
 
 ## Architecture
 
-Identical to Orpheus 3B — see [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) for the full architecture writeup. The CrispASR `orpheus` runtime is checkpoint-agnostic; this GGUF is loaded by the same `orpheus_init_from_file` path with no source-code changes. The `--voice` flag here is just the speaker name string in the prompt; emotion and outburst control happens via the prompt text itself.
+Identical to Orpheus 3B — see [`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) for the full architecture writeup. The CrispASR `orpheus` runtime is checkpoint-agnostic; this GGUF is loaded by the same `orpheus_init_from_file` path with no source-code changes. The `--voice` flag here is just the speaker name string in the prompt; emotion and outburst control happens via the prompt text itself.
 
 ## Conversion
 
@@ -120,6 +120,16 @@ build/bin/crispasr-quantize kartoffel-orpheus-de-synthetic-f16.gguf \
 - **Llama base:** [`meta-llama/Llama-3.2-3B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) — Llama-3.2 community license.
 - **SNAC codec:** [`hubertsiuzdak/snac_24khz`](https://huggingface.co/hubertsiuzdak/snac_24khz) (MIT) — see [`cstr/snac-24khz-GGUF`](https://huggingface.co/cstr/snac-24khz-GGUF).
 - **GGUF conversion + ggml runtime:** [`CrispStrobe/CrispASR`](https://github.com/CrispStrobe/CrispASR) — see `src/orpheus.cpp`, `src/orpheus_snac.cpp`, `models/convert-orpheus-to-gguf.py`.
+
+## Voice provenance (EU AI Act Art. 50(4))
+
+This checkpoint is trained on **synthetic German speech**, not on recordings of people. Its four speakers (Martin, Luca, Anne, Emma) are personas over generated audio. Note this is a genuine finding from the card, not an inference from the repo name — its `natural` sibling is classified the other way.
+
+CrispASR records this as `speaker_identity=synthetic`. No spoken AI disclosure is added, because no identifiable person's voice is being reproduced. Machine-readable marking (watermark + C2PA) still applies to every synthesis, as it does for all CrispASR TTS output.
+
+Override per run with `--speaker-identity`, or stamp a file permanently with
+`models/stamp-speaker-identity.py`. See
+[`docs/eu-ai-act.md` §6.2a](https://github.com/CrispStrobe/CrispASR/blob/main/docs/eu-ai-act.md).
 
 ## License
 

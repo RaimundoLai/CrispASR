@@ -184,6 +184,25 @@ struct Params {
     // frames. Default 1 (no stacking). Currently only supported with
     // Layout::TimeMels; other layouts leave the knob ignored.
     int stacked_frames = 1;
+
+    // Per-backend opt-in for the OpenMP-parallel STFT frame loop (§176f). The
+    // global env var CRISPASR_MEL_PARALLEL=1 enables it for everything; this
+    // flag lets a single backend turn it on by default once (a) its `fft`
+    // callable is confirmed re-entrant and (b) it has been benched faster on the
+    // target arch. AUDIT (2026-06-20): every in-tree fft callable is re-entrant
+    // — pure stack-only Cooley-Tukey (cohere/nemotron/parakeet/canary/canary_ctc),
+    // a captureless lambda (glm_asr), recursive-on-caller-buffer (qwen3_asr), or
+    // thread_local scratch (voxtral) — none use shared mutable state, so the
+    // parallel path is correctness-safe; the remaining gate is per-arch perf.
+    bool allow_parallel_stft = false;
+
+    // Thread budget for the parallel STFT. 0 (default) keeps the previous
+    // behaviour: the OpenMP path uses omp_get_max_threads() and the portable
+    // std::thread path uses min(hardware_concurrency, 8). A positive value caps
+    // both paths to that many threads WITHOUT mutating global OpenMP state —
+    // callers wanting a specific budget set this instead of omp_set_num_threads()
+    // (which races across concurrent callers of the shared OpenMP thread count).
+    int n_threads = 0;
 };
 
 // Compute log-mel spectrogram from raw PCM samples.

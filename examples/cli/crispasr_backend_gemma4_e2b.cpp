@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class Gemma4E2BBackend : public CrispasrBackend {
 public:
@@ -56,7 +57,7 @@ public:
         gemma4_e2b_context_params cp = gemma4_e2b_context_default_params();
         cp.n_threads = params.n_threads;
         cp.verbosity = params.no_prints ? 0 : 1;
-        if (getenv("CRISPASR_VERBOSE") || getenv("GEMMA4_E2B_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH"))
             cp.verbosity = 2;
         cp.use_gpu = params.use_gpu;
         // Honor -tp / --temperature so CAP_TEMPERATURE is real, not just a
@@ -149,6 +150,44 @@ public:
         std::string result(out);
         free(out);
         return result;
+    }
+
+    void transcribe_streaming(const float* samples, int n_samples, int64_t /*t_offset_cs*/,
+                              const whisper_params& params, crispasr_stream_callback on_text) override {
+        if (!ctx_) {
+            CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
+            return;
+        }
+        std::string accumulated;
+        bool first_tok = true;
+        auto cb = [&](int tok_id, float /*prob*/, void* /*ud*/) {
+            if (gemma4_e2b_is_control_token(ctx_, tok_id))
+                return;
+            const char* raw = gemma4_e2b_token_text(ctx_, tok_id);
+            if (!raw || !*raw)
+                return;
+            std::string piece(raw);
+            // SentencePiece: ▁ (U+2581, 0xE2 0x96 0x81) → space
+            size_t pos = 0;
+            while ((pos = piece.find("\xe2\x96\x81", pos)) != std::string::npos) {
+                piece.replace(pos, 3, " ");
+                pos++;
+            }
+            if (first_tok) {
+                size_t sp = 0;
+                while (sp < piece.size() && (piece[sp] == ' ' || piece[sp] == '\n'))
+                    sp++;
+                piece = piece.substr(sp);
+                if (!piece.empty())
+                    first_tok = false;
+            }
+            accumulated += piece;
+            if (!accumulated.empty())
+                on_text(accumulated.c_str(), false);
+        };
+        auto cb_fn = [](int id, float p, void* ud) { (*static_cast<decltype(cb)*>(ud))(id, p, nullptr); };
+        gemma4_e2b_transcribe_cb(ctx_, samples, n_samples, cb_fn, &cb);
+        on_text(accumulated.c_str(), true);
     }
 
     void shutdown() override {

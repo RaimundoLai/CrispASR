@@ -9,11 +9,13 @@
 #include "core/fft.h"
 #include "core/kaldi_fbank.h"
 #include "core/mel.h"
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +24,32 @@
 #include <vector>
 
 namespace chatterbox_campplus {
+
+// ===========================================================================
+// Bench instrumentation — `CB_CAMPPLUS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool cb_campplus_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_CB_CAMPPLUS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct cb_campplus_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit cb_campplus_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~cb_campplus_bench_stage() {
+        if (!cb_campplus_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  cb_campplus_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Phase 1 — Kaldi fbank + per-utterance mean subtract
@@ -769,8 +797,41 @@ static std::vector<float> unit_forward(const UnitCache& u, const float* in, int 
 
 // Helper: BN+ReLU+Conv1d (the order TransitLayer / DenseLayer use).
 // `bn` is the BN folded against C_in.
+//
+// `lin_b` is optional and usually absent — TransitLayer's Conv1d is declared
+// `bias=False`. It is NOT always absent, though, and dropping it is a silent
+// correctness bug (#334). CAMPPlus ends with
+//   … transit3.linear(Conv1d) → out_nonlinear(BN + ReLU) → StatsPool → dense
+// and an ONNX exporter is free to FOLD that trailing BatchNorm back into the
+// preceding convolution. CosyVoice3's `campplus.onnx` does exactly that: its
+// graph has a bare `/xvector/out_nonlinear/relu/Relu` with no BN parameters
+// anywhere, while `/xvector/transit3/linear/Conv` gained a fused weight AND a
+// fused bias (transit1/transit2 keep their named, bias-free weights because
+// no BN follows them). Skipping the absent out_nonlinear BN is therefore
+// right, but only if the bias that absorbed it is applied here.
+//
+// Measured on a 4.26 s reference: dropping it put the 192-d speaker embedding
+// at cos 0.737 against campplus.onnx — a real but plausible-looking vector,
+// so every WAV clone was conditioned on the wrong timbre while the baked
+// voice bank (whose embeddings come from the ONNX model in Python) was fine.
+// Zeroing the same bias in the ONNX reference reproduces the C++ output at
+// cos 0.999998, which is what pins the cause to this one term.
+//
+// The three consumers of this code ship TWO different export shapes, so read
+// the checkpoint rather than assuming either. Verified by listing the tensor
+// names in each published GGUF:
+//   chatterbox / chatterbox-turbo s3gen — 15 transit tensors, no transit
+//       `linear.bias`, and an explicit `s3.se.xv.out_nl.bn.*`
+//   dots.tts spk                        — 18 transit tensors, no transit
+//       `linear.bias`, explicit `…xvector.out_nonlinear.batchnorm.*`
+//   cosyvoice3 campplus                 — transit3 `linear.bias` present, NO
+//       out_nonlinear parameters at all (folded)
+// So this bias is a no-op for chatterbox and dots.tts — they are bit-identical
+// — and it is the whole fix for cosyvoice3. This code was written against the
+// un-folded shape and had simply never met a folded one.
 static std::vector<float> bn_relu_conv1d(const BNFolded& bn, const float* in, int C_in, int T,
-                                         const std::vector<float>& lin_w, int kw, int C_out, int s, int p) {
+                                         const std::vector<float>& lin_w, const std::vector<float>& lin_b, int kw,
+                                         int C_out, int s, int p) {
     std::vector<float> a((size_t)C_in * (size_t)T);
     std::memcpy(a.data(), in, a.size() * sizeof(float));
     apply_bn_inplace(a.data(), C_in, T, bn);
@@ -778,11 +839,14 @@ static std::vector<float> bn_relu_conv1d(const BNFolded& bn, const float* in, in
     const int T_out = (T + 2 * p - (kw - 1) - 1) / s + 1;
     std::vector<float> out((size_t)C_out * (size_t)T_out, 0.0f);
     conv1d_forward(a.data(), C_in, T, lin_w.data(), C_out, kw, s, p, 1, out.data());
+    add_channel_bias(out.data(), C_out, T_out, lin_b);
     return out;
 }
 
 // StatsPool: concat(mean, std) along T → (2*C,)
-static std::vector<float> stats_pool(const float* in, int C, int T) {
+// `var_floor` clamps the variance before sqrt (3D-Speaker's masked stats
+// pooling uses eps=1e-2 → std>=0.1; chatterbox/CosyVoice uses 0 = no floor).
+static std::vector<float> stats_pool(const float* in, int C, int T, double var_floor = 0.0) {
     std::vector<float> out((size_t)(2 * C), 0.0f);
     for (int c = 0; c < C; c++) {
         const float* row = in + (size_t)c * (size_t)T;
@@ -796,7 +860,9 @@ static std::vector<float> stats_pool(const float* in, int C, int T) {
             sumsq += d * d;
         }
         // PyTorch tensor.std defaults to unbiased=True → divide by (n-1).
-        const double var = (T > 1) ? sumsq / (double)(T - 1) : 0.0;
+        double var = (T > 1) ? sumsq / (double)(T - 1) : 0.0;
+        if (var < var_floor)
+            var = var_floor;
         const double std_ = std::sqrt(var);
         out[(size_t)c] = (float)mean;
         out[(size_t)C + (size_t)c] = (float)std_;
@@ -824,13 +890,14 @@ cb_campplus_runtime::~cb_campplus_runtime() {
 // ---------------------------------------------------------------------------
 
 std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runtime& cache, const float* feat_t_80,
-                                   int T) {
+                                   int T, float stats_var_floor) {
     if (!feat_t_80 || T <= 0)
         return {};
     if (!m.head.conv1_w || !m.tdnn.lin_w || !m.dense.lin_w || m.block1.layers.empty()) {
         fprintf(stderr, "chatterbox_campplus: model not bound\n");
         return {};
     }
+    cb_campplus_bench_stage _bs_total("xvector_total");
     auto* state = static_cast<CampplusCache*>(cache.impl);
     if (!state) {
         cache.impl = new CampplusCache();
@@ -839,12 +906,15 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
     init_cache(*state, m);
     cache.initialised = true;
 
-    const bool dbg = std::getenv("CHATTERBOX_DEBUG") != nullptr;
+    const bool dbg = crispasr_env::get("CRISPASR_CHATTERBOX_DEBUG") != nullptr;
 
     // FCM head: (T, 80) → (320, T)
     int C_fcm = 0, T_fcm = 0;
     std::vector<float> fcm;
-    fcm_forward(*state, feat_t_80, T, fcm, C_fcm, T_fcm);
+    {
+        cb_campplus_bench_stage _bs("fcm_head");
+        fcm_forward(*state, feat_t_80, T, fcm, C_fcm, T_fcm);
+    }
     if (dbg)
         fprintf(stderr, "campplus: post-FCM C=%d T=%d\n", C_fcm, T_fcm);
 
@@ -866,7 +936,8 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
 
     // transit1: BN(512) + ReLU + Conv1d 1×1 (512→256), bias=False
     BNFolded bn_t1 = fold_bn(m.transit1.bn_m, m.transit1.bn_v, m.transit1.bn_w, m.transit1.bn_b, C_blk1);
-    auto post_t1 = bn_relu_conv1d(bn_t1, post_blk1.data(), C_blk1, T_tdnn, state->xv_transit1.lin_w, 1, 256, 1, 0);
+    auto post_t1 = bn_relu_conv1d(bn_t1, post_blk1.data(), C_blk1, T_tdnn, state->xv_transit1.lin_w,
+                                  state->xv_transit1.lin_b, 1, 256, 1, 0);
 
     // block2: 24 layers, dilation=2 → 256 + 24*32 = 1024
     int C_blk2 = 0;
@@ -874,7 +945,8 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
 
     // transit2: BN(1024) + ReLU + Conv1d 1×1 (1024→512)
     BNFolded bn_t2 = fold_bn(m.transit2.bn_m, m.transit2.bn_v, m.transit2.bn_w, m.transit2.bn_b, C_blk2);
-    auto post_t2 = bn_relu_conv1d(bn_t2, post_blk2.data(), C_blk2, T_tdnn, state->xv_transit2.lin_w, 1, 512, 1, 0);
+    auto post_t2 = bn_relu_conv1d(bn_t2, post_blk2.data(), C_blk2, T_tdnn, state->xv_transit2.lin_w,
+                                  state->xv_transit2.lin_b, 1, 512, 1, 0);
 
     // block3: 16 layers, dilation=2 → 512 + 16*32 = 1024
     int C_blk3 = 0;
@@ -885,7 +957,8 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
 
     // transit3: BN(1024) + ReLU + Conv1d 1×1 (1024→512)
     BNFolded bn_t3 = fold_bn(m.transit3.bn_m, m.transit3.bn_v, m.transit3.bn_w, m.transit3.bn_b, C_blk3);
-    auto post_t3 = bn_relu_conv1d(bn_t3, post_blk3.data(), C_blk3, T_tdnn, state->xv_transit3.lin_w, 1, 512, 1, 0);
+    auto post_t3 = bn_relu_conv1d(bn_t3, post_blk3.data(), C_blk3, T_tdnn, state->xv_transit3.lin_w,
+                                  state->xv_transit3.lin_b, 1, 512, 1, 0);
 
     // out_nl: BN(512) + ReLU. Note: out_nl is a bare get_nonlinear, so its
     // GGUF tensors are at `out_nl.bn.*` (not `out_nl.nl.bn.*`); the bind
@@ -895,9 +968,12 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
     relu_inplace(post_t3.data(), post_t3.size());
 
     // StatsPool → (1024,)
-    auto stats = stats_pool(post_t3.data(), 512, T_tdnn);
+    auto stats = stats_pool(post_t3.data(), 512, T_tdnn, (double)stats_var_floor);
 
-    // dense: Conv1d(1024→192, k=1) + BN(affine=False)
+    // dense: Conv1d(1024→emb_dim, k=1) + BN(affine=False). emb_dim is 192 for
+    // chatterbox's CAM++ and 512 for dots.tts — inferred from the actual
+    // dense.linear weight (init_unit set out_dim from ne[2]).
+    const int emb_dim = state->xv_dense.out_dim > 0 ? state->xv_dense.out_dim : 192;
     std::vector<float> dense_in((size_t)1024, 0.0f);
     std::memcpy(dense_in.data(), stats.data(), 1024 * sizeof(float));
     int T_dense = 1;
@@ -906,23 +982,24 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
         unit_forward(state->xv_dense, dense_in.data(), 1024, T_dense, T_dense_out, /*s*/ 1, /*p*/ 0); // BN folded
     if (dense_pre.empty())
         return {};
-    // The unit_forward above used u.bn folded against `out_dim=192`; for
+    // The unit_forward above used u.bn folded against `out_dim`; for
     // affine=False the gamma reduces to 1/sqrt(var+eps) and beta to
     // -mean/sqrt(var+eps), so it's correct.
     // Squeeze the trailing T=1.
-    std::vector<float> emb((size_t)192);
-    for (int i = 0; i < 192; i++)
+    std::vector<float> emb((size_t)emb_dim);
+    for (int i = 0; i < emb_dim; i++)
         emb[(size_t)i] = dense_pre[(size_t)i];
     return emb;
 }
 
 std::vector<float> embed_speaker(const cb_campplus_model& m, cb_campplus_runtime& cache, const float* pcm_16k,
-                                 int n_samples) {
+                                 int n_samples, float stats_var_floor) {
+    cb_campplus_bench_stage _bs_total("embed_speaker");
     int T = 0;
     auto fb = compute_fbank(pcm_16k, n_samples, T);
     if (fb.empty() || T <= 0)
         return {};
-    return compute_xvector(m, cache, fb.data(), T);
+    return compute_xvector(m, cache, fb.data(), T, stats_var_floor);
 }
 
 // ---------------------------------------------------------------------------

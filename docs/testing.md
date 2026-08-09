@@ -5,7 +5,7 @@ CrispASR has two tiers of tests: **unit tests** (no models, fast) and
 
 ## Unit tests
 
-439 unit tests run unconditionally in ~5 seconds with no model files:
+679 unit tests run unconditionally in ~20 seconds with no model files:
 
 ```bash
 ctest --test-dir build -L unit --timeout 30
@@ -13,7 +13,9 @@ ctest --test-dir build -L unit --timeout 30
 
 These cover: audio chunking, mel preprocessing, CTC/beam decode,
 sentence splitting, WAV metadata, stream finalization, registry lookup,
-watermark embed/detect, cache helpers, and more.
+watermark embed/detect, cache helpers, GPT-2 BPE tokenizer,
+BERT WordPiece tokenizer, bench env-var gating, per-backend param
+defaults and null-guard coverage (43 backends), and more.
 
 ## Integration tests
 
@@ -64,6 +66,7 @@ other vars derive from it unless individually overridden.
 | `CRISPASR_MODEL_DIA` | Dia TTS live tests | Q4_K GGUF (~892 MB) |
 | `CRISPASR_MODEL_OUTETTS` | OuteTTS live tests | Q4_K GGUF (~600 MB) |
 | `CRISPASR_MODEL_WAVTOK` | WavTokenizer (OuteTTS codec) | F16 GGUF (~100 MB) |
+| `CRISPASR_MODEL_BTC_CHORDS` | BTC chord-recognition live tests | F32 GGUF (~11.7 MB). Default: `$CRISPASR_MODELS_DIR/btc-chords-large-f32.gguf`. Weights are CC-BY-NC-SA — see below. |
 
 ### Test groups
 
@@ -80,6 +83,15 @@ other vars derive from it unless individually overridden.
 | #462 | Backend regression | Auto-download (many backends) | 600s |
 | #463 | Benchmark-quick | parakeet-tdt-0.6b-v3 | 300s |
 | #464 | Progress output | Auto-download (whisper + parakeet) | 300s |
+| — | BTC chords (`test-btc-chords`, tag `[btc-chords]`) | btc-chords-large-f32.gguf (~11.7 MB) | — |
+
+> **BTC chord weights are non-commercial.** `test-btc-chords` (3 test cases /
+> 41 assertions, ctest label `live`, drives the session C-ABI) needs a BTC GGUF
+> from `cstr/btc-chords-GGUF`. The upstream BTC *code* is MIT, but the shipped
+> *weights* are CC-BY-NC-SA (trained on Isophonics / Robbie Williams /
+> UsPop2002 chord annotations), so the registry refuses to download them
+> without `--accept-license cc-by-nc-sa-4.0` (or the `CRISPASR_ACCEPT_LICENSE`
+> env var). CrispASR itself stays MIT.
 
 ### Auto-download and model cache
 

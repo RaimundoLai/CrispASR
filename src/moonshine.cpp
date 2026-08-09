@@ -5,6 +5,9 @@
 #include "core/attention.h"
 #include "core/beam_decode.h"
 #include "core/gguf_loader.h"
+#include "core/repeat_break.h"     // fix/moonshine-repeat-break: decode-time loop break
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -14,12 +17,39 @@
 
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `MOONSHINE_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool moonshine_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_MOONSHINE_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct moonshine_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit moonshine_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~moonshine_bench_stage() {
+        if (!moonshine_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  moonshine_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 struct moonshine_context {
     moonshine_model model;
@@ -40,6 +70,10 @@ struct moonshine_context {
     bool use_gpu = false;
     float temperature = 0.0f; // 0 = greedy argmax; > 0 = multinomial sampling
     int beam_size = 1;        // 1 = greedy/sampled; >1 = beam search (deterministic)
+    // #292: ceiling on generated tokens. Moonshine is a short-form model, so the
+    // default 194 (~30 s) is architectural; --max-new-tokens raises the ceiling
+    // for callers who force single-pass long audio.
+    int max_new_tokens = 194;
     // Sticky per-call seed override for best-of-N. 0 = derive deterministically
     // from the input audio buffer (the historical default — repeated calls
     // with the same input give identical samples). Non-zero values let the
@@ -47,6 +81,11 @@ struct moonshine_context {
     // same audio.
     uint64_t seed_override = 0;
     moonshine_timing timing = {};
+
+    // §176s: cached encoder graph — reused when n_samples matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    int cached_enc_n_samples = 0;
 };
 
 using TensorMap = std::map<std::string, ggml_tensor*>;
@@ -60,6 +99,15 @@ static struct ggml_tensor* checked_get_tensor(const TensorMap& tensors, const ch
         return nullptr;
     }
     return it->second;
+}
+
+// §232 hybrid placement predicate for load_weights_split: encoder weights on
+// the GPU, decoder weights on the CPU. The moonshine decode graph is CPU-pinned
+// (self-attn KV cache is a CPU buffer), so co-locating the decoder weights on
+// the CPU avoids a per-token GPU→CPU weight re-copy. Any non-"encoder." tensor
+// (decoder.*, output, tied embeddings) stays off-GPU.
+static bool moonshine_is_gpu_tensor(const char* tensor_name, void* /*user*/) {
+    return tensor_name && std::strncmp(tensor_name, "encoder.", 8) == 0;
 }
 
 // helper: read uint32 from GGUF KV
@@ -160,20 +208,41 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
     ctx->use_gpu = (ctx->backend != ctx->backend_cpu);
 
     // ── Pass 2: load weights via core_gguf (mmap, backend buffer) ──
+    //
+    // §232 hybrid placement: on GPU, keep only the *encoder* weights on the GPU
+    // and route the *decoder* weights to the CPU backend. The decode graph is
+    // already CPU-pinned (the self-attn KV cache lives on a CPU buffer), so in
+    // the all-GPU layout the sched re-copies every GPU-resident decoder weight
+    // (incl. the 18-36 MB embed/lm_head) from GPU→CPU on *each* of the ~26
+    // per-token graph rebuilds — pure waste that balloons under GPU contention
+    // (the source of the plan's 440-660 ms/decode-under-load figures). With the
+    // decoder weights already CPU-resident there is nothing to copy: decode runs
+    // CPU-local, bit-identical output, and the encoder still runs on GPU.
+    // Opt out with MOONSHINE_ALL_GPU=1 (restores the legacy all-GPU load for A/B).
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(model_path, ctx->backend, "moonshine", wl)) {
+    const char* all_gpu_env = crispasr_env::get("CRISPASR_MOONSHINE_ALL_GPU");
+    const bool all_gpu = all_gpu_env && all_gpu_env[0] == '1';
+    bool loaded;
+    if (ctx->use_gpu && !all_gpu) {
+        loaded = core_gguf::load_weights_split(model_path, ctx->backend, ctx->backend_cpu, moonshine_is_gpu_tensor,
+                                               nullptr, "moonshine", wl);
+    } else {
+        loaded = core_gguf::load_weights(model_path, ctx->backend, "moonshine", wl);
+    }
+    if (!loaded) {
         fprintf(stderr, "%s: failed to load weights from '%s'\n", __func__, model_path);
         delete ctx;
         return nullptr;
     }
     model.ctx_w = wl.ctx;
     model.buf_w = wl.buf;
+    model.buf_w_cpu = wl.buf_cpu; // non-null only for the split (hybrid) load
 
     // Bind tensors into model struct fields
     bool ok = true;
@@ -389,7 +458,7 @@ static struct ggml_tensor* build_conv_stem(struct ggml_context* ctx0, const moon
 static struct ggml_tensor* moonshine_build_encoder(struct ggml_context* ctx0, const moonshine_model& model,
                                                    struct ggml_tensor* conv_output, // [hidden, seq_len]
                                                    struct ggml_tensor* pos,         // [seq_len] I32 position IDs
-                                                   int seq_len) {
+                                                   int seq_len, bool manual_attn) {
     const auto& hp = model.hparams;
     const int n_heads = hp.n_heads;
     const int n_kv_heads = hp.n_kv_heads;
@@ -423,15 +492,29 @@ static struct ggml_tensor* moonshine_build_encoder(struct ggml_context* ctx0, co
         Q = ggml_rope_ext(ctx0, Q, pos, nullptr, rotary_dim, 0, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         K = ggml_rope_ext(ctx0, K, pos, nullptr, rotary_dim, 0, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        // Permute for flash attention:
-        //   [head_dim, n_heads, seq_len] -> [head_dim, seq_len, n_heads]
-        Q = ggml_permute(ctx0, Q, 0, 2, 1, 3);
-        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
-        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
-
-        // Flash attention (bidirectional — no causal mask)
-        float scale = 1.0f / sqrtf((float)head_dim);
-        struct ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        // Bidirectional attention (no causal mask). Q/K/V: [head_dim, n_heads, seq_len].
+        const float scale = 1.0f / sqrtf((float)head_dim);
+        struct ggml_tensor* attn;
+        if (manual_attn) {
+            // §232: Metal has no flash_attn kernel for head_dim=36, so
+            // ggml_flash_attn_ext falls back to CPU — bouncing every encoder
+            // layer MTL->CPU->MTL. Manual mul_mat + soft_max keeps the whole
+            // encoder on-backend (used on GPU; CPU keeps flash, which is faster
+            // there). MHA (n_kv_heads == n_heads), so no GQA repeat.
+            struct ggml_tensor* Qp = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3)); // [hd, T, nh]
+            struct ggml_tensor* Kp = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3)); // [hd, T, nh]
+            struct ggml_tensor* scores = ggml_mul_mat(ctx0, Kp, Qp);                     // [T_k, T_q, nh]
+            scores = ggml_soft_max_ext(ctx0, scores, nullptr, scale, 0.0f);
+            struct ggml_tensor* Vp = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 2, 0, 3)); // [T_k, hd, nh]
+            attn = ggml_mul_mat(ctx0, Vp, scores);                                       // [hd, T_q, nh]
+            attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));                // [hd, nh, T]
+        } else {
+            // Flash attention: [head_dim, n_heads, seq_len] -> [head_dim, seq_len, n_heads]
+            Q = ggml_permute(ctx0, Q, 0, 2, 1, 3);
+            K = ggml_permute(ctx0, K, 0, 2, 1, 3);
+            V = ggml_permute(ctx0, V, 0, 2, 1, 3);
+            attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        }
 
         // Result is [head_dim, n_heads, seq_len] — reshape to [hidden, seq_len]
         attn = ggml_reshape_2d(ctx0, attn, (int64_t)head_dim * n_heads, seq_len);
@@ -510,47 +593,90 @@ static bool moonshine_kv_cache_init(moonshine_kv_cache& cache, int n_layers, int
 static int moonshine_run_encoder(struct moonshine_context* ctx, const float* audio, int n_samples) {
     const auto& hp = ctx->model.hparams;
 
-    const size_t n_tensors = hp.enc_n_layers * 25 + 100;
-    const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
-    struct ggml_init_params params = {
-        /*.mem_size   =*/mem_size,
-        /*.mem_buffer =*/nullptr,
-        /*.no_alloc   =*/true,
-    };
-    struct ggml_context* ctx0 = ggml_init(params);
-    if (!ctx0) {
-        fprintf(stderr, "%s: failed to init ggml context\n", __func__);
-        return -1;
+    // §176s: reuse cached encoder graph when n_samples matches.
+    // #301: reusing the cached cgraph across ggml_backend_sched_reset/alloc
+    // cycles is only safe on CPU. On a GPU sched (Metal/CUDA/Vulkan) the reused
+    // input tensors stay bound to the previous cycle's freed buffer, so the
+    // ggml_backend_tensor_set below memmoves into freed memory and SIGSEGVs on
+    // the 2nd transcribe (reproduced on Metal via crispasr --server). Gate the
+    // reuse to CPU; on GPU rebuild the (tiny) encoder graph each call and free
+    // it after compute. moonshine's GPU encoder is marginal anyway (§232), so
+    // the per-call rebuild costs nothing measurable.
+    const bool cache_ok = ggml_backend_is_cpu(ctx->backend);
+    struct ggml_cgraph* graph;
+    struct ggml_context* ctx0 = nullptr;
+    struct ggml_context* transient_ctx = nullptr; // freed after compute when not cached (GPU)
+    if (cache_ok && ctx->cached_enc_gf && ctx->cached_enc_n_samples == n_samples) {
+        graph = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+            ctx->cached_enc_n_samples = 0;
+        }
+        const size_t n_tensors = hp.enc_n_layers * 25 + 100;
+        const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
+        struct ggml_init_params params = {mem_size, nullptr, true};
+        ctx0 = ggml_init(params);
+        if (!ctx0) {
+            fprintf(stderr, "%s: failed to init ggml context\n", __func__);
+            return -1;
+        }
+
+        struct ggml_tensor* input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_samples, 1, 1);
+        ggml_set_name(input, "audio_input");
+        ggml_set_input(input);
+        struct ggml_tensor* conv_out = build_conv_stem(ctx0, ctx->model, input);
+        const int seq_len = (int)conv_out->ne[1];
+        struct ggml_tensor* pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, seq_len);
+        ggml_set_name(pos, "enc_pos");
+        ggml_set_input(pos);
+        // §232: flash_attn_ext falls back to CPU for head_dim=36 (Metal has no
+        // kernel), bouncing every encoder layer MTL->CPU->MTL. Keeping the
+        // whole encoder on Metal via manual mul_mat+soft_max was MEASURED SLOWER
+        // (~40%: the T² scores + conts spawn more small Metal kernels than the
+        // cheap 514K bounce copies cost — "death by kernel count" for this tiny
+        // model). So flash stays the default on both backends; the manual path
+        // is opt-in (MOONSHINE_ENC_ATTN=manual) for A/B on other GPUs / larger
+        // moonshine variants where the tradeoff may differ. See PLAN §232.
+        bool manual_attn = false;
+        if (const char* e = crispasr_env::get("CRISPASR_MOONSHINE_ENC_ATTN")) {
+            if (std::strcmp(e, "manual") == 0)
+                manual_attn = true;
+            else if (std::strcmp(e, "flash") == 0)
+                manual_attn = false;
+        }
+        struct ggml_tensor* output = moonshine_build_encoder(ctx0, ctx->model, conv_out, pos, seq_len, manual_attn);
+        ggml_set_name(output, "encoder_output");
+        ggml_set_output(output);
+        graph = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(graph, output);
+
+        if (cache_ok) {
+            ctx->cached_enc_ctx = ctx0;
+            ctx->cached_enc_gf = graph;
+            ctx->cached_enc_n_samples = n_samples;
+            ctx0 = nullptr; // owned by cache now
+        } else {
+            transient_ctx = ctx0; // GPU: own it here, free after compute
+            ctx0 = nullptr;
+        }
     }
-
-    struct ggml_tensor* input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_samples, 1, 1);
-    ggml_set_name(input, "audio_input");
-    ggml_set_input(input);
-
-    struct ggml_tensor* conv_out = build_conv_stem(ctx0, ctx->model, input);
-
-    const int seq_len = (int)conv_out->ne[1];
-
-    struct ggml_tensor* pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, seq_len);
-    ggml_set_name(pos, "enc_pos");
-    ggml_set_input(pos);
-
-    struct ggml_tensor* output = moonshine_build_encoder(ctx0, ctx->model, conv_out, pos, seq_len);
-    ggml_set_name(output, "encoder_output");
-    ggml_set_output(output);
-
-    struct ggml_cgraph* graph = ggml_new_graph(ctx0);
-    ggml_build_forward_expand(graph, output);
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
-        ggml_free(ctx0);
+        if (transient_ctx)
+            ggml_free(transient_ctx);
         return -1;
     }
 
+    struct ggml_tensor* input = ggml_graph_get_tensor(graph, "audio_input");
     ggml_backend_tensor_set(input, audio, 0, n_samples * sizeof(float));
 
+    struct ggml_tensor* pos = ggml_graph_get_tensor(graph, "enc_pos");
+    const int seq_len = (int)pos->ne[0];
     std::vector<int32_t> pos_data(seq_len);
     for (int i = 0; i < seq_len; i++) {
         pos_data[i] = i;
@@ -559,19 +685,22 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
 
     if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
-        ggml_free(ctx0);
+        if (transient_ctx)
+            ggml_free(transient_ctx);
         return -1;
     }
 
-    const int hidden_dim = (int)output->ne[0];
-    const int out_seq = (int)output->ne[1];
+    struct ggml_tensor* enc_output = ggml_graph_get_tensor(graph, "encoder_output");
+    const int hidden_dim = (int)enc_output->ne[0];
+    const int out_seq = (int)enc_output->ne[1];
     const size_t out_bytes = hidden_dim * out_seq * sizeof(float);
 
     ctx->encoder_out.resize(hidden_dim * out_seq);
     ctx->enc_len = out_seq;
-    ggml_backend_tensor_get(output, ctx->encoder_out.data(), 0, out_bytes);
+    ggml_backend_tensor_get(enc_output, ctx->encoder_out.data(), 0, out_bytes);
 
-    ggml_free(ctx0);
+    if (transient_ctx)
+        ggml_free(transient_ctx);
     return 0;
 }
 
@@ -827,6 +956,65 @@ static struct ggml_tensor* moonshine_build_decoder_step(struct ggml_context* ctx
 }
 
 // Build a decoder step graph and compute via scheduler
+// §232: In-graph argmax for greedy decode. The graph is still rebuilt per step
+// (cur_pos is baked into KV cache view offsets), but the argmax runs on-device
+// and we read back 4 bytes instead of 128 KB of logits.
+static int moonshine_decode_step_greedy(struct moonshine_context* ctx, int32_t token_id, int32_t& out_token) {
+    const auto& hp = ctx->model.hparams;
+    const int cur_pos = ctx->kv_self.n;
+
+    const size_t n_tensors = hp.dec_n_layers * 60 + 50;
+    const size_t mem_size = ggml_tensor_overhead() * (n_tensors + 2) + ggml_graph_overhead();
+    struct ggml_init_params params = {
+        /*.mem_size   =*/mem_size,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context* ctx0 = ggml_init(params);
+    if (!ctx0)
+        return -1;
+
+    struct ggml_tensor* inp_token = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(inp_token, "token_id");
+    ggml_set_input(inp_token);
+
+    struct ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(inp_pos, "dec_pos");
+    ggml_set_input(inp_pos);
+
+    struct ggml_cgraph* graph = ggml_new_graph(ctx0);
+
+    struct ggml_tensor* logits = moonshine_build_decoder_step(ctx0, ctx->model, ctx->kv_self, ctx->kv_cross, inp_token,
+                                                              inp_pos, ctx->enc_len, cur_pos, graph);
+
+    // In-graph argmax: runs on-device, returns 1 int32 instead of vocab_size floats
+    struct ggml_tensor* argmax = ggml_argmax(ctx0, logits);
+    ggml_set_name(argmax, "argmax");
+    ggml_set_output(argmax);
+    ggml_build_forward_expand(graph, argmax);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, graph)) {
+        ggml_free(ctx0);
+        return -1;
+    }
+
+    ggml_backend_tensor_set(inp_token, &token_id, 0, sizeof(int32_t));
+    int32_t pos_val = cur_pos;
+    ggml_backend_tensor_set(inp_pos, &pos_val, 0, sizeof(int32_t));
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx0);
+        return -1;
+    }
+
+    ggml_backend_tensor_get(argmax, &out_token, 0, sizeof(int32_t));
+
+    ctx->kv_self.n++;
+    ggml_free(ctx0);
+    return 0;
+}
+
 static int moonshine_decode_step(struct moonshine_context* ctx, int32_t token_id, std::vector<float>& logits_out) {
     const auto& hp = ctx->model.hparams;
     const int cur_pos = ctx->kv_self.n;
@@ -910,29 +1098,40 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // 1. Run encoder
-    int ret = moonshine_run_encoder(ctx, audio, n_samples);
+    int ret;
+    {
+        moonshine_bench_stage _b("encoder");
+        ret = moonshine_run_encoder(ctx, audio, n_samples);
+    }
     if (ret != 0) {
         return ret;
     }
 
     // 2. Init KV caches
     int max_gen = (int)(ceil((double)n_samples / 16000.0 * 6.5));
-    if (max_gen > 194) {
-        max_gen = 194;
+    const int gen_ceiling = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 194; // #292
+    if (max_gen > gen_ceiling) {
+        max_gen = gen_ceiling;
     }
     int max_len = max_gen + 1; // +1 for BOS
 
-    if (!moonshine_kv_cache_init(ctx->kv_self, hp.dec_n_layers, max_len, hp.n_kv_heads, hp.head_dim)) {
-        return -2;
-    }
+    {
+        moonshine_bench_stage _b("kv_init");
+        if (!moonshine_kv_cache_init(ctx->kv_self, hp.dec_n_layers, max_len, hp.n_kv_heads, hp.head_dim)) {
+            return -2;
+        }
 
-    if (!moonshine_kv_cache_init(ctx->kv_cross, hp.dec_n_layers, ctx->enc_len, hp.n_kv_heads, hp.head_dim)) {
-        ctx->kv_self.reset();
-        return -2;
+        if (!moonshine_kv_cache_init(ctx->kv_cross, hp.dec_n_layers, ctx->enc_len, hp.n_kv_heads, hp.head_dim)) {
+            ctx->kv_self.reset();
+            return -2;
+        }
     }
 
     // 3. Precompute cross-attention KV
-    ret = moonshine_precompute_cross_kv(ctx);
+    {
+        moonshine_bench_stage _b("cross_kv_precompute");
+        ret = moonshine_precompute_cross_kv(ctx);
+    }
     if (ret != 0) {
         ctx->kv_self.reset();
         ctx->kv_cross.reset();
@@ -949,6 +1148,7 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     // softmax(logits/T) + multinomial sample. Beam search (beam_size > 1)
     // takes a separate path below — it ignores temperature and always
     // returns the highest cumulative-log-prob hypothesis.
+    moonshine_bench_stage _b_decode("decode");
     if (ctx->beam_size > 1) {
         // 5a. Prefill BOS to populate slot 0 + capture initial logits.
         std::vector<float> bos_logits;
@@ -1024,16 +1224,16 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
         ctx->timing.decode_ms = std::chrono::duration<double, std::milli>(t_decode_done - t_encode_done).count();
         ctx->timing.n_tokens = (int)out_tokens.size();
 
-
         ctx->kv_self.reset();
         ctx->kv_cross.reset();
         return 0;
     }
 
     int32_t token = (int32_t)hp.bos_token_id;
-    std::vector<float> logits((size_t)hp.vocab_size);
     const float T = ctx->temperature;
     const bool sample = (T > 0.0f);
+    // §232: use the greedy fast path when no sampling and no probs needed
+    const bool greedy_fast = !sample && !out_token_probs;
 
     // Per-call seed: derive from samples + audio length so repeated runs are
     // deterministic but different from each other. When the caller has
@@ -1051,63 +1251,87 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
         return (float)((rng_state >> 11) & 0x1FFFFF) / (float)(1 << 21);
     };
 
-    for (int step = 0; step < max_len; step++) {
-        ret = moonshine_decode_step(ctx, token, logits);
-        if (ret != 0) {
-            break;
-        }
+    std::vector<float> logits;
+    if (!greedy_fast)
+        logits.resize((size_t)hp.vocab_size);
 
-        const int V = (int)hp.vocab_size;
+    // Decode-time repetition-loop break (on by default; see the loop body).
+    const bool repeat_break = [] {
+        const char* e = std::getenv("CRISPASR_MOONSHINE_NO_REPEAT_BREAK");
+        return !(e && e[0] && e[0] != '0');
+    }();
+
+    for (int step = 0; step < max_len; step++) {
         int32_t picked = 0;
         float picked_prob = 0.0f;
 
-        if (!sample) {
-            // Greedy argmax
-            int32_t best = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < V; i++) {
-                if (logits[i] > best_val) {
-                    best_val = logits[i];
-                    best = i;
-                }
-            }
-            picked = best;
-            if (out_token_probs) {
-                // Softmax of the picked logit (numerically stable).
-                float mx = best_val;
-                float s = 0.f;
-                for (int i = 0; i < V; i++)
-                    s += expf(logits[i] - mx);
-                picked_prob = 1.0f / s;
-            }
+        if (greedy_fast) {
+            // §232: in-graph argmax — 4 bytes readback instead of 128 KB
+            ret = moonshine_decode_step_greedy(ctx, token, picked);
+            if (ret != 0)
+                break;
         } else {
-            // Multinomial sample from softmax(logits / T).
-            float mx = logits[0];
-            for (int i = 1; i < V; i++)
-                if (logits[i] > mx)
-                    mx = logits[i];
-            std::vector<float> probs((size_t)V);
-            float s = 0.f;
-            const float inv_T = 1.0f / T;
-            for (int i = 0; i < V; i++) {
-                probs[i] = expf((logits[i] - mx) * inv_T);
-                s += probs[i];
-            }
-            const float inv_s = 1.0f / s;
-            for (int i = 0; i < V; i++)
-                probs[i] *= inv_s;
-            float u = rand_uniform();
-            float c = 0.f;
-            picked = V - 1;
-            for (int i = 0; i < V; i++) {
-                c += probs[i];
-                if (u <= c) {
-                    picked = i;
-                    break;
+            ret = moonshine_decode_step(ctx, token, logits);
+            if (ret != 0)
+                break;
+
+            const int V = (int)hp.vocab_size;
+
+            if (!sample) {
+                // Greedy argmax — NaN-robust (see canary_qwen note): seed -inf,
+                // skip non-finite. If the whole row is non-finite, route through
+                // the EOS path below to terminate cleanly instead of spewing 0.
+                int32_t best = -1;
+                float best_val = -std::numeric_limits<float>::infinity();
+                for (int i = 0; i < V; i++) {
+                    if (std::isfinite(logits[i]) && logits[i] > best_val) {
+                        best_val = logits[i];
+                        best = i;
+                    }
                 }
+                if (best < 0) {
+                    fprintf(stderr, "moonshine: non-finite logits — stopping decode\n");
+                    picked = (int32_t)hp.eos_token_id;
+                } else {
+                    picked = best;
+                    if (out_token_probs) {
+                        float mx = best_val;
+                        float s = 0.f;
+                        for (int i = 0; i < V; i++)
+                            if (std::isfinite(logits[i]))
+                                s += expf(logits[i] - mx);
+                        picked_prob = 1.0f / s;
+                    }
+                }
+            } else {
+                // Multinomial sample from softmax(logits / T).
+                float mx = logits[0];
+                for (int i = 1; i < V; i++)
+                    if (logits[i] > mx)
+                        mx = logits[i];
+                std::vector<float> probs((size_t)V);
+                float s = 0.f;
+                const float inv_T = 1.0f / T;
+                for (int i = 0; i < V; i++) {
+                    probs[i] = expf((logits[i] - mx) * inv_T);
+                    s += probs[i];
+                }
+                const float inv_s = 1.0f / s;
+                for (int i = 0; i < V; i++)
+                    probs[i] *= inv_s;
+                float u = rand_uniform();
+                float c = 0.f;
+                picked = V - 1;
+                for (int i = 0; i < V; i++) {
+                    c += probs[i];
+                    if (u <= c) {
+                        picked = i;
+                        break;
+                    }
+                }
+                if (out_token_probs)
+                    picked_prob = probs[picked];
             }
-            if (out_token_probs)
-                picked_prob = probs[picked];
         }
 
         if (picked == (int32_t)hp.eos_token_id) {
@@ -1118,6 +1342,14 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
         if (out_token_probs)
             out_token_probs->push_back(picked_prob);
         token = picked;
+
+        // Decode-time repetition break: on hard audio (e.g. a chunked long-audio
+        // slice) greedy decode can get stuck in a short token cycle and burn
+        // every remaining step. Stop as soon as a period-<=8 block repeats 4x —
+        // saves the wasted compute; core_ngram::fix_loops still cleans residue.
+        // Disable with CRISPASR_MOONSHINE_NO_REPEAT_BREAK=1.
+        if (repeat_break && core_repeat::tail_is_repetition(out_tokens))
+            break;
     }
 
     auto t_decode_done = std::chrono::high_resolution_clock::now();
@@ -1125,7 +1357,6 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     ctx->timing.n_tokens = (int)out_tokens.size();
 
     // Cleanup
-    // sched is persistent — no per-call free needed
     ctx->kv_self.reset();
     ctx->kv_cross.reset();
 
@@ -1189,6 +1420,12 @@ extern "C" void moonshine_set_seed(struct moonshine_context* ctx, uint64_t seed)
         ctx->seed_override = seed;
 }
 
+// #292: forward --max-new-tokens. <= 0 keeps the 194 short-form default.
+extern "C" void moonshine_set_max_new_tokens(struct moonshine_context* ctx, int max_new_tokens) {
+    if (ctx && max_new_tokens > 0)
+        ctx->max_new_tokens = max_new_tokens;
+}
+
 extern "C" void moonshine_set_beam_size(struct moonshine_context* ctx, int beam_size) {
     if (ctx)
         ctx->beam_size = (beam_size > 0) ? beam_size : 1;
@@ -1205,6 +1442,9 @@ void moonshine_free(struct moonshine_context* ctx) {
     if (!ctx) {
         return;
     }
+    // §176s: free cached encoder graph.
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     // moonshine_model's destructor frees buf_w + ctx_w. It must run BEFORE

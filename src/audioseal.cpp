@@ -16,6 +16,8 @@
 #include "audioseal.h"
 #include "core/conv.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -23,6 +25,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +34,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `AUDIOSEAL_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool audioseal_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_AUDIOSEAL_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct audioseal_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit audioseal_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~audioseal_bench_stage() {
+        if (!audioseal_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  audioseal_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 namespace {
 
@@ -441,16 +470,16 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x, const aud
                                     const audioseal_lstm_layer lstm[2], const audioseal_conv& enc_out,
                                     const uint32_t ratios[4]) {
     // Input conv
-    if (std::getenv("AUDIOSEAL_DEBUG"))
+    if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
         fprintf(stderr, "  enc_in: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     if (enc_in.w) {
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  enc_in.w ne=[%lld,%lld,%lld]\n", (long long)enc_in.w->ne[0], (long long)enc_in.w->ne[1],
                     (long long)enc_in.w->ne[2]);
         x = conv1d(ctx, x, enc_in.w, enc_in.b, 1, 3, 1);
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  after enc_in: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
-        if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DUMP_STAGES")) {
             ggml_set_name(x, "stage_enc_0");
             ggml_set_output(x);
         }
@@ -458,16 +487,16 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x, const aud
 
     // 4 blocks: resblock → ELU → downsample
     for (int i = 0; i < 4; i++) {
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  resblock %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         x = build_resblock(ctx, x, res[i]);
-        if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DUMP_STAGES")) {
             char nm[32];
             snprintf(nm, sizeof(nm), "stage_enc_res%d", i);
             ggml_set_name(x, nm);
             ggml_set_output(x);
         }
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  after resblock %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         x = elu(ctx, x);
         if (down[i].w) {
@@ -480,18 +509,18 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x, const aud
             // ggml_conv_1d only supports symmetric padding.
             // NOTE: ggml_pad_ext convention may swap left/right — test both
             x = ggml_pad_ext(ctx, x, pad_right, pad_left, 0, 0, 0, 0, 0, 0);
-            if (std::getenv("AUDIOSEAL_DEBUG"))
+            if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
                 fprintf(stderr, "  down %d: ratio=%d K=%d pad_l=%d pad_r=%d w ne=[%lld,%lld,%lld]\n", i, ratio, K,
                         pad_left, pad_right, (long long)down[i].w->ne[0], (long long)down[i].w->ne[1],
                         (long long)down[i].w->ne[2]);
             x = conv1d(ctx, x, down[i].w, down[i].b, ratio, 0, 1); // pad=0 (done externally)
-            if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+            if (crispasr_env::get("CRISPASR_AUDIOSEAL_DUMP_STAGES")) {
                 char nm[32];
                 snprintf(nm, sizeof(nm), "stage_enc_down%d", i);
                 ggml_set_name(x, nm);
                 ggml_set_output(x);
             }
-            if (std::getenv("AUDIOSEAL_DEBUG"))
+            if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
                 fprintf(stderr, "  after down %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         }
     }
@@ -501,41 +530,41 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x, const aud
     {
         ggml_tensor* lstm_in = x;
         int hidden = (int)x->ne[1]; // x is (T, D) in ggml, ne[0]=T, ne[1]=D
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  LSTM: x ne=[%lld,%lld] hidden=%d\n", (long long)x->ne[0], (long long)x->ne[1], hidden);
         // Transpose to (D, T) for LSTM
         x = ggml_cont(ctx, ggml_transpose(ctx, x)); // (D, T)
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  LSTM after transpose: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
         for (int i = 0; i < 2; i++) {
             if (lstm[i].weight_ih)
                 x = lstm_layer_forward(ctx, x, lstm[i], hidden);
         }
         // Transpose back to (T, D)
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  LSTM output (before transpose back): x ne=[%lld,%lld]\n", (long long)x->ne[0],
                     (long long)x->ne[1]);
         x = ggml_cont(ctx, ggml_transpose(ctx, x));
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  LSTM output (after transpose back): x ne=[%lld,%lld]\n", (long long)x->ne[0],
                     (long long)x->ne[1]);
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  lstm_in: ne=[%lld,%lld]\n", (long long)lstm_in->ne[0], (long long)lstm_in->ne[1]);
         x = ggml_add(ctx, x, lstm_in); // skip connection
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  after skip add: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     }
 
     // ELU + output conv
     x = elu(ctx, x);
-    if (std::getenv("AUDIOSEAL_DEBUG"))
+    if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
         fprintf(stderr, "  enc_out conv: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     if (enc_out.w) {
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  enc_out.w ne=[%lld,%lld,%lld]\n", (long long)enc_out.w->ne[0],
                     (long long)enc_out.w->ne[1], (long long)enc_out.w->ne[2]);
         x = conv1d(ctx, x, enc_out.w, enc_out.b, 1, 3, 1);
-        if (std::getenv("AUDIOSEAL_DEBUG"))
+        if (crispasr_env::get("CRISPASR_AUDIOSEAL_DEBUG"))
             fprintf(stderr, "  after enc_out: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     }
 
@@ -634,7 +663,7 @@ struct audioseal_ctx* audioseal_init_from_file(const char* path, struct audiosea
 
     // Backend
     if (params.use_gpu) {
-        c->backend = ggml_backend_init_best();
+        c->backend = crispasr_init_gpu_backend();
     }
     if (!c->backend) {
         c->backend = ggml_backend_cpu_init();
@@ -703,6 +732,7 @@ uint32_t audioseal_nbits(const struct audioseal_ctx* ctx) {
 float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_samples, const uint8_t* message) {
     if (!ctx || !pcm || n_samples <= 0 || !ctx->has_generator)
         return nullptr;
+    audioseal_bench_stage _bs_total("embed_total");
 
     // Build compute graph
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
@@ -798,7 +828,7 @@ float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_sample
     }
 
     // Dump intermediate stages for debug/diff comparison
-    if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+    if (crispasr_env::get("CRISPASR_AUDIOSEAL_DUMP_STAGES")) {
         const char* stage_names[] = {
             "stage_enc_0",    "stage_enc_res0",  "stage_enc_down0", "stage_enc_res1",  "stage_enc_down1",
             "stage_enc_res2", "stage_enc_down2", "stage_enc_res3",  "stage_enc_down3", "enc_output",
@@ -839,6 +869,7 @@ float* audioseal_embed(struct audioseal_ctx* ctx, const float* pcm, int n_sample
 float* audioseal_detect(struct audioseal_ctx* ctx, const float* pcm, int n_samples, int* out_n, uint8_t* out_message) {
     if (!ctx || !pcm || n_samples <= 0 || !ctx->has_detector)
         return nullptr;
+    audioseal_bench_stage _bs_total("detect_total");
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -873,29 +904,35 @@ float* audioseal_detect(struct audioseal_ctx* ctx, const float* pcm, int n_sampl
         head_out = conv1d(ctx0, latent, ctx->det_head.w, ctx->det_head.b, 1, 0, 1);
     }
 
-    // Softmax on detection channels (first 2), take index 1 (watermark present)
-    // head_out shape: (18, T)
-    ggml_tensor* det_logits = ggml_view_2d(ctx0, head_out, 2, (int)head_out->ne[1], head_out->nb[1], 0);
-    det_logits = ggml_cont(ctx0, det_logits);
-    det_logits = ggml_soft_max(ctx0, det_logits);
-    // Take channel 1 (watermark probability)
-    ggml_tensor* det_probs =
-        ggml_view_2d(ctx0, det_logits, 1, (int)det_logits->ne[1], det_logits->nb[1], sizeof(float));
-    det_probs = ggml_cont(ctx0, det_probs);
+    // head_out layout is (T, C=18): ne[0]=time, ne[1]=channel — the ggml conv
+    // output convention (same as the generator, whose decoder crops along ne[0]
+    // = time). Channels 0-1 = detection logits, 2-17 = the 16 message bits.
+    //
+    // #260: the previous code assumed (C, T) and sliced 2 elements along ne[0]
+    // (i.e. 2 time samples) then read ne[1]=18 (the channel count) as the frame
+    // count — so softmax ran over the wrong axis and detection was chance-level
+    // (~0.4988). The Python reference detector output is (1, 18, 16000); per-frame
+    // detection is a softmax over the 2 detection channels at each of T frames.
+    const int T = (int)head_out->ne[0];
+
+    // Detection: channels 0,1 → view (T,2), transpose to (2,T), softmax over the
+    // 2 classes per frame, take class 1 (watermark present) → (1,T).
+    ggml_tensor* det2 = ggml_view_2d(ctx0, head_out, T, 2, head_out->nb[1], 0);
+    det2 = ggml_cont(ctx0, ggml_transpose(ctx0, det2)); // (2, T)
+    det2 = ggml_soft_max(ctx0, det2);                   // softmax over ne[0]=2 classes
+    ggml_tensor* det_probs = ggml_view_2d(ctx0, det2, 1, T, det2->nb[1], sizeof(float));
+    det_probs = ggml_cont(ctx0, det_probs); // (1, T): ne[1] = T frames
     ggml_set_name(det_probs, "det_probs");
     ggml_set_output(det_probs);
     ggml_build_forward_expand(gf, det_probs);
 
-    // Message head: channels 2-17 → sigmoid → decoded bits
+    // Message: channels 2-17 → view (T,16) at channel offset 2 → average over
+    // time (ne[0]=T) → (1,16) → sigmoid → decoded bits.
     ggml_tensor* msg_out = nullptr;
-    if (out_message && (int)head_out->ne[0] >= 18) {
-        ggml_tensor* msg_logits =
-            ggml_view_2d(ctx0, head_out, 16, (int)head_out->ne[1], head_out->nb[1], 2 * sizeof(float));
-        msg_logits = ggml_cont(ctx0, msg_logits);
-        // Average over time → (16,)
-        // For now: take mean over time dimension
-        msg_out = ggml_pool_1d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, msg_logits)), GGML_OP_POOL_AVG,
-                               (int)msg_logits->ne[1], (int)msg_logits->ne[1], 0);
+    if (out_message && (int)head_out->ne[1] >= 18) {
+        ggml_tensor* msg_logits = ggml_view_2d(ctx0, head_out, T, 16, head_out->nb[1], (size_t)2 * head_out->nb[1]);
+        msg_logits = ggml_cont(ctx0, msg_logits);                            // (T, 16)
+        msg_out = ggml_pool_1d(ctx0, msg_logits, GGML_OP_POOL_AVG, T, T, 0); // (1, 16)
         msg_out = ggml_sigmoid(ctx0, msg_out);
         ggml_set_name(msg_out, "msg_out");
         ggml_set_output(msg_out);

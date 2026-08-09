@@ -14,16 +14,45 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `MARBLENET_VAD_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool marblenet_vad_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_MARBLENET_VAD_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct marblenet_vad_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit marblenet_vad_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~marblenet_vad_bench_stage() {
+        if (!marblenet_vad_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  marblenet_vad_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Model ──────────────────────────────────────────────────────────────────
 
@@ -72,6 +101,44 @@ struct marblenet_vad_context {
     ggml_backend_t backend = nullptr;
     ggml_backend_sched_t sched = nullptr;
 };
+
+// #305 audit: the ggml graph is multi-threaded (CPU backend), but the mel FFT
+// front-end was single-threaded — the recurring VAD bottleneck (see whisper-vad
+// / firered). Parallelize over frames. Opt out with CRISPASR_MARBLENET_VAD_SERIAL=1.
+static int marblenet_vad_nthreads() {
+    static int v = -1;
+    if (v < 0) {
+        if (crispasr_env::get("CRISPASR_MARBLENET_VAD_SERIAL") != nullptr) {
+            v = 1;
+        } else {
+            unsigned hw = std::thread::hardware_concurrency();
+            v = (hw == 0) ? 1 : (int)std::min(hw, 8u);
+        }
+    }
+    return v;
+}
+
+// Run fn(begin, end) over a partition of [0, n) across threads; sub-ranges are
+// disjoint (each frame writes its own mel column), so this is bit-identical.
+template <class F> static void marblenet_parallel_for(int n, F&& fn) {
+    const int nt = std::min(marblenet_vad_nthreads(), n);
+    if (nt <= 1) {
+        fn(0, n);
+        return;
+    }
+    std::vector<std::thread> pool;
+    pool.reserve(nt - 1);
+    const int chunk = (n + nt - 1) / nt;
+    for (int t = 1; t < nt; t++) {
+        const int a = t * chunk, b = std::min(n, a + chunk);
+        if (a >= b)
+            break;
+        pool.emplace_back([&fn, a, b]() { fn(a, b); });
+    }
+    fn(0, std::min(n, chunk));
+    for (auto& th : pool)
+        th.join();
+}
 
 // ── Mel ────────────────────────────────────────────────────────────────────
 
@@ -136,24 +203,28 @@ static std::vector<float> mbn_compute_mel(const float* pcm, int n_samples, const
     }
 
     std::vector<float> mel((size_t)n_mels * n_frames, 0);
-    std::vector<float> si(4 * n_fft, 0), so(8 * n_fft, 0);
 
-    for (int t = 0; t < n_frames; t++) {
-        // Window (win_len) centered in n_fft-sized frame, zero-padded
-        for (int i = 0; i < n_fft; i++)
-            si[i] = 0;
-        int frame_start = t * hop;
-        for (int i = 0; i < win_len && (frame_start + i) < padded_len; i++)
-            si[i] = padded[frame_start + i] * hann[i];
-        mbn_fft(si.data(), n_fft, so.data());
-        // Power spectrum
-        for (int f = 0; f < n_freqs; f++) {
-            float pw = so[2 * f] * so[2 * f] + so[2 * f + 1] * so[2 * f + 1];
-            // Mel projection: fb is [n_mels, n_freqs]
-            for (int m = 0; m < n_mels; m++)
-                mel[(size_t)m * n_frames + t] += pw * fb[m * n_freqs + f];
+    // Frames are independent (each writes its own mel column t); give each thread
+    // its own FFT scratch. Bit-identical to the serial loop (#305).
+    marblenet_parallel_for(n_frames, [&](int t0, int t1) {
+        std::vector<float> si(4 * n_fft, 0), so(8 * n_fft, 0);
+        for (int t = t0; t < t1; t++) {
+            // Window (win_len) centered in n_fft-sized frame, zero-padded
+            for (int i = 0; i < n_fft; i++)
+                si[i] = 0;
+            int frame_start = t * hop;
+            for (int i = 0; i < win_len && (frame_start + i) < padded_len; i++)
+                si[i] = padded[frame_start + i] * hann[i];
+            mbn_fft(si.data(), n_fft, so.data());
+            // Power spectrum
+            for (int f = 0; f < n_freqs; f++) {
+                float pw = so[2 * f] * so[2 * f] + so[2 * f + 1] * so[2 * f + 1];
+                // Mel projection: fb is [n_mels, n_freqs]
+                for (int m = 0; m < n_mels; m++)
+                    mel[(size_t)m * n_frames + t] += pw * fb[m * n_freqs + f];
+            }
         }
-    }
+    });
     // Log + dither
     for (auto& v : mel)
         v = logf(v + 1e-5f);
@@ -399,6 +470,8 @@ extern "C" int marblenet_vad_detect(struct marblenet_vad_context* ctx, const flo
     if (!ctx || !samples || n_samples <= 0)
         return -1;
     auto& m = ctx->model;
+
+    marblenet_vad_bench_stage _bs_total("detect_total");
 
     // Compute mel
     std::vector<float> hann(m.win_length), fb((size_t)m.n_mels * (m.n_fft / 2 + 1));
