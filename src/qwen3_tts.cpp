@@ -6742,20 +6742,50 @@ extern "C" int qwen3_tts_set_language_by_name(struct qwen3_tts_context* ctx, con
         ctx->language_id = -1;
         return 0;
     }
+    if (want == "zh") want = "chinese";
+    else if (want == "en") want = "english";
+    else if (want == "ja") want = "japanese";
+    else if (want == "ko") want = "korean";
+    else if (want == "de") want = "german";
+    else if (want == "fr") want = "french";
+    else if (want == "ru") want = "russian";
+    else if (want == "pt") want = "portuguese";
+    else if (want == "es") want = "spanish";
+    else if (want == "it") want = "italian";
+
     const auto& names = ctx->hp.codec_language_names;
     const auto& ids = ctx->hp.codec_language_ids;
-    if (names.empty() || names.size() != ids.size()) {
-        return -2; // model has no language table (older GGUF)
+    if (!names.empty() && names.size() == ids.size()) {
+        for (size_t i = 0; i < names.size(); i++) {
+            std::string n = names[i];
+            std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            if (n == want) {
+                ctx->language_id = (int)ids[i];
+                return 0;
+            }
+        }
     }
-    for (size_t i = 0; i < names.size(); i++) {
-        std::string n = names[i];
-        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-        if (n == want) {
-            ctx->language_id = (int)ids[i];
+
+    static const struct { const char* name; int id; } std_langs[] = {
+        { "chinese", 2038 },
+        { "english", 2039 },
+        { "japanese", 2040 },
+        { "korean", 2041 },
+        { "german", 2042 },
+        { "french", 2043 },
+        { "russian", 2044 },
+        { "portuguese", 2045 },
+        { "spanish", 2046 },
+        { "italian", 2047 },
+    };
+
+    for (const auto& l : std_langs) {
+        if (want == l.name) {
+            ctx->language_id = l.id;
             return 0;
         }
     }
-    return -3; // name not found in this model's table
+    return -3;
 }
 
 extern "C" int qwen3_tts_is_custom_voice(struct qwen3_tts_context* ctx) {
