@@ -5,12 +5,15 @@
 #include "grammar-parser.h"
 #include "whisper_params.h"       // struct whisper_params (shared with crispasr_*)
 #include "crispasr_backend.h"     // crispasr_run_backend() dispatch entry point
+#include "crispasr_cpu_isa.h"     // fail-fast on build-vs-host ISA mismatch (#380)
 #include "crispasr_diagnostics.h" // --version / --diagnostics + verbose banner (#31)
 #include "crispasr_consent_record.h"
 #include "crispasr_diarize_cli.h"      // crispasr_apply_diarize / pyannote cache (#107)
 #include "crispasr_speaker_embedder.h" // pluggable speaker embedder (#107 P3)
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
+#include "core/asr_sensitivity.h"      // --sensitivity presets (PLAN.md §W7)
+#include "core/ggml_cpu_backend.h"     // CPU-backend probe — fail fast when no module loads (#405)
 #include "core/gpu_backend_pref.h"     // crispasr_set_gpu_backend_pref (#214)
 #include "core/win_compat.h"           // setenv/unsetenv shims for MSVC
 #include "crispasr_model_mgr_cli.h"
@@ -223,6 +226,30 @@ static bool whisper_params_parse_arg_general(int argc, char** argv, int& i, whis
         params.audio_ctx = std::stoi(ARGV_NEXT);
     } else if (arg == "-wt" || arg == "--word-thold") {
         params.word_thold = std::stof(ARGV_NEXT);
+    } else if (arg == "--sensitivity") {
+        // PLAN.md §W7. Applied HERE, in argv order, so a later explicit -et /
+        // -lpt / -nth on the same command line overrides it — and an EARLIER
+        // one is deliberately overridden by the preset, which is the same
+        // last-flag-wins rule every other option in this parser follows.
+        const std::string name = ARGV_NEXT;
+        core_sensitivity::Preset p;
+        if (!core_sensitivity::parse_preset(name, p)) {
+            fprintf(stderr, "error: unknown --sensitivity '%s' (expected: %s)\n", name.c_str(),
+                    core_sensitivity::preset_list());
+            // exit rather than `return false`: this parser is a chain of
+            // "did I handle this arg" helpers, so returning false means
+            // UNHANDLED — the caller would then print "unknown argument:
+            // --sensitivity", which is wrong (the flag is known, its value is
+            // not) and dump the full usage over the real message. Non-zero
+            // because a mistyped preset silently decoding at the wrong
+            // thresholds is exactly what this flag exists to prevent.
+            exit(1);
+        }
+        const auto t = core_sensitivity::preset(p);
+        params.entropy_thold = t.entropy_thold;
+        params.logprob_thold = t.logprob_thold;
+        params.no_speech_thold = t.no_speech_thold;
+        params.temperature_inc = t.temperature_inc;
     } else if (arg == "-et" || arg == "--entropy-thold") {
         params.entropy_thold = std::stof(ARGV_NEXT);
     } else if (arg == "-lpt" || arg == "--logprob-thold") {
@@ -585,6 +612,14 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         // Also drive the native-knob path (f5 ode_steps, chatterbox cfm_steps),
         // which reads tts_num_steps; previously only vibevoice honoured this.
         params.tts_num_steps = params.tts_steps;
+    } else if (arg == "--tts-min-speech-tokens") {
+        // #360: the floor was reachable ONLY from /v1/audio/speech — no CLI
+        // flag, no session ABI, no binding — while every other TTS knob has at
+        // least the CLI. Units are the backend's AR decode step (MOSS: codec
+        // frames at 12.5 Hz, so 80 ms each), not samples and not milliseconds.
+        params.tts_min_speech_tokens = std::stoi(ARGV_NEXT);
+        if (params.tts_min_speech_tokens < 0)
+            params.tts_min_speech_tokens = 0;
     } else if (arg == "--tts-cfg-scale") {
         params.tts_cfg_scale = std::stof(ARGV_NEXT);
         if (params.tts_cfg_scale < 0.0f)
@@ -690,10 +725,14 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.chat_n_ctx = std::stoi(ARGV_NEXT);
     } else if (arg == "--chat-gpu-layers") {
         params.chat_n_gpu_layers = std::stoi(ARGV_NEXT);
+    } else if (arg == "--separate-model") {
+        params.separate_model = ARGV_NEXT;
     } else if (arg == "--g2p-dict") {
         params.g2p_dict = ARGV_NEXT;
     } else if (arg == "--tts-trim-silence") {
         params.tts_trim_silence = true;
+    } else if (arg == "--tts-pad-silence-ms") {
+        params.tts_pad_silence_ms = std::stoi(ARGV_NEXT);
     } else if (arg == "--tts-play") {
         params.tts_play = true;
     } else if (arg == "--tts-play-device") {
@@ -774,6 +813,12 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.stream_partial_decode_ms = std::stoi(ARGV_NEXT);
         if (params.stream_partial_decode_ms < 0) {
             fprintf(stderr, "crispasr: --stream-partial-decode-ms must be >= 0\n");
+            exit(2);
+        }
+    } else if (arg == "--stream-partial-tail-sec") {
+        params.stream_partial_tail_sec = std::stoi(ARGV_NEXT);
+        if (params.stream_partial_tail_sec < 0) {
+            fprintf(stderr, "crispasr: --stream-partial-tail-sec must be >= 0\n");
             exit(2);
         }
     } else if (arg == "--stream-punc") {
@@ -986,6 +1031,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "  -lpt N,    --logprob-thold N      [%-7.2f] log probability threshold for decoder fail\n",
             params.logprob_thold);
     fprintf(stderr, "  -nth N,    --no-speech-thold N    [%-7.2f] no speech threshold\n", params.no_speech_thold);
+    fprintf(stderr, "             --sensitivity S       [%-7s] preset for the four thresholds above: %s\n", "balanced",
+            core_sensitivity::preset_list());
     fprintf(stderr, "  -tp,       --temperature N        [%-7.2f] The sampling temperature, between 0 and 1\n",
             params.temperature);
     fprintf(stderr, "             --seed N               [%-7d] RNG seed for sampling (0 = non-deterministic)\n",
@@ -1265,6 +1312,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "  --stream-partial-decode-ms N      [%-7d] JSON+VAD minimum interval between partial ASR decodes; 0 = "
             "every step\n",
             params.stream_partial_decode_ms);
+    fprintf(stderr,
+            "  --stream-partial-tail-sec N       [%-7d] JSON+VAD cap partial decodes to the last N s of the open "
+            "utterance (0 = full slice)\n",
+            params.stream_partial_tail_sec);
     fprintf(stderr, "  --stream-punc MODE                [%-7s] JSON+VAD FireRedPunc mode: off, final, or partial\n",
             params.stream_punc.c_str());
     fprintf(stderr,
@@ -1367,10 +1418,13 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "                                                 [--align-format srt|json|plain] [--align-output f])\n"
             "             --align-only              standalone CTC forced alignment (issue #217)\n"
             "                                                 (-am <aligner.gguf> -f <audio> --ref-text \"text\"\n"
-            "                                                 or --text-file <file.txt|file.srt>)\n"
+            "                                                 or --text-file <file.txt|.srt|.json|->)\n"
+            "                                                 --text-file - reads from stdin (auto-detects format);\n"
+            "                                                 .json accepts CrispASR --output-json transcription\n"
+            "                                                 -m/--backend, --vad, --max-len are unused here\n"
             "             --align-granularity G     [auto   ] align-only output units: auto|word|segment\n"
-            "                                                 (segment = re-timed input SRT cues / .txt lines;\n"
-            "                                                 auto = segment for .srt input, word otherwise)\n");
+            "                                                 (segment = re-timed input cues/segments;\n"
+            "                                                 auto = segment for .srt/.json, word otherwise)\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",
@@ -1404,10 +1458,17 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --chat-gpu-layers N      [%-7d] server: GPU layers for the chat model "
             "(-1 = all, 0 = CPU only)\n",
             params.chat_n_gpu_layers);
+    fprintf(stderr, "             --separate-model PATH    server: enable POST /v1/audio/separation backed by "
+                    "this GGUF (htdemucs or mel-band-roformer; independent of --model)\n");
     fprintf(stderr,
             "             --tts-steps N            [%-7d] diffusion/ODE steps (vibevoice 10-20; irodori 40; "
             "chatterbox/f5/tada)\n",
             params.tts_steps);
+    fprintf(stderr,
+            "             --tts-min-speech-tokens N [%-6d] floor on generated audio length (moss-tts, "
+            "moss-tts-local). Units are the backend's AR decode step, NOT samples or ms: one codec frame, "
+            "12.5 Hz on the shipped models, so 80 ms each and N=25 floors at ~2 s. -1 = model default\n",
+            params.tts_min_speech_tokens);
     fprintf(
         stderr,
         "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale (vibevoice/chatterbox/f5/tada/irodori; "
@@ -1420,6 +1481,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_speed);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
+    fprintf(stderr,
+            "             --tts-pad-silence-ms N   [%-7d] prepend N ms of silence (useful for VLC C2PA buffer drop)\n",
+            params.tts_pad_silence_ms);
     fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",
             params.tts_play ? "true" : "false");
     fprintf(stderr, "             --tts-play-device N      [%-7d] speaker device index (-1 = default)\n",
@@ -1438,8 +1502,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "\nVoice Activity Detection (VAD) options:\n");
     fprintf(stderr, "             --vad                           [%-7s] enable Voice Activity Detection (VAD)\n",
             params.vad ? "true" : "false");
-    fprintf(stderr, "  -vm FNAME, --vad-model FNAME               [%-7s] VAD model (path, 'firered', or 'silero')\n",
-            params.vad_model.c_str());
+    fprintf(stderr, "  -vm FNAME, --vad-model FNAME               [%-7s] VAD model: a path, or one of %s\n",
+            params.vad_model.c_str(), crispasr_vad_model_keywords());
     fprintf(stderr, "  -vt N,     --vad-threshold N               [%-7.2f] VAD threshold for speech recognition\n",
             params.vad_threshold);
     fprintf(stderr, "  -vspd N,   --vad-min-speech-duration-ms  N [%-7d] VAD min speech duration (ms)\n",
@@ -2336,6 +2400,52 @@ int main(int argc, char** argv) {
     // hitting #31 get a complete capture in the same log block.
     if (params.verbose) {
         crispasr_print_full_diagnostics(stderr);
+    }
+
+    // #380 (and #261/#374 before it): if this binary's ggml kernels emit
+    // instructions the host CPU lacks (e.g. the AVX2+FMA release zip on a
+    // pre-2013 CPU), the first compute op dies with an illegal-instruction
+    // fault that Windows swallows — the user sees the banner and then
+    // nothing. Fail fast with the actual fix instead. Every backend runs
+    // some ops on the CPU backend even in GPU mode, so there is no safe way
+    // to continue; CRISPASR_IGNORE_CPU_ISA=1 overrides for experts.
+    {
+        const crispasr_cpu_isa::IsaCheck isa = crispasr_cpu_isa::check();
+        if (isa.checked && !isa.ok) {
+            const char* ov = getenv("CRISPASR_IGNORE_CPU_ISA");
+            fprintf(stderr,
+                    "error: this build was compiled for %s, but this CPU lacks: %s (%s).\n"
+                    "       Running it would crash with an illegal instruction at the first\n"
+                    "       compute step. Use the '-legacy' release artifact instead (e.g.\n"
+                    "       crispasr-windows-x86_64-cpu-legacy.zip — generic x86-64 baseline\n"
+                    "       for CPUs without AVX2/FMA), or build from source on this machine.\n",
+                    isa.required.c_str(), isa.missing.c_str(), isa.host_note.c_str());
+            if (!(ov && ov[0] == '1')) {
+                return 1;
+            }
+            fprintf(stderr, "warning: CRISPASR_IGNORE_CPU_ISA=1 set — continuing anyway.\n");
+        }
+    }
+
+    // Issue #405 — the case the #380 check above cannot see: in a
+    // GGML_BACKEND_DL package the CPU backend is a dlopen'd module with an ISA
+    // gate of its own (ggml_backend_score()), and on a host below every shipped
+    // variant's floor NONE of them registers. has_feature() then reports no
+    // features, isa.checked stays false, and the process used to run on until
+    // the first null-backend deref aborted it (GGML_ASSERT(backend) /
+    // GGML_ASSERT(device) — the two #405 stacks). Probe the CPU backend once,
+    // up front, and fail with the actual story instead. In non-DL builds the
+    // probe is ggml_backend_cpu_init() and never fails.
+    {
+        ggml_backend_t cpu_probe = core_cpu_backend::init();
+        if (!cpu_probe) {
+            fprintf(stderr, "error: no CPU ggml backend could be initialised (see the message above).\n"
+                            "       Nothing can run without one — even GPU inference stages audio and\n"
+                            "       falls back per-op on the CPU backend. Use the '-cpu-legacy' release\n"
+                            "       artifact for this machine, or build from source.\n");
+            return 1;
+        }
+        ggml_backend_free(cpu_probe);
     }
 
     if (params.use_gpu) {

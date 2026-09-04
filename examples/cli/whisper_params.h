@@ -369,6 +369,16 @@ struct whisper_params {
     // decodes. 0 = decode partials every --stream-step, preserving the
     // previous behavior. VAD timing/finalization still runs every step.
     int32_t stream_partial_decode_ms = 0;
+    // JSON streaming + VAD only (#404): bound the audio each live partial
+    // decode covers to the last N seconds of the open utterance. Text already
+    // decoded ahead of the moving anchor is kept as a committed prefix, so
+    // partial.text still covers the whole utterance; `final.text` is
+    // unaffected (redecode mode re-decodes the full utterance regardless).
+    // Cuts land on the quietest 100 ms (energy-min, same policy as the
+    // long-audio chunker). 0 = off (decode the full open slice, previous
+    // behavior). Minimum useful value ~4 s: values below the 2 s encoder
+    // floor + slack behave like 4.
+    int32_t stream_partial_tail_sec = 0;
     // JSON streaming + VAD only: control FireRedPunc placement when
     // --punc-model is loaded. "final" avoids the high-frequency partial
     // punc path; "partial" preserves the older partial+final behavior.
@@ -439,6 +449,7 @@ struct whisper_params {
     // CLI: --tts-phonemes "<IPA>"
     std::string tts_phonemes;
     bool tts_trim_silence = false;
+    int tts_pad_silence_ms = 0;
 
     // --make-ref: create a TADA voice reference GGUF from --voice <audio.wav>
     // + --ref-text "transcript". Requires tada-encoder.gguf + tada-aligner-*.gguf.
@@ -653,4 +664,10 @@ struct whisper_params {
     std::string chat_model; // path to a GGUF chat model
     int32_t chat_n_ctx = 4096;
     int32_t chat_n_gpu_layers = -1;
+
+    // Source separation (server-mode POST /v1/audio/separation). Independent
+    // from the primary ASR backend — a secondary GGUF loaded at startup.
+    // GGUF arch auto-detected (htdemucs / mel-band-roformer). When empty,
+    // /v1/audio/separation returns 503 with `separation_disabled`.
+    std::string separate_model;
 };

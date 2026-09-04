@@ -39,6 +39,8 @@ struct crispasr_diarize_opts_abi;
 typedef struct crispasr_diarize_opts_abi crispasr_diarize_opts_abi;
 struct crispasr_diarize_seg_abi;
 typedef struct crispasr_diarize_seg_abi crispasr_diarize_seg_abi;
+struct crispasr_diarize_turn_abi;
+typedef struct crispasr_diarize_turn_abi crispasr_diarize_turn_abi;
 struct crispasr_open_params_v1;
 typedef struct crispasr_open_params_v1 crispasr_open_params_v1;
 struct crispasr_session;
@@ -71,6 +73,16 @@ CRISPASR_SESSION_API void crispasr_reset_progress(void);
 // Single-pass and non-Parakeet backends do not fire it. The module-level
 // atomic (crispasr_get_progress) is updated in lockstep, so pure pollers
 // (e.g. Dart FFI) get chunked progress without registering a callback.
+//
+// Issue #385: between the unified-dispatch switch (0.8.24) and 0.8.29 the
+// default non-JA Parakeet path ran through a shared orchestrator with no
+// progress hook, so neither the callback nor the atomic moved until the
+// call returned. The hook now lives in the orchestrator itself, so the
+// contract holds on every dispatch path — including the ones that run one
+// decode over a chunk-ENCODED input (an explicit chunk_seconds > 0, and the
+// JA streamed route), which report per ENCODER window and emit the final
+// (total, total) only once the decode and any repair pass have returned.
+// A genuinely indivisible single pass still fires nothing.
 typedef void (*crispasr_progress_callback)(int processed, int total, void* user_data);
 
 // Register (or clear, with cb == NULL) the session progress callback.
@@ -173,6 +185,10 @@ CRISPASR_SESSION_API float crispasr_detect_language(whisper_context* ctx, const 
 CRISPASR_SESSION_API int crispasr_vad_segments(const char* vad_model_path, const float* pcm, int n_samples,
                                                int sample_rate, float threshold, int min_speech_ms, int min_silence_ms,
                                                int n_threads, bool use_gpu, float** out_spans);
+// Returns the slice count (>= 0), or negative on error: -1 bad arguments,
+// -2 allocation failed, -3 the VAD model could not be loaded. -3 matters
+// because 0 ("loaded fine, found no speech") used to be the answer for a
+// missing model too, which made every binding read a broken install as silence.
 CRISPASR_SESSION_API int crispasr_vad_slices(const char* vad_model_path, const float* pcm, int n_samples,
                                              int sample_rate, float threshold, int min_speech_ms, int min_silence_ms,
                                              int speech_pad_ms, float max_chunk_duration_s, int n_threads,
@@ -247,6 +263,13 @@ CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe(crispa
 // non-JA window length / the JA streamed window. `overlap_seconds < 0`
 // uses the default. For non-Parakeet backends the chunk params are inert
 // and this behaves exactly like crispasr_session_transcribe[_lang].
+//
+// 0.8.29+ (issue #350): `chunk_seconds = 0` is "per-model defaults", NOT
+// "no chunking" — reaching this entry point at all is a request for bounded
+// long-form, so the non-JA single-pass cap drops from 300 s to the decoder's
+// reliable ~30 s window for this call. Between 0.8.24 and 0.8.28 the unified
+// dispatch collapsed the two, and such a call took ONE full-length decode
+// that silently dropped whole spans of speech.
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_chunked_lang(
     crispasr_session* s, const float* pcm, int n_samples, int chunk_seconds, int overlap_seconds, const char* language);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_chunked(crispasr_session* s, const float* pcm,
@@ -261,6 +284,35 @@ CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_vad(
 CRISPASR_SESSION_API int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
                                                        int32_t is_stereo, crispasr_diarize_seg_abi* segs,
                                                        int32_t n_segs, const crispasr_diarize_opts_abi* opts);
+// 0.8.30+ (issue #395): diarize AND hand back the speaker turns the method
+// derived from the audio, so a caller can split one of its own segments that
+// spans a speaker change — labelling alone can never resolve finer than the
+// segment grid the caller sent in. Only FoxNose (method 4) derives turns; the
+// other methods report 0, which is not an error.
+//
+// A NEW SYMBOL rather than a signature change, so the existing ABI stays
+// stable (same append-only convention as crispasr_diarize_opts_abi).
+// `out_turns == NULL, n_turns_cap == 0, out_n_turns == NULL` behaves exactly
+// like crispasr_diarize_segments_abi.
+//
+// `out_n_turns`, when non-NULL, always receives the TOTAL turn count — also
+// when it exceeds n_turns_cap, so a caller can size and retry (at the cost of
+// a second full pass: the ABI keeps no state between calls). `out_turns`,
+// when non-NULL, receives up to n_turns_cap turns.
+//
+// Turn timestamps are centiseconds on the SAME absolute timeline as
+// crispasr_diarize_seg_abi (i.e. `opts->slice_t0_cs` is already added back),
+// so turns and caller segments compare directly.
+//
+// Returns 0 on success, 2 when a turn buffer was given and could not hold
+// every turn (the segments are still fully labelled and the first n_turns_cap
+// turns are still written), 1 on model load failure, -1 on invalid arguments.
+CRISPASR_SESSION_API int crispasr_diarize_segments_turns_abi(const float* left_pcm, const float* right_pcm,
+                                                             int32_t n_samples, int32_t is_stereo,
+                                                             crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                                             const crispasr_diarize_opts_abi* opts,
+                                                             crispasr_diarize_turn_abi* out_turns, int32_t n_turns_cap,
+                                                             int32_t* out_n_turns);
 CRISPASR_SESSION_API int crispasr_detect_language_pcm(const float* samples, int32_t n_samples, int32_t method,
                                                       const char* model_path, int32_t n_threads, int32_t use_gpu,
                                                       int32_t gpu_device, int32_t flash_attn, char* out_lang_buf,
@@ -377,8 +429,13 @@ CRISPASR_SESSION_API int crispasr_session_set_instruct(crispasr_session* s, cons
 // seam between text processing and the acoustic model. Use it to reproduce
 // another implementation's pronunciation exactly, or to separate "the G2P is
 // wrong" from "the model is wrong". Empty clears. Returns -2 (soft no-op) when
-// the active backend exposes no phonemes-in call; kokoro and piper do.
+// phonemes-in call; kokoro and piper do.
 CRISPASR_SESSION_API int crispasr_session_set_tts_phonemes(crispasr_session* s, const char* phonemes);
+
+// Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs
+// where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+CRISPASR_SESSION_API void crispasr_session_set_tts_pad_silence_ms(crispasr_session* s, int ms);
+
 CRISPASR_SESSION_API int crispasr_session_is_custom_voice(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_is_voice_design(crispasr_session* s);
 // UNMARKED synthesis — hard-refused unless crispasr_session_accept_marking_responsibility() was called first.
@@ -673,6 +730,14 @@ CRISPASR_SESSION_API int crispasr_session_set_cfg_weight(crispasr_session* s, fl
 CRISPASR_SESSION_API int crispasr_session_set_tts_noise_temp(crispasr_session* s, float noise_temp);
 CRISPASR_SESSION_API int crispasr_session_set_exaggeration(crispasr_session* s, float exaggeration);
 CRISPASR_SESSION_API int crispasr_session_set_max_speech_tokens(crispasr_session* s, int n);
+// Issue #360: the floor counterpart to set_max_speech_tokens. UNITS are the
+// backend's own AR decode step — NOT samples, NOT milliseconds. Today only the
+// MOSS TTS backends consume it, where one unit is an audio-codec frame at
+// sampling_rate / downsample_rate (24000 / 1920 = 12.5 Hz on the shipped
+// models), i.e. 80 ms per frame, so n = 25 floors the output at ~2 s. It works
+// by masking the audio-end token until n frames exist, so it bounds the decode
+// rather than padding the result. Other backends return -2.
+CRISPASR_SESSION_API int crispasr_session_set_min_speech_tokens(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_length_scale(crispasr_session* s, float scale);
 CRISPASR_SESSION_API int crispasr_session_set_best_of(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_max_new_tokens(crispasr_session* s, int n);

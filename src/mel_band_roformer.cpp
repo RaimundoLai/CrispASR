@@ -51,6 +51,7 @@ extern "C" void openblas_set_num_threads(int);
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // Model context
@@ -281,7 +282,7 @@ mel_band_roformer_context* mel_band_roformer_init_from_file(const char* model_pa
     hp.normalized = (int)core_gguf::kv_u32(meta, "mel-band-roformer.stft_normalized", hp.normalized);
     core_gguf::free_metadata(meta);
 
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     if (!ctx->backend) {
         fprintf(stderr, "mel_band_roformer: ggml_backend_cpu_init failed\n");
         delete ctx;
@@ -321,7 +322,7 @@ void mel_band_roformer_free(mel_band_roformer_context* ctx) {
     if (!ctx)
         return;
     if (ctx->weights.buf)
-        ggml_backend_buffer_free(ctx->weights.buf);
+        core_gguf::release_weight_buffer(ctx->weights.buf);
     if (ctx->weights.ctx)
         ggml_free(ctx->weights.ctx);
     if (ctx->backend)
@@ -1275,7 +1276,7 @@ int mel_band_roformer_diff(const char* model_gguf, const char* ref_gguf, const c
     }
 
     if (rw.buf)
-        ggml_backend_buffer_free(rw.buf);
+        core_gguf::release_weight_buffer(rw.buf);
     if (rw.ctx)
         ggml_free(rw.ctx);
     mel_band_roformer_free(ctx);

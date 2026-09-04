@@ -81,6 +81,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_pocket_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_speecht5_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dia_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dots_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_confucius4_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parler_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastpitch_backend();
 // csm-tts (§135): sesame/csm-1b — Llama backbone + depth decoder + Mimi codec.
@@ -178,9 +179,10 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "kartoffel-orpheus-synthetic" || name == "lex-au-orpheus-de" || name == "lex-au-orpheus")
         return crispasr_make_orpheus_backend();
     if (name == "chatterbox" || name == "chatterbox-tts" || name == "chatterbox-base" || name == "chatterbox-turbo" ||
-        name == "chatterbox_turbo" || name == "kartoffelbox" || name == "kartoffelbox-turbo" ||
-        name == "kartoffelbox_turbo" || name == "lahgtna" || name == "lahgtna-chatterbox" ||
-        name == "lahgtna-chatterbox-v1")
+        name == "chatterbox_turbo" || name == "chatterbox-nano" || name == "chatterbox_nano" ||
+        name == "chatterbox-finnish-nano" || name == "chatterbox_finnish_nano" || name == "kartoffelbox" ||
+        name == "kartoffelbox-turbo" || name == "kartoffelbox_turbo" || name == "lahgtna" ||
+        name == "lahgtna-chatterbox" || name == "lahgtna-chatterbox-v1")
         return crispasr_make_chatterbox_backend();
     if (name == "tada" || name == "tada-tts" || name == "tada-1b" || name == "tada-tts-1b" || name == "tada-3b" ||
         name == "tada-3b-ml")
@@ -201,7 +203,11 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_f5_tts_backend();
     if (name == "irodori-tts" || name == "irodori_tts" || name == "irodori")
         return crispasr_make_irodori_tts_backend();
-    if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket")
+    if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket" ||
+        name == "pocket-tts-de" || name == "pocket-tts-german" || name == "pocket-tts-es" ||
+        name == "pocket-tts-spanish" || name == "pocket-tts-it" || name == "pocket-tts-italian" ||
+        name == "pocket-tts-pt" || name == "pocket-tts-portuguese" || name == "pocket-tts-fr" ||
+        name == "pocket-tts-french")
         return crispasr_make_pocket_tts_backend();
     if (name == "fastpitch" || name == "fastpitch-tts" || name == "fastpitch_tts")
         return crispasr_make_fastpitch_backend();
@@ -278,6 +284,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_dia_backend();
     if (name == "dots-tts" || name == "dots_tts" || name == "dots" || name == "dots.tts")
         return crispasr_make_dots_tts_backend();
+    if (name == "confucius4-tts" || name == "confucius4_tts" || name == "confucius4")
+        return crispasr_make_confucius4_tts_backend();
     if (name == "parler-tts" || name == "parler_tts" || name == "parler" || name == "parlertts")
         return crispasr_make_parler_tts_backend();
     if (name == "zonos" || name == "zonos-tts" || name == "zonos_tts")
@@ -339,6 +347,8 @@ std::vector<std::string> crispasr_list_backends() {
         "kartoffel-orpheus-de-synthetic",
         "chatterbox",
         "chatterbox-turbo",
+        "chatterbox-nano",
+        "chatterbox-finnish-nano",
         "kartoffelbox-turbo",
         "lahgtna-chatterbox",
         "tada",
@@ -348,6 +358,11 @@ std::vector<std::string> crispasr_list_backends() {
         "indextts",
         "f5-tts",
         "pocket-tts",
+        "pocket-tts-de",
+        "pocket-tts-es",
+        "pocket-tts-it",
+        "pocket-tts-pt",
+        "pocket-tts-fr",
         "fastpitch",
         "kokoro",
         "melotts",
@@ -386,6 +401,7 @@ std::vector<std::string> crispasr_list_backends() {
         "dia",
         "dia-tts",
         "dots-tts",
+        "confucius4-tts",
         "parler-tts",
         "zonos",
         "zonos-tts",
@@ -737,6 +753,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "dia";
     if (contains_ci("dia-tts") || contains_ci("dia_tts"))
         return "dia";
+    if (contains_ci("confucius4") || contains_ci("confucius4-tts") || contains_ci("confucius4_tts"))
+        return "confucius4-tts";
     if (contains_ci("dots-tts") || contains_ci("dots_tts") || contains_ci("dots.tts"))
         return "dots-tts";
     if (contains_ci("csm") || contains_ci("sesame"))

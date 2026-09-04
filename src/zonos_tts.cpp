@@ -52,6 +52,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // -----------------------------------------------------------------------
 // Internal structures
@@ -373,13 +374,13 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
     }
 
     // Backend init
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "zonos_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend) {
         ctx->backend = ctx->backend_cpu;
@@ -402,8 +403,8 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
             ctx->backend = ctx->backend_cpu;
         }
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     // Pass 2: load weights via core_gguf helper
@@ -492,10 +493,10 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
     // Try to load speaker embedding from file, else use random Gaussian.
     ctx->cond_state.speaker_emb.resize(128);
     {
+        // No hardcoded default: this used to fall back to a maintainer path,
+        // which no user has, so the fallback only ever succeeded on one machine.
         const char* spk_path = crispasr_env::get("CRISPASR_ZONOS_SPEAKER_EMB_PATH");
-        if (!spk_path)
-            spk_path = "/mnt/storage/zonos-tts/jfk_speaker_emb.bin";
-        FILE* sf = fopen(spk_path, "rb");
+        FILE* sf = spk_path ? fopen(spk_path, "rb") : nullptr;
         if (sf) {
             int32_t dim = 0;
             if (fread(&dim, sizeof(int32_t), 1, sf) == 1 && dim == 128) {
@@ -2106,12 +2107,13 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
                     best_u = i;
             fprintf(stderr, "zonos_tts: DIFF uncond prefill cb0 argmax=%d (%.2f)\n", best_u, logits_uncond[best_u]);
         }
+        // Opt-in only. There is no default directory: the previous fallback
+        // was a maintainer path, so on every other machine this wrote nowhere.
         const char* dump_dir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
-        if (!dump_dir)
-            dump_dir = "/mnt/storage/zonos-tts";
         char df_path[512];
-        snprintf(df_path, sizeof(df_path), "%s/cpp_prefill_logits.npy", dump_dir);
-        FILE* df = fopen(df_path, "wb");
+        if (dump_dir)
+            snprintf(df_path, sizeof(df_path), "%s/cpp_prefill_logits.npy", dump_dir);
+        FILE* df = dump_dir ? fopen(df_path, "wb") : nullptr;
         if (df) {
             // NumPy .npy v1.0: shape (n_codebooks, head_vocab_size) float32
             const char magic[] = "\x93NUMPY\x01\x00";
@@ -2608,9 +2610,13 @@ float* zonos_tts_synthesize(struct zonos_tts_context* ctx, const char* text, int
         return nullptr;
     }
 
-    // Dump codes for external verification
-    {
-        const char* dump_path = "/mnt/storage/zonos-tts/cpp_codes.txt";
+    // Dump codes for external verification. Opt-in via
+    // CRISPASR_ZONOS_CPP_DUMP_DIR — this used to be an UNGATED write to a
+    // hardcoded maintainer path on every synthesis, which silently failed to
+    // open on every other machine.
+    if (const char* dump_dir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR")) {
+        char dump_path[512];
+        snprintf(dump_path, sizeof(dump_path), "%s/cpp_codes.txt", dump_dir);
         FILE* f = fopen(dump_path, "w");
         if (f) {
             fprintf(f, "%d %d\n", n_codes, n_codebooks);
@@ -2718,7 +2724,7 @@ void zonos_tts_free(struct zonos_tts_context* ctx) {
     if (ctx->dac_ctx_perm)
         ggml_free(ctx->dac_ctx_perm);
     if (ctx->dac_buf_w)
-        ggml_backend_buffer_free(ctx->dac_buf_w);
+        core_gguf::release_weight_buffer(ctx->dac_buf_w);
     if (ctx->dac_ctx_w)
         ggml_free(ctx->dac_ctx_w);
     if (ctx->kv_buf)
@@ -2726,7 +2732,7 @@ void zonos_tts_free(struct zonos_tts_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend_cpu)

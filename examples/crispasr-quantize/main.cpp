@@ -785,6 +785,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             // embeddings, and the tiny FM input projection at F16/F32.
             !(arch == "voxtral_tts" &&
               (sname == "codec.semantic_cb.weight" || sname.find("voice.") == 0 || sname.find("fm.input_proj") == 0)) &&
+            // Confucius4-TTS: keep the baked speaker encoders at source precision.
+            // T2S ECAPA (speaker_encoder.*) makes the single condition_emb prefix
+            // slot; S2A CAMPPlus (campplus.*) makes the 192-d style vector — both
+            // are tiny and load-bearing (a wrong style vector shifts the whole
+            // CFG-conditioned ODE).
+            !(arch.find("confucius4") != std::string::npos &&
+              (sname.find("speaker_encoder.") == 0 || sname.find("campplus.") == 0)) &&
             !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) && (sname.find("enc_proj.") != 0) &&
             (allow_lmhead || (sname.find("lm_head.") != 0)) && (sname.find("tok_emb.") != 0) &&
             (sname.find("lang_emb.") != 0) &&
@@ -952,6 +959,22 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         // unquantized targets pass through. Rows not 32-aligned keep source.
         if (is_qwen3_asr && !qwen3asr_quant_audio && sname.find("audio.") == 0 && should_quantize &&
             ggml_is_quantized(target_types[i]) && target_types[i] != GGML_TYPE_Q8_0) {
+            target_types[i] = (ncols % ggml_blck_size(GGML_TYPE_Q8_0) == 0) ? GGML_TYPE_Q8_0 : t->type;
+        }
+
+        // Chatterbox Multilingual V3 Q4 quality floor. The S3Tokenizer output
+        // is reused twice by native voice cloning (T3 speech prompt and S3Gen
+        // prompt tokens), so its error affects both speaker conditioning and
+        // the generated mel. Against the pinned official V3 Python path, a Q8
+        // tokenizer floor improves proj-down cosine 0.999477 -> 0.999929 and
+        // downstream T3 conditioning 0.9855 -> 0.9951. Keep the T3 sampling
+        // head at Q8 too: it directly ranks 8194 speech tokens and costs only
+        // ~4 MB. Q8/F16 targets are unchanged; unsupported row widths retain
+        // their source precision.
+        const bool chatterbox_q8_floor =
+            is_chatterbox && (sname.find("s3.tok.") == 0 || sname == "t3.speech_head.weight");
+        if (chatterbox_q8_floor && should_quantize && ggml_is_quantized(target_types[i]) &&
+            target_types[i] != GGML_TYPE_Q8_0) {
             target_types[i] = (ncols % ggml_blck_size(GGML_TYPE_Q8_0) == 0) ? GGML_TYPE_Q8_0 : t->type;
         }
 

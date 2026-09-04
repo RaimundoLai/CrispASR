@@ -56,6 +56,35 @@ TEST_CASE("registry: default bundle preserves license metadata", "[unit][registr
     REQUIRE(bundle.requires_license_acceptance);
 }
 
+TEST_CASE("registry: non-permissive supported weights carry policy metadata", "[unit][registry][license]") {
+    struct Expected {
+        const char* backend;
+        const char* needle;
+        bool requires_acceptance;
+    } cases[] = {
+        {"parakeet", "CC-BY-4.0", false},
+        {"canary", "CC-BY-4.0", false},
+        {"fastconformer-ctc", "CC-BY-4.0", false},
+        {"fastpitch", "CC-BY-4.0", false},
+        {"outetts", "CC-BY-NC-SA-4.0", true},
+        {"wespeaker", "CC-BY-4.0", false},
+        {"lid-fasttext176", "CC-BY-NC-4.0", true},
+        {"lfm2-audio", "lfm1.0", true},
+        {"funasr", "funasr-v1.1", true},
+        {"sensevoice", "funasr-v1.1", true},
+        {"gemma4-e2b", "gemma-terms", true},
+        {"pocket-tts", "pocket-tts-terms", true},
+        {"tada", "llama3.2", true},
+        {"orpheus", "llama3.2", true},
+    };
+    for (const auto& c : cases) {
+        CrispasrRegistryEntry e;
+        REQUIRE(crispasr_registry_lookup(c.backend, e));
+        REQUIRE(std::string(e.license).find(c.needle) != std::string::npos);
+        REQUIRE(crispasr_license_requires_acceptance(e.license) == c.requires_acceptance);
+    }
+}
+
 TEST_CASE("registry: default bundle rejects unknown backends", "[unit][registry]") {
     CrispasrRegistryBundle bundle;
     REQUIRE_FALSE(crispasr_registry_default_bundle("nonexistent-backend-xyz", bundle));
@@ -181,14 +210,14 @@ TEST_CASE("registry: preferred quant rewrites primary filename", "[unit][registr
     CrispasrRegistryEntry e;
     bool found = crispasr_registry_lookup("chatterbox", e, "q4_k");
     REQUIRE(found);
-    REQUIRE(e.filename == "chatterbox-t3-q4_k.gguf");
+    REQUIRE(e.filename == "chatterbox-v3-t3-q4_k.gguf");
 }
 
 TEST_CASE("registry: companion quant can be resolved independently", "[unit][registry]") {
     CrispasrRegistryEntry e;
     bool found = crispasr_registry_lookup("chatterbox", e, "q4_k");
     REQUIRE(found);
-    REQUIRE(e.companion_filename == "chatterbox-s3gen-q4_k.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-v3-s3gen-q4_k.gguf");
 }
 
 TEST_CASE("registry: non-quantized companion remains unchanged", "[unit][registry]") {
@@ -252,12 +281,17 @@ TEST_CASE("registry: chatterbox family keeps multilingual and finetunes separate
     CrispasrRegistryEntry e;
 
     REQUIRE(crispasr_registry_lookup("chatterbox", e));
-    REQUIRE(e.filename == "chatterbox-t3-q8_0.gguf");
-    REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
+    REQUIRE(e.filename == "chatterbox-v3-t3-q8_0.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-v3-s3gen-q8_0.gguf");
 
     REQUIRE(crispasr_registry_lookup("kartoffelbox-turbo", e));
     REQUIRE(e.filename.find("kartoffelbox-turbo-t3") != std::string::npos);
     REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-f16.gguf");
+
+    REQUIRE(crispasr_registry_lookup("chatterbox-finnish-nano", e));
+    REQUIRE(e.filename == "chatterbox-finnish-nano-v0.1.3-t3-q8_0.gguf");
+    REQUIRE(e.url.find("JJarvinen/chatterbox-finnish-nano-GGUF") != std::string::npos);
+    REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-q8_0.gguf");
 
     REQUIRE(crispasr_registry_lookup("lahgtna-chatterbox", e));
     REQUIRE(e.filename == "chatterbox-t3-f16.gguf");
@@ -413,6 +447,23 @@ TEST_CASE("registry: csm (sesame) has entry", "[unit][registry]") {
 TEST_CASE("registry: pocket-tts has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("pocket-tts", e));
+}
+
+TEST_CASE("registry: Pocket-TTS language checkpoints are wired", "[unit][registry]") {
+    const std::pair<const char*, const char*> variants[] = {
+        {"pocket-tts-de", "pocket-tts-german-q8_0.gguf"},
+        {"pocket-tts-es", "pocket-tts-spanish-q8_0.gguf"},
+        {"pocket-tts-it", "pocket-tts-italian-q8_0.gguf"},
+        {"pocket-tts-pt", "pocket-tts-portuguese-q8_0.gguf"},
+        {"pocket-tts-fr", "pocket-tts-french_24l-q8_0.gguf"},
+    };
+    for (const auto& [backend, filename] : variants) {
+        CAPTURE(backend);
+        CrispasrRegistryEntry e;
+        REQUIRE(crispasr_registry_lookup(backend, e));
+        REQUIRE(e.filename == filename);
+        REQUIRE(e.url.find("cstr/pocket-tts-GGUF") != std::string::npos);
+    }
 }
 
 TEST_CASE("registry: speecht5 has entry", "[unit][registry]") {

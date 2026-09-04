@@ -39,12 +39,14 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_speaker_id(Pointer session, int id);
         int     crispasr_session_set_punc_model(Pointer session, String puncModel);
         int     crispasr_session_set_hotwords(Pointer session, String hotwords, float boost);
+        int     crispasr_session_set_sensitivity(Pointer session, String preset);
         int     crispasr_session_set_g2p_dict(Pointer session, String source);
         int     crispasr_session_n_speakers(Pointer session);
         String  crispasr_session_get_speaker_name(Pointer session, int i);
         int     crispasr_session_set_instruct(Pointer session, String instruct);
         // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise).
         int          crispasr_session_set_tts_phonemes(Pointer session, String phonemes);
+        void         crispasr_session_set_tts_pad_silence_ms(Pointer session, int ms);
         int     crispasr_session_is_custom_voice(Pointer session);
         int     crispasr_session_is_voice_design(Pointer session);
         Pointer crispasr_session_synthesize(Pointer session, String text, IntByReference outNSamples);
@@ -86,6 +88,7 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_tts_noise_temp(Pointer session, float noiseTemp);
         int     crispasr_session_set_exaggeration(Pointer session, float exaggeration);
         int     crispasr_session_set_max_speech_tokens(Pointer session, int n);
+        int     crispasr_session_set_min_speech_tokens(Pointer session, int n);
         int     crispasr_session_set_length_scale(Pointer session, float scale);
         int     crispasr_session_set_best_of(Pointer session, int n);
         int     crispasr_session_set_beam_size(Pointer session, int n);
@@ -520,6 +523,12 @@ public final class CrispasrSession implements AutoCloseable {
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_max_speech_tokens failed (rc=" + rc + ")");
     }
 
+    /** Floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s. Other backends no-op (rc=-2). */
+    public void setMinSpeechTokens(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_min_speech_tokens(handle, n);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_min_speech_tokens failed (rc=" + rc + ")");
+    }
+
     /** Per-phoneme length-scale / speaking-rate scalar. Honoured by kokoro today; other backends no-op. */
     public void setLengthScale(float scale) {
         int rc = Lib.INSTANCE.crispasr_session_set_length_scale(handle, scale);
@@ -665,6 +674,28 @@ public final class CrispasrSession implements AutoCloseable {
         if (rc != 0) throw new IllegalStateException("set_hotwords failed (rc=" + rc + ")");
     }
 
+    /**
+     * Apply a named bundle of the four decoder fallback thresholds:
+     * {@code "conservative"}, {@code "balanced"} (the shipped defaults, a no-op)
+     * or {@code "aggressive"}. {@code "strict"}/{@code "default"}/{@code "loose"}
+     * are aliases. Mirrors the CLI's {@code --sensitivity}.
+     *
+     * <p>The four thresholds interact — a decode is only retried when the logprob
+     * <em>and</em> no-speech bars are both crossed — so they move as a set. A later
+     * {@link #setFallbackThresholds} overrides this.
+     *
+     * @throws IllegalArgumentException if the preset is unrecognised; a typo is
+     *     never silently treated as {@code "balanced"}.
+     */
+    public void setSensitivity(String preset) {
+        int rc = Lib.INSTANCE.crispasr_session_set_sensitivity(handle, preset);
+        if (rc == -2) {
+            throw new IllegalArgumentException(
+                "unknown sensitivity preset '" + preset + "' (expected: conservative, balanced, aggressive)");
+        }
+        if (rc != 0) throw new IllegalStateException("set_sensitivity failed (rc=" + rc + ")");
+    }
+
     /** Select the G2P pronunciation dictionary for TTS ({@code olaph}/{@code open-dict}/path). */
     public void setG2pDict(String source) {
         int rc = Lib.INSTANCE.crispasr_session_set_g2p_dict(handle, source);
@@ -705,6 +736,11 @@ public final class CrispasrSession implements AutoCloseable {
         int rc = Lib.INSTANCE.crispasr_session_set_tts_phonemes(handle, phonemes == null ? "" : phonemes);
         if (rc == -2) throw new RuntimeException("backend has no phonemes-in entry point (kokoro and piper do)");
         if (rc != 0) throw new RuntimeException("set_tts_phonemes failed (rc=" + rc + ")");
+    }
+
+    /** Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio while parsing a large C2PA chunk. */
+    public void setTtsPadSilenceMs(int ms) {
+        Lib.INSTANCE.crispasr_session_set_tts_pad_silence_ms(handle, ms);
     }
 
     /**

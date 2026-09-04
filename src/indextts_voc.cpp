@@ -51,6 +51,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h> // vDSP_conv, vvsinf, vDSP_vsq — Step C-1
@@ -191,7 +192,7 @@ struct indextts_voc_context {
             ggml_free(ctx_w);
         }
         if (buf_w) {
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         }
         if (backend && backend != backend_cpu) {
             ggml_backend_free(backend);
@@ -1350,7 +1351,7 @@ extern "C" struct indextts_voc_context* indextts_voc_init(const char* path, int 
     // users don't have to remember `--no-gpu` for IndexTTS. Set
     // INDEXTTS_VOC_FORCE_GPU=1 to opt back into the slow mixed path (useful
     // for the benchmark history once Step B/C lift the AA op to GPU).
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "indextts-voc: failed to init CPU backend\n");
         delete c;

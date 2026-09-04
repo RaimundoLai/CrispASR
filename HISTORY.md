@@ -6,6 +6,794 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #411 Pocket-TTS multilingual registry — five languages model-proven, fixed 2026-08-31
+
+Added Kyutai's German, Spanish, Italian, Portuguese, and French Pocket-TTS
+checkpoints to the public GGUF repository and wired `-m auto -l de|es|it|pt|fr`
+through the registry, CLI factory/router, and C session ABI. The four distilled
+6-layer Q8_0 models are ~124 MB each; the undistilled French 24-layer preview is
+~365 MB. The converter now downloads only one language at a time and explicitly
+records French's 24 layers because the gated weights repository omits the
+source YAML. Direct inspection of the published GGUF confirmed architecture,
+language, and `num_layers=24` metadata.
+
+Hosted run 33371566746 passed 4,787 registry assertions, capability/static
+tests, the complete backend-wiring audit, public gated-license auto-download,
+and CPU synthesis plus multilingual Whisper roundtrip for all five models.
+Decoded proof: German “Guten Morgen … die Sonne”; Spanish “Buenos días … el
+sol”; Italian “un giorno … splendere il sole”; Portuguese target-exact; French
+“Bonjour. Aujourd'hui, le soleil …”. WAV and log artifacts are retained on the
+run. F16 and Q8_0 voice-cloning GGUFs and the multilingual model card are
+published at `cstr/pocket-tts-GGUF`.
+
+## #382 Finnish Chatterbox Nano — registry and live proof, fixed 2026-08-30
+
+Registered `JJarvinen/chatterbox-finnish-nano-GGUF` v0.1.3 with its shared
+Turbo S3Gen companion; wired the CLI factory/list, `-m auto -l fi` routing,
+C ABI aliases, capabilities, docs, and generated feature matrix. The audit
+also found that previously shipped Nano/Turbo/fine-tune aliases appeared in
+the CLI but were not openable through the C ABI, and repaired the whole
+family. Finnish Nano is monolingual: `-l fi` selects it without injecting the
+nonexistent `[fi]` multilingual token. Hosted run 33334395303 passed the
+4,677-assertion registry suite, static/capability tests, full backend-wiring
+audit, both public auto-downloads, and CPU synthesis of a 4.84 s / 24 kHz WAV.
+
+## #410 Chatterbox direct KV-cache views — merged and model-proven 2026-08-30
+
+PR #410 removed redundant `ggml_cont()` copies around each Chatterbox T3
+flash-attention K/V layer view. Audit confirmed that each selected layer is
+logically contiguous and only carries a nonzero base offset. Follow-up
+coverage builds a real CPU ggml graph over a nonzero-offset cache layer and
+compares the direct view with the former materialized path (71 assertions).
+Hosted live run 33333867440 used public Nano Q4_K plus Turbo S3Gen Q4_K: both
+paths emitted the same 40-token trajectory and byte-identical decoded PCM.
+`CRISPASR_CHATTERBOX_KV_CONT=1` retains the old path as a diagnostic A/B.
+
+## #405 CUDA package on a pre-AVX2 CPU had NO cpu backend — variant CPU modules + graceful no-CPU failure, fixed 2026-08-30
+
+A Tesla P40 user (old pre-AVX2 Xeon) crashed on every run of the
+linux-x86_64-cuda package: `--no-gpu` died at `ggml-backend.cpp:471
+GGML_ASSERT(backend)` inside `core_gguf::load_weights` (parakeet), the GPU
+run died at `:595 GGML_ASSERT(device)` inside whisper LID's
+`make_buft_list`. Root cause chain: the CUDA legs built ONE `libggml-cpu.so`
+at AVX2+FMA+F16C; under `GGML_BACKEND_DL` its `ggml_backend_score()`
+(correctly) returns 0 on that host, ggml refuses the module, and the
+registry registers only CUDA — `registered backends: 1` in the report. The
+#380 ISA fail-fast could not fire because `has_feature()` needs the very
+module that was refused; `core_cpu_backend::init()` returned null; and both
+abort sites deref'd it. Reproduced bit-for-bit from the shipped v0.8.30
+tarball under `qemu-x86_64 -cpu Nehalem` (rc=134, same assert line).
+
+Fix, two layers. (1) Packaging: the CUDA legs now build
+`GGML_CPU_ALL_VARIANTS` — 14 `libggml-cpu-<variant>.so` modules from the
+always-works `x64` baseline up; the loader scores and picks the best at
+runtime, so the reporter's box gets sse42 and CUDA inference works. The
+package step asserts the x64 baseline shipped. (2) Robustness when no CPU
+module loads at all: `load_weights` rejects a null backend with a clean
+error (hermetic guard: tests/test-gguf-null-backend.cpp — the pre-fix test
+binary dies on the GGML_ASSERT), `make_buft_list` tolerates the missing CPU
+device with whisper/VAD loads failing properly, `cpu_device()` prints a
+one-time diagnosis naming the cause, and the CLI + server probe the CPU
+backend at startup and exit 1 with the `-cpu-legacy` pointer.
+
+Proof: `.github/workflows/linux-isa-fallback-verify.yml` (runs on every push
+touching the involved files) — native arm picks an AVX2+ variant and
+transcribes jfk.wav; the `qemu -cpu Nehalem` arm picks x64/sse42 and still
+transcribes; the no-modules arm exits 1 with the diagnosis instead of
+SIGABRT. Locally: skylakex picked natively, arm A exit 1 verified, and the
+shipped-tarball repro above. Kaggle P100
+(`chr1s4/crispasr-issue405-cuda-variants`) builds the exact release-CUDA-leg
+shape and runs parakeet-on-CUDA + whisper-LID end-to-end with the variant
+set, plus the graceful no-CPU arm. Also documented: `mise` installs get the
+default AVX2 asset — flavor guidance now in docs/install.md.
+
+## #398 htdemucs GPU path aborted in ggml-cuda binbcast — F32-cast broadcast weights, fixed 2026-08-29
+
+The first `/v1/audio/separation` under `CRISPASR_HTDEMUCS_GGML=1` +
+`CRISPASR_HTDEMUCS_GPU=1` hard-aborted the server:
+`ggml-cuda/binbcast.cu:293: GGML_ASSERT(nb10 % sizeof(src1_t) == 0)`. Root
+cause: the F16 GGUF ships sixteen 1-D F16 DConv GroupNorm affines
+(`*.dconv.layers.N.4.weight`, 384/768 elements — a bare nn.Sequential index,
+so the converter's ".norm"/".bias"/"scale"/size<256 keep-F32 rules all missed
+them), and the per-layer encoder/decoder graphs fed them as src1 of broadcast
+`ggml_mul`/`ggml_add`. ggml's binary-broadcast family supports F32⊙F32 but not
+F32⊙F16 on ANY backend — CUDA asserts on the stride, the CPU graph path aborts
+with `binary-ops.cpp:135: unsupported types` (the legacy CPU/BLAS path
+converts per element, which is why only GPU users saw it; quantized files
+inherit the F16 tensors verbatim, hence q8_0 crashing identically). The
+CrossTransformer-only graph that had been verified 45/45 has no such tensors;
+the enc/dec graphs added later inherited that claim without re-running it.
+
+Fix: `htd_bcast_f32()` (src/htdemucs_ggml_util.h) casts any non-F32 weight to
+F32 in-graph at every broadcast site; pre-fix graph reachable via
+`CRISPASR_HTDEMUCS_NO_BCAST_CAST=1`; the converter now keeps all 1-D tensors
+F32; `htd_first_bad_binbcast()` walks a built graph for the whole defect class
+and anchors the hermetic unit test (tests/test-htdemucs-binbcast.cpp). Proof
+on a Kaggle P100 (`chr1s4/crispasr-issue398-htdemucs-cuda`, single build,
+gate-off as the repro arm): repro rc=134 with the exact binbcast assert and 0
+stems; fix writes 4 stems for f16 AND q8_0; per-stem parity vs the CPU/BLAS
+reference cos 0.9997–1.000000 with |gpu|/|cpu| magnitude ratio 1.000. Local
+VPS: full unit suite 1742/1742; CPU ggml-vs-BLAS stems cos 0.996–1.000000,
+ratio ≈1.000 (drums/bass at the F16 noise floor of near-silent stems).
+
+## #402 chatterbox-turbo/Nano Vulkan T3 flash_attn_ext crash — naive-attention default on Vulkan, fixed 2026-08-29
+
+On AMD Radeon 780M / RADV, forcing the GPT-2 T3 onto Vulkan
+(`CRISPASR_CHATTERBOX_T3_GPU=1`) crashed in the Vulkan `FLASH_ATTN_EXT`
+pipeline for both F16 and Q4_K weights, while the reporter's A/B showed the
+explicit softmax(QK^T)V path (`CRISPASR_CHATTERBOX_NAIVE_ATTN=1`) completing a
+full 431-step synthesis with plausible first-divergence-at-step-3 float
+ordering vs CPU. With no RADV hardware to bisect the shader, the fix is the
+policy the evidence supports: `chatterbox_attn_policy.h` makes naive attention
+the default whenever the T3 backend is Vulkan; `CRISPASR_CHATTERBOX_FLASH_ATTN=1`
+opts back in for fixed drivers, and the pre-existing `..._NAIVE_ATTN=1` debug
+gate outranks both. The decision table is a weight-free header with a hermetic
+unit test (`tests/test-chatterbox-attn-policy.cpp`) because on non-RADV boxes
+both paths sound identical — a wrong default is invisible to numeric checks.
+Kaggle proof on a Tesla P100 Vulkan ICD (`chr1str/crispasr-issue402-t3-vulkan`):
+the load log prints `T3 GPT-2 attention = naive softmax(QK^T)V (backend
+Vulkan0)`, and the default, flash-opt-in, and CPU arms all round-trip
+"The quick brown fox jumps over the lazy dog." through whisper-tiny at word
+overlap 1.0 (NVIDIA's Vulkan doesn't crash — consistent with a RADV-specific
+pipeline bug, which the opt-in gate leaves reachable for retesting).
+
+## #383 Nemotron `/v1/realtime` progressive lag — native streaming + VAD, fixed 2026-08-27
+
+The realtime JSON WebSocket re-ran ASR over the entire growing turn every 0.5
+seconds. Nemotron's cache was streaming only within one inference call, so its
+`T=8,14,18...` logs were full-prefix re-encodes and CPU work grew
+quadratically. The first safety fix made the endpoint commit-only; the completed
+port replaces that mitigation for Nemotron with a per-connection native stream
+owning independent attention/convolution caches and RNN-T predictor state.
+Appends advance only newly stable encoder frames and emit real pre-commit token
+deltas; commit flushes the short tail and resets the utterance. CPU amortizes
+four native 320 ms chunks per graph build; GPU keeps the native cadence.
+
+`--vad --vad-model` now applies to `/v1/realtime`: a bounded onset buffer gates
+ASR until speech, speech-start/stopped events expose the turn, and trailing
+silence auto-commits. Client commit remains the advertised fallback without
+VAD, and backends without a native session retain bounded commit-only behavior.
+The 30-second cap is lossless across an oversized append, native-stream failure
+downgrades explicitly, and completion separates received/processed duration,
+inference, model-mutex wait, and backlog metrics. Model-backed tests pin
+byte-identical streamed/one-shot Nemotron output, bounded actual encoder-frame
+work, pre-commit partials, Silero auto-turns, and same-socket reset; the full
+unit suite passed 1,728/1,728. A from-scratch Ninja/ccache CUDA build on a
+Kaggle Tesla P100 passed the persistent-stream test (113/113) and the realtime
+WebSocket live test (7/7). The same kernel ran NVIDIA's current Transformers
+blueprint independently (six lookahead tokens, 560 ms advertised latency) and
+produced the expected JFK transcript. CrispASR retains the GGUF's configured
+three-frame right context; the comparison validates the persistent-cache and
+chunk-feeding design, not identical latency presets.
+
+## #375 canary "repeated phrases" — two real bugs, neither where the bisect pointed, fixed 2026-08-19
+
+A reporter's canary quality regressed after an upgrade: phrases repeated a few
+times before recognition continued, on every quantization, CUDA and CPU alike.
+Their bisect window turned out wrong (they later withdrew it), but chasing it
+methodically surfaced **two real, independent defects**, both fixed the same day:
+
+**1. glint's AAC-LC decoder mis-decoded every real-world `.aac` to ~17 dB SNR**
+(bitrate-independent — 96k and 192k both). It parsed and DISCARDED
+`window_shape` (sine synthesis against the KBD analysis windows ffmpeg/Apple/fdk
+emit on most frames breaks MDCT perfect reconstruction) and its TNS decode was
+wrong five ways (skipped on short windows entirely, no `tns_max_bands` clamp,
+direction ignored, one filter max, hardcoded 4-bit dequant). Invisible to every
+glint gate because the roundtrip tests own both sides of the contract — glint's
+own encoder emits neither KBD nor short-window TNS. Fixed upstream (glint
+`77738f3`, 17.7→67.3 dB at 16 kHz), synced in-tree (`0e5d1344`), gated by a
+red-verified foreign-decode SNR floor (old decoder 16.4 dB FAIL). Found because
+"all quants + all backends identical" is an **input-path signature** — compute
+bugs vary by backend — and because the window's WAV-only probes could not rule
+out formats whose ROUTING changed.
+
+**2. The reporter's actual bug: canary's long-form chunking was parakeet
+machinery wearing a canary comment.** `canary_transcribe_streamed` split ALL
+audio into 8 s chunks / 2 s overlap over a globally-normalized mel and merged
+seams with an LCS prefix-drop + word-snap + splice-punctuation heuristics; the
+comment cited NeMo's `FrameBatchMultiTaskAED` — which actually joins
+NON-overlapping chunks with `" ".join`, and canary-1b-v2's shipped
+`.transcribe()` does something else again: dynamic 30..40 s RAW-WAVEFORM chunks
+(size maximizing the last chunk), 1 s overlap, per-chunk normalization, and
+`lcs_alignment_merge_buffer` anchoring the seam in token space. Ported exactly
+(`core/canary_chunk_merge.h`, `8219b429`), pinned by unit vectors generated
+from the nemo 2.7.3 Python functions, old path kept behind
+`CRISPASR_CANARY_LEGACY_STREAM=1`. The reporter's 12 s sample reproduces
+byte-for-byte under the legacy gate and transcribes cleanly on the new default;
+jfk_x12 (quote ×12) went from "ask not Ask not"-riddled to 12 clean
+repetitions; decoded-output acceptance vs NeMo itself (Kaggle,
+`tools/kaggle/canary-blueprint-ref/`): word similarity 1.000 / 1.000 / 0.982 on
+132 s / 59 s / 594 s clips, q4_k vs bf16. Also fixed en route: the session
+C-ABI had single-passed ALL audio — and single-pass past the 40 s trained
+window EOSes early (a 59 s file lost everything after ~45 s), so chunking is
+REQUIRED for long audio, not just nicer.
+
+The trap that cost two prior sessions: a "reproduction" of the symptom on main
+that was never diffed against the good commit on the same file (the seam
+artifacts predated the window), and a file-path-scoped search ("the only canary
+commit in the window") that by construction cannot see cross-cutting changes.
+
+## #369 VibeVoice-ASR Korean language flip — five defects, merged 2026-08-19
+
+A reporter showed `vibevoice-bitnet` losing Korean entirely on borderline audio
+(answering in Italian, Vietnamese, Thai) while Microsoft's demo Space kept it on
+the same clips, and later that audio.cpp's q8_0 transcribed a file our full model
+failed. Five real defects came out of it. **Two of them were mine to begin with:
+the reference I measured against, and the conclusion I published from it.**
+
+**The language flip was the missing -25 dBFS input normalisation.** Upstream and
+audio.cpp normalise before the sigma-VAE encoders (`VibeVoiceASRFrontend::normalize`,
+`target_dB_FS`); our ASR path did not — the helper existed, wired only into TTS
+voice cloning. Bisected on Kaggle against the full 7B q4_k on the reporter's
+`ko-mic-cue-lost.wav`: current main EXACT, prompt+resampler rolled back still
+EXACT, normalisation rolled back **Thai**, everything rolled back **Thai** — and
+"Thai" is precisely what the reporter measured at q4_k and q8_0. One flag
+reproduces and removes it.
+
+⚠ I had already shipped that fix and reported it to the issue as a no-op, because
+I measured it on the BITNET checkpoint — the only one that fit on the dev Mac.
+BitNet is wrong on those clips whatever you do to the input, so that arm had no
+headroom and "still broken" was the only answer it could return. An arm that
+fails under every condition cannot discriminate a fix from a no-op.
+
+**BitNet was getting the 7B's prompt.** VibeASR.cpp's `utils/prompt_builder.h`
+says, in a comment, that `"text"` format is the 1.5B's ("…please transcribe it.")
+and `"json"` the 7B's ("…with these keys: …"), and it defaults to text. Ours came
+from microsoft/VibeVoice's PYTHON processor, which only targets the 7B, so every
+checkpoint got the JSON form. Two of three real Korean clips went straight to
+EXACT and `ko-mic-cue-lost` kept its language for the first time. Found by
+READING the reference runtime after every numerical avenue had been eliminated —
+weights equal to upstream's I2_S to 2 values in 13.76 M, sigma-VAE at cos
+0.999926, LM storage (TQ2_0/Q8_0/F16) character-identical, and BitNet's per-token
+`activation_quant` implemented and measured immaterial.
+
+**The prompt's hardcoded ids did not match their own comment.** They read
+`"seconds audio, please transcribe it with"` and decoded to
+`" configuration audio,thonPEND itiz"` — the word "transcribe" was absent from
+every transcription this project ever produced. Six wrong tokens in 107,
+confirmed against three independent implementations. Nothing had ever turned the
+ids back into text; `tests/test-vibevoice-asr-prompt.cpp` now does, against a
+vocabulary slice read out of the shipped GGUF.
+
+**The audio loader resampled with linear interpolation.** `read_audio_data()`
+asked miniaudio for the target rate, so every conversion ran through
+`ma_resample_algorithm_linear`. A 10 kHz tone decoded to 16 kHz — above Nyquist,
+must vanish — survived at **-10.3 dB** and folded to 6 kHz, inside the speech
+band; 48 -> 16 kHz measured cos 0.702 against soxr. That hit every backend on any
+44.1/48 kHz file. Now decodes at the file's own rate and resamples with the
+Kaiser sinc already in the tree (`CRISPASR_HQ_RESAMPLE=0` restores the old path).
+
+**`[Silence]` reached the transcript.** It is a Content value the MODEL emits; it
+appears nowhere in this codebase. Passing it through put the literal string in
+SRTs over non-silent speech AND suppressed the "no text produced" warning, which
+is gated on there being no text. The subtle half was the fallback: both consumers
+treated "no segments" as "not a transcript blob" and handed back the raw JSON, so
+filtering alone would have printed the whole object.
+
+Also: exact-erf GELU where `ACT2FN["gelu"]` is erf and ggml_gelu is the tanh
+approximation (cosine cannot see it — 0.999926 vs 0.999927 — the NORM can:
+494.188 -> 494.320 against 494.319); `GGML_PREC_F32` on the ASR attention as
+audio.cpp sets, measured identical on P100 so consistency insurance rather than a
+fix; a false `CAP_TEMPERATURE` that suppressed the warning telling the reporter
+`-tp` was unwired; and `--seed` never plumbed into transcribe at all.
+
+**The reference was the other thing I got wrong.** `tools/reference_backends/vibevoice.py`
+reimplemented the sigma-VAE in PyTorch "matching the C++ graph step by step" — a
+shape that cannot falsify the runtime's assumptions. It had F.silu where upstream
+has GELU, which made every ConvNeXt stage look like the divergence and nearly got
+the correct runtime "fixed" to match; after that, the resampler kept the number
+wrong. Rebuilt on upstream's own `TokenizerEncoder`, with identical 24 kHz input
+the runtime reads **cos 0.999926** at `speech_features`. There was never an
+acoustic-conditioning gap; the 0.83 / 0.95 / 0.97 figures published to the issue
+are withdrawn.
+
+Kernels: `tools/kaggle/vibevoice-369-fullmodel`, `tools/kaggle/vibeasr-bitnet-lm-precision`.
+Commits `b6efe1de`, `ac4aa478`, `e68664c7`, `26076da0`, `23107227`, `824c934d`,
+`3b1bc0b2`, `0627047b`, `51b99d1b`.
+
+---
+
+## ark-asr empty transcripts, and a diff harness that could not see it — merged 2026-08-18
+
+`ark_asr.cpp` built the prompt as `<|user|><|begin_of_audio|>…<|end_of_audio|><|assistant|>`,
+omitting the text instruction upstream's `ArkAsrProcessor` always sends. Every ark
+decode therefore ran on a prompt the model was never trained on. Off-distribution
+the step-1 argmax is `<im_end>`; the #253 hack bans that on step 1 (upstream never
+does), so it emitted the runner-up "." and stopped at step 2, and "." trims to
+empty — "no text produced for N s of non-silent audio". Because the model was
+merely marginal rather than broken, any perturbation tipped it, so the symptom
+tracked the KV cache dtype and the audio length non-monotonically and looked
+q8_0-specific on one clip. It was not: the default f16 cache failed too.
+
+Six previously-empty cases now transcribe (1 → 17/20/21/21/43/43 tokens);
+previously-working paths are byte-identical. Also landed upstream's
+`bad_words_ids`, its `asr_block_token_id_from` (ids ≥ 151670 were emittable and
+are never valid ASR output), and `ark_asr_set_ask()` reaching transcription at
+all — it had been spliced only into a function the transcribe path never calls,
+so the CLI's language steering had never once run.
+
+The harness that should have caught it could not. `tools/reference_backends/arkasr.py`
+built the same promptless prompt, so the reference and the runtime shared one wrong
+assumption and `first_logits` reported cos 0.988 by comparing our mistake against
+itself. Fixing only the runtime made that number FALL to 0.449, which reads as a
+regression and is the exact opposite. With a correctly-dumped reference it is
+0.9944 (jfk) / 0.9967 (fleurs_en). The dumper was wrong in four independent ways
+in total: missing instruction, missing `audios.to(dtype)` (so nothing could be
+dumped at the default bf16), no `gguf` dependency to write an archive, and a bf16
+default that manufactures a false `audio_embeds` failure.
+
+Three things that looked like bugs and were not, each closed by measurement:
+German transcribing as English (upstream translates that clip too, near
+word-for-word, confirmed by running its own forward pass on the same bytes);
+`audio_embeds` cos 0.94 (bf16 reference rounding — f32 gives 0.9985, and the
+worst frames MOVE between references, which a real port bug would not do);
+`first_logits` 0.449 (the stale reference).
+
+Alongside: `kv_dtype_parse` accepted only f16/f32/q8_0/q4_0 and silently served
+F16 for everything else, so any narrowing table over q4_1/q5_0/q5_1 was measuring
+f16 while saying otherwise; `tests/test-kv-quant-roundtrip.cpp` gives the
+quantised KV cache its first coverage. #366 (kyutai) keyed its language warning to
+the backend rather than the loaded checkpoint — now derived from LM layer count,
+verified on BOTH models since "the warning stopped appearing" looks identical
+whether the detection was fixed or simply broken.
+
+## #355-#360 community issue sweep — 2026-08-16
+
+Five open issues worked end to end. #360 (`f57b65a2`): the TTS speech-token
+floor was reachable only from `/v1/audio/speech` — no CLI flag, no session ABI,
+no binding — while its `max` sibling was on all ten surfaces; now on all ten
+plus `--tts-min-speech-tokens`, with the units documented (MOSS codec frames at
+12.5 Hz) and confirmed live at 1.92 s → 4.08 s for floor=49. #359
+(`9831b40e`): source separation was bound in Python and Dart but not Rust or
+Go, so a Rust caller reaching for htdemucs found only `speech_to_speech`;
+`separate()` added to both, live on mel-band-roformer. #358: answered with
+measured concurrency (serialised, FIFO) and warm-server RTF 1.09. #355
+(`2eb54888`): confirmed against the shipped binary, documented the artifact
+matrix; the graceful-degradation fix needs `GGML_BACKEND_DL`, which is a
+406-site refactor across 104 files, so it stays open. #337: no AMD hardware, so
+bounded rather than fixed — the length trigger does not reproduce on Metal at
+T=419.
+
+## #337 Qwen3-TTS HIP correctness fallback — 2026-08-30
+
+The reporter's later RX 7900 XTX traces isolated two native-HIP defects rather
+than the earlier suspected talker trajectory divergence: content-dependent
+codec-encoder drift on the Daphne reference, and all-NaN code-predictor logits
+for the 0.6B F16 talker. `3fb042e0` makes the shipping path fail-safe: ROCm
+routes the codec encoder to CPU and routes that affected predictor shape to CPU,
+while explicit native-HIP environment switches preserve the A/B diagnostic
+paths. Every predictor logit is now checked for finiteness before sampling, so a
+backend failure aborts instead of silently selecting token 30. The shared model
+runtime owns this routing, so CLI, C ABI, sessions, server, and bindings receive
+the same behavior.
+
+Proof is deliberately split. Hermetic qwen3-tts policy tests passed 17/17 with
+the available unit tier; CI run 33316132718 passed; release run 33316140657
+compiled and packaged the HIP leg. `.github/workflows/qwen3-tts-hip-proof.yml`
+is the real gfx1100 end-to-end gate (public 0.6B F16 model + Daphne clip + ASR
+round-trip), but it requires a self-hosted runner labelled `gfx1100`. GitHub has
+no AMD hosted runner for this repository and no self-hosted runner is currently
+registered, so these results prove the safe routing and HIP compilation, not
+that the two native kernels are repaired. Kaggle's NVIDIA workers cannot close
+that evidence gap.
+
+## #343 / #361 / #362 docs TOC and the chat ABI bindings — merged 2026-08-16
+
+Three community PRs. #343 (Juste-Leo2) adds a TOC and section links to
+`docs/tts.md` and fixes a dead anchor in `cli.md`; merged at `8da6a531`, taking
+main's corrected outetts / pocket-tts licence strings over the branch's older
+text. #361 and #362 (mculbert) make the `crispasr_chat_*` C ABI cancellable,
+countable and safe to tear down, then bind it from Python, Go, Java, Dart and
+Rust; #362 is a superset of #361, merged at `f9de92b2` and `f409a5b2`.
+
+#361 fixed three paths that aborted the host process (a prompt over `n_batch`,
+`memory_estimate` on every model, and `close` under load) and made shared-prefix
+KV reuse actually reachable. Verified here on a different model than the
+author's, with the close-wait guard red-verified by deletion.
+
+`462d8a6d` then closed the CI gap the bindings landed with — five bindings, one
+compiled — via a text-level drift check over the header, plus path filters and
+the orphaned Python suite. See LEARNINGS.md.
+
+## #353 parakeet long-form throughput — merged 2026-08-16
+
+PR #353 (davideme) decouples the LONGFORM window (new `kParakeetLongformWindowS`
+= 90 s) from the 300 s single-pass cap and overlaps encode with decode, both
+across long-form windows and across dispatcher slices. Reported 2.1-2.3x
+long-form throughput on an M1 Pro with WER unchanged or better; CI fully green.
+
+`e33eba8c` then fixed three defects the split path carried: a SIGABRT from the
+#89 gap-fill re-entering `be.transcribe()` on the consumer thread mid-pipeline
+(two threads on one ggml scheduler), five CLI flags silently dropped because the
+split pair skipped `transcribe()`'s sticky-parameter prologue, and issue #350's
+span repair skipped because it skipped the epilogue. Gating conditions moved
+into one pure predicate with a red-verified guard; the PR's byte-identity and
+26/26-slice pipelining both preserved. See LEARNINGS.md for why splitting a
+function drops its prologue and epilogue.
+
+## #356 gap-fill recoveries emitted inside the segment they came from — fixed 2026-08-15
+
+Reported downstream as SubtitleEdit/subtitleedit#13548: on a 634 s Japanese file
+18 of 289 SRT cues started before the previous cue ended, jumping backwards by up
+to 10.5 s. The #89 gap-fill second pass appended each recovery to the slice's
+segment list and sorted by `t0`, but the first pass emits one segment whose
+sparse words straddle the hole, so its span enclosed every recovery.
+
+PR #357 (niksedk) split the covering segment at each recovery; `308cddfb` then
+replaced its clamp fallback with a merge for the interleaved case, which the
+clamp left both non-monotone and word-stranding; `4edb2e10` added the
+unconditional time-order guard the issue asked for, and `9f1bddbb` wired that
+guard into the session C ABI as well (its first pass covered the CLI and server
+arms only). Verified live on
+parakeet-tdt-0.6b-ja-q8_0 over a 240 s clip: 4 backward cues (worst 11.36 s)
+before, 0 after, with the character multiset unchanged. See LEARNINGS.md for
+why a guard written against segment spans passed the buggy list.
+
+## #348 Chatterbox Multilingual V3 parity port — shipped 2026-08-13
+
+PR #354 landed as a six-commit rebase at `278e3fbf`. The port pins the exact
+upstream code and model revisions, converts separate V3 T3 and S3Gen F16 GGUFs,
+and quantizes them with Q8 floors for the sensitive S3 tokenizer projection and
+T3 speech head. Published F16/Q8/Q4 artifacts are paired explicitly in the
+registry; the published German/JFK Python `-ref.gguf` is the release oracle.
+
+The canonical Q4 native diff passed 32 stages with zero failures and two
+intentional skips. A generated reference/clone/baseline loop transcribed the
+complete German target and measured TitaNet `cos(C,R)=0.792725` over
+`cos(B,R)=0.431873`. The Kaggle P100/SM60 release gate reproduced all tensor
+names, shapes, types, and provenance; passed the same 32/0/2 CPU-oracle to CUDA
+diff; produced finite, non-silent audio in all 23 supported languages; returned
+nonempty ASR in the nine-language roundtrip subset; and independently measured
+`cos(C,R)=0.769132` over `cos(B,R)=0.491945`. The merged head passed every
+required GitHub check, including 1,605 Linux unit assertions and static analysis.
+
+## #302 Pascal Windows GPU startup regression — fixed 2026-08-13
+
+The v0.8.28 Windows CUDA and Vulkan OmniVoice packages could terminate during
+startup with `0xC000001D` on an older HP Z800 host with a Quadro P5000.  The
+Pascal CUDA architecture was present. GPU startup still registers ggml-cpu,
+and the Z800's likely Westmere Xeon generation has SSE4.2 but no AVX. However,
+the same AVX2/FMA/F16C/BMI2 release baseline worked for this reporter in v0.8.23,
+so treating that baseline alone as the regression was too broad.
+
+The release-to-release delta identified ggml commit `dd2aaf04`: it moved a new
+UE4M3 lookup-table fill into unconditional `ggml_cpu_init()`. That made GPU-only
+startup execute newly compiled CPU work even though only NVFP4 CPU dot products
+consume the table. Fork commit `4d9a5c3d` makes initialization thread-safe and
+lazy at the two real consumers (x86 and ARM NVFP4 dot products), with
+`GGML_CPU_EAGER_UE4M3_LUT=1` preserving the old path for A/B diagnosis.
+
+An initial containment change put every GPU artifact on a generic x86-64
+baseline. It was superseded before release: CUDA, HIP, and Vulkan artifacts keep
+their optimized CPU helpers, while only explicitly legacy/portable artifacts
+use `CRISPASR_PORTABLE_CPU`. Thus the one suspected startup operation is gated
+without imposing a global CPU performance regression. Exact confirmation still
+requires the reporter's exception address; the ProcDump/WinDbg recipe is in
+`docs/windows-illegal-instruction-dumps.md`.
+
+The dedicated Kaggle P100 acceptance kernel built the containment commit for
+`sm_60`, confirmed all 15 ISA switches were off, started the persistent OmniVoice server
+with a WAV clone, synthesized 4.759 seconds on CUDA, and round-tripped it through
+Whisper base as `The quick brown fox jumps over the lazy dog.` (1.0 word
+overlap).  This proves the full Pascal CUDA path rather than only compilation.
+
+## WhisperJAV port — post-decode text hardening (§W1–W7), archived from PLAN.md 2026-08-09
+
+Landed `3d64e7c5..48ae0c41`, all on `main`. Originated from a user report on
+CrispEmbed#44 asking for the best Japanese model — the reporter named
+WhisperJAV and noted it had stopped being updated. Answered on that issue.
+
+**Still open:** `crispasr_session_set_sensitivity` is exposed in Python and the
+C ABI only; the other seven binding surfaces (Go, Java, C#, Ruby,
+JS/emscripten, Flutter) still lack it. Mirror `set_fallback_thresholds`.
+
+**§W4 measured end-to-end 2026-08-09** — it was written from reasoning, so it
+was worth checking against the real CLI rather than only the unit predicate.
+Two controls through `crispasr --vad -vm webrtc --vad-export` (webrtc needs no
+model, so this is reproducible with no download):
+
+| Case | Slices | Audio reaching the model |
+|---|---|---|
+| 301 s, 1 s of speech, `CRISPASR_VAD_FAILOVER=0` (old behaviour) | 1 | **1.1 s of 301 s — 0.4%** |
+| same file, failover on (new default) | 11 | 301 s — 100% |
+| 154 s of continuous real speech (negative control) | 6 | 154 s — 100%, failover correctly silent |
+
+So on the failure case the user was losing 99.6% of their audio with no error,
+and the healthy case is untouched. That is the asymmetry the whole heuristic
+was justified by, now measured rather than argued.
+
+⚠ Caveat on the fixture: the silence is digital zeros, not room tone. Real
+noisy-but-speechless audio may read differently to an energy VAD, so this
+demonstrates the wiring and the direction, not a tuned threshold.
+
+**§W3 measured end-to-end 2026-08-09**, with `canary-ctc-aligner-q4_k.gguf` on
+real audio via `--align-only`:
+
+| Case | Result |
+|---|---|
+| correct English transcript vs `samples/jfk.wav` (negative control) | sentinel **silent**; 22 words, plausible timestamps ending 10.08–10.16 s in an 11 s clip |
+| Japanese transcript vs the same English-vocab aligner | sentinel **fires**: `zero-position words 28/28 (1.000 > 0.100); coverage 0.000 < 0.050 of 11.000s` |
+
+The positive case is the real documented failure, not a synthetic one: the
+aligner returned **all 28 words at `t0 == t1 == 0`** and exited **0**. The SRT
+shows 27 of 28 cues as `00:00:00,000 --> 00:00:00,000` (the 28th is the
+formatter clamping the last cue to the clip end). Text intact, every timestamp
+worthless, and before this sentinel nothing said a word about it. Two of the
+five signals fired independently, which is the design working as intended.
+
+⚠ **Trap that nearly produced a false bug report on our own code:** the first
+check said the sentinel had NOT fired. It had. The CLI echoes the transcript
+through `%.80s`, which truncated the Japanese mid-UTF-8 and left an invalid
+byte in the captured output — so `grep` classified the file as binary and
+silently suppressed every match. Use `grep -a` on any captured CrispASR output
+containing non-Latin text, or verify in Python. A binary-suppressed grep looks
+exactly like "the feature did not run".
+
+Survey of https://github.com/meizhong986/WhisperJAV (Python orchestration over
+faster-whisper; nothing ports at the code level, the *algorithms* do). It is
+worth taking seriously because JAV audio is an adversarial worst case for
+Whisper — long-form, heavy non-verbal vocalisation, low SNR — so its
+post-processing stack is far ahead of ours. Full survey in `LEARNINGS.md`.
+
+**The survey immediately found a live bug, verified, see W1.**
+
+### W1 — `core_ngram::fix_loops` was a NO-OP on CJK — DONE 2026-08-09
+
+`src/core/ngram_loop_fix.h:68` `split_words()` splits on ASCII whitespace only.
+Japanese/Chinese has none, so the entire segment is one "word", `collapse()`
+can never fire, and the guard is inert. Compiled the header standalone
+2026-08-09:
+
+```
+ああああああああ            → UNCHANGED
+はい、はい、はい、はい、      → UNCHANGED
+謝謝觀看，謝謝觀看，謝謝觀看， → UNCHANGED     ← *the* canonical Whisper zh hallucination
+hey hey hey hey hey         → "hey hey hey"  (changed)
+```
+
+Real caller list, verified by grep (an earlier draft of this section named
+`firered_asr` — wrong, see W1b): `src/moss_transcribe.cpp:1503`,
+`src/moss_transcribe_diarize.cpp:1504`, `src/higgs_stt.cpp:1674`, and six sites
+in `src/crispasr_c_api.cpp` covering cohere, granite and glm-asr. Of those,
+**moss-transcribe is zh/en and glm-asr is Mandarin + Chinese dialects +
+Cantonese** (README.md:107, :126) — the guard was dead on its two most
+CJK-exposed consumers. Same class as "prove the new code path EXECUTES":
+wired, never fires.
+
+Also: `fix_loops()` re-joins survivors with single spaces, so on mixed CJK/Latin
+it would rewrite original spacing if it ever did split. Any fix must not
+normalise whitespace on text it does not otherwise change.
+
+**Port**: WhisperJAV `modules/repetition_cleaner.py:174` `_detect_generic_repetition`
+— script-agnostic, needs no word tokenizer. For substring lengths 2..50, candidate
+starts limited to offsets `0..sub_len-1` (a repeating unit must begin within its
+own length), count non-overlapping occurrences, and if
+`count*sub_len / len(text) >= coverage_threshold` (~0.5) reduce to 1–2 copies
+(2 if the unit is short, else 1). O(n·L²) worst case, but subtitle-line sized.
+Operate on Unicode code points, not bytes. Gate on "segment contains no
+whitespace" or "majority CJK" so Latin text keeps today's word-level path
+byte-for-byte.
+
+**Landed.** `split_codepoints` / `decode_codepoint` / `is_cjk_codepoint` /
+`wants_codepoint_collapse` / `fix_loops_codepoints` in
+`src/core/ngram_loop_fix.h`, called per surviving token from `fix_loops`. The
+*same* `collapse_indices()` runs over code points instead of words — one
+algorithm, two tokenizations — rather than WhisperJAV's
+"replace-the-line-with-the-dominant-unit" form, which eats a good prefix
+(`今日はいい天気ですね。` + `あ`×30 would have become `ああ`). Gate:
+≥8 code points AND ≥60% CJK, so Latin and short natural reduplication
+(`ええ`, `はいはい`, `Mississippi`) are untouched.
+
+Guard: `tests/test-ngram-loop-fix-cjk.cpp`, 9 cases / 30 assertions. **Watched
+red first — 6 of 9 failed before the fix**, and the 3 that passed were the
+must-not-change invariants (natural CJK, Latin, edge cases), which is the point.
+`test-ngram-loop-fix.cpp` (Latin, 36 assertions) unchanged and still green.
+The gate can still go red on demand: the last case asserts
+`CRISPASR_NGRAM_LOOPFIX_OFF=1` restores the raw text *and* that clearing it
+restores the collapse — both directions, so a silently-dead path fails.
+
+**Known limitation, deliberate:** `fix_loops_keep_indices` is untouched. It
+reports *membership* for parallel per-word arrays (SRT/VTT word timings), and
+the CJK path rewrites token *content*, not membership — so word-level output on
+CJK is still uncollapsed. On these scripts a whitespace-delimited "word" is not
+a linguistic unit anyway; doing this properly needs word timings from the
+aligner, not from a space split.
+
+`fix_loops` still normalises whitespace to single spaces on rejoin — that was
+already true and `test-ngram-loop-fix.cpp:86` pins it. Not changed here.
+
+### W1b — firered-asr had NO `fix_loops` at all — DONE 2026-08-09
+
+Turned up checking W1's blast radius. `src/firered_asr.cpp` does not even
+`#include "core/ngram_loop_fix.h"`; the only mention is a comment at :2270
+saying so out loud — *"firered's CLI adapter has no `core_ngram::fix_loops`, so
+this also cleans the garbage tail"*, justifying the decode-time
+`core_repeat::tail_is_repetition` break as a substitute.
+
+That substitute is **greedy-only by construction** (wired into the
+`beam_size == 1` branch only, since beam search self-terminates), so a firered
+run with `beam_size > 1` has neither guard. firered-asr is Mandarin + 20+
+Chinese dialects (README.md:110) — i.e. precisely the script W1 is about, on
+the backend with the least coverage.
+
+**Landed.** `examples/cli/crispasr_backend_firered_asr.cpp` now runs
+`fix_loops_keep_indices` over the token texts (filtering `seg.tokens` in
+lockstep, mirroring the canary-qwen path at `crispasr_c_api.cpp:5675`) and
+`fix_loops` over `seg.text`.
+
+Guard: `tests/test-loopfix-wiring.cpp`. A pure-predicate test could never have
+caught this — the predicate was always correct, the *join* was missing — so
+this one is a source scan asserting each AR adapter contains the CALL, not the
+`#include` (an include nothing invokes is precisely the state firered shipped
+in). **Proven red**: stashing the firered change makes it fail naming that
+exact file; restored and green after. Costs nothing, needs no model.
+
+The list of six adapters in that test pins *observed* wiring — it is not a
+claim that every adapter needs the collapse (CTC/RNN-T backends do not loop
+this way; higgs-stt and moss-transcribe call it in-library, which the test
+checks separately).
+
+### W2 / W5 / W6 — segment hygiene — DONE 2026-08-09
+
+One header, `src/core/segment_hygiene.h`, because all three are the same kind of
+thing: a transform on the assembled segment list, downstream of the logits,
+where `crispasr-diff` reads cos 1.000000 whether they work or not. That
+harness-blind zone is why they get hermetic unit tests
+(`tests/test-segment-hygiene.cpp`, 30 cases) — it is the only check available.
+
+- **W2 `cap_length`** — truncate a runaway line, backing up to the last
+  `。．.！!？?、,` but never below 75% of the cap, so an early boundary cannot
+  throw away a legitimate line. Counts CODE POINTS: a byte cap cuts mid-character
+  and produces mojibake, and reads 3x short on CJK.
+- **W6 `should_drop` / `looks_nonverbal`** — logprob gate with a margin that
+  LOOSENS for segments ≤1.6 s (a short segment's mean logprob is noisier, so it
+  gets more room, not less), plus `[Music]` / `（喘ぎ声）` / `♪` dropping.
+- **W5 `merge_repeats`** — collapse runs of ≥3 near-identical adjacent segments
+  within a 2 s gap, keeping the first text and the run's full span. Similarity is
+  LCS over code points. Compares each candidate against the run's FIRST text, not
+  its predecessor, so a slowly-drifting chain cannot merge unboundedly.
+
+**Two corrections to WhisperJAV, both pinned by a test:**
+
+1. Its non-verbal filter substring-matches a keyword list against the whole
+   line, so "The music started and everyone danced." is deleted as a music
+   marker. Ours only considers a line that is ENTIRELY a bracketed descriptor.
+2. Its bracket handling is ASCII-only. A Japanese marker is written `（喘ぎ声）`
+   or `【笑い】` — so the ASCII test fires on exactly zero real Japanese markers
+   while claiming to support them. Found by the test suite, not by reading.
+
+**Wiring.** All three run from `merge_segments()` in `crispasr_run.cpp` — the
+structural chokepoint all four `merge_segments(...)` call sites pass through.
+Patching the four sites by hand is the shape of bug the copies-in-sync guard
+exists for. It must also be here rather than per-slice: a repetition straddling
+a slice boundary is only visible once the slices are flat.
+
+**Every stage is OFF unless its env var is set** (`CRISPASR_SEG_MAX_CHARS`,
+`_DROP_NONVERBAL`, `_LOGPROB_THOLD`, `_LOGPROB_MARGIN`, `_MERGE_REPEATS`,
+`_MERGE_SIMILARITY`, `_MERGE_GAP_CS`, `_MERGE_MIN_RUN`). Each can delete
+user-visible text and a wrong deletion is worse than a surviving artifact, so
+none may switch on by surprise. Dropped counts print to stderr — silent loss is
+the failure mode.
+
+**Both surfaces wired.** `crispasr_c_api.cpp` reimplements every backend's
+transcribe inline and never calls the CLI adapter, so it needs its own arm —
+`apply_session_hygiene()`, called from the two `transcribe_lang` paths and from
+`transcribe_vad_lang`. The other three public entries are thin wrappers over
+those. It runs BEFORE `apply_session_punc_model`, matching the CLI where
+`merge_segments()` precedes `apply_punc_model()`; the order is not cosmetic,
+since the length cap prefers to cut at a sentence mark and whether punctuation
+exists yet moves the cut.
+
+⚠ **The VAD path defers the merge** (`hygiene_defer_merge`).
+`crispasr_session_transcribe_vad_lang` transcribes a STITCHED buffer — silence
+removed, replaced with uniform 0.1 s joins — so every segment pair looks 10 cs
+apart and the repeat-merge would collapse utterances that are minutes apart in
+the real audio. Cap and filter are timestamp-independent and still run inline;
+the merge waits until after `crispasr_vad_remap_timestamp` restores the real
+timeline. Do not "simplify" this back into one call.
+
+### W3 — aligner collapse sentinel — DONE 2026-08-09
+
+`src/core/align_sentinel.h` + `tests/test-align-sentinel.cpp` (10 cases).
+
+The failure is REAL in our code, not a ported hypothetical. `ctc_forced_align()`
+cannot fail loudly — it returns `{}` only when the whole call is unusable — while
+two paths inside it emit `t0 == t1 == 0` for individual words inside a
+SUCCESSFUL return: `wranges[wi].cs < 0` (characters absent from the CTC vocab,
+documented in `align.h`'s `@return`) and `t0_frame < 0` (the Viterbi path never
+visited the word). Feed a Chinese transcript to a Latin-vocab CTC model and
+EVERY word comes back that way.
+
+Five signals — (0,0) ratio >10%, zero-length-span ratio >40%, chars/sec >50,
+coverage <5%, span <0.5 s — each with its own precondition so a short clip, a
+two-word clip, or unknown audio duration is not condemned. chars/sec counts code
+points; on bytes it reads 3x high and would flag every correct Japanese
+alignment.
+
+Wired at `crispasr_align_words()`, the ONE join all three aligner backends
+(qwen3-fa, wav2vec2, canary-ctc) funnel through, so CLI + session ABI + bindings
++ server are covered by one call. **The offset is subtracted before assessing** —
+a chunk at 30 s would otherwise present silent-zero words as (30.0, 30.0), a
+plausible-looking position, and the signal could never fire.
+
+Detect + warn by default. `CRISPASR_ALIGN_SENTINEL_REDISTRIBUTE=1` opts into
+repair, `=0` disables. Repair is opt-in because this is a new heuristic against a
+failure we have never measured in the field; a wrong auto-repair would be just as
+invisible as the collapse it replaces.
+
+Mutation-checked: a sentinel that never fires (= today's `main`) fails 7 of 10
+cases, and the 3 that pass are the must-not-fire ones.
+
+### W4 — VAD failover — DONE 2026-08-09
+
+`src/core/vad_failover.h` + `tests/test-vad-failover.cpp` (10 cases). Wired into
+`crispasr_compute_vad_slices` — again the single shared entry point.
+
+**Placed after the merge and BEFORE the re-chunk.** The re-chunk splits long
+segments at `chunk_seconds`, so one 10-minute monologue becomes ~20 slices;
+measuring segment COUNT after that reports a healthy number for any input and the
+few-segment signal could never fire.
+
+Falls back to `crispasr_fixed_chunk_slices`, not one giant slice — "transcribe
+everything" has to stay inside the chunk length the backend's context expects.
+`CRISPASR_VAD_FAILOVER=0` disables.
+
+**Deliberate correction to WhisperJAV.** Its few-segment rule is
+`len(segments) <= 2 and duration >= 480` with no coverage condition, which
+misfires on a 10-minute continuous monologue detected as ONE segment at 99%
+coverage and needlessly re-transcribes it. Verified by building their exact rule
+against our fixtures — it fails the monologue test. Ours also requires
+coverage <10%.
+
+### W7 — sensitivity presets — DONE 2026-08-09
+
+`src/core/asr_sensitivity.h` + `tests/test-asr-sensitivity.cpp` (8 cases).
+`--sensitivity conservative|balanced|aggressive` on the CLI,
+`crispasr_session_set_sensitivity()` on the session ABI (both surfaces, because
+the C-ABI does not call the CLI).
+
+The four thresholds INTERACT: `crispasr.cpp:8499` requires `avg_logprob <
+logprob_thold` AND `no_speech_prob < no_speech_thold` together, so moving one
+alone produces a combination that does not mean what its name says. The tests pin
+each preset's DIRECTION against balanced and that the two sit on OPPOSITE sides
+of it — asserting each against balanced separately would still allow both to
+drift the same way.
+
+`balanced` is byte-identical to the shipped defaults, and a test pins those
+defaults against `crispasr.cpp:6523` so a change there without a change here
+fails. An unknown name is REJECTED (CLI errors, ABI returns -2) rather than
+silently treated as balanced, so a typo is visible. A test also round-trips every
+name advertised in `--help` through the parser, guarding the classic
+documented-but-unparseable drift.
+
+### Follow-ups left open by this round
+
+1. ~~Session C-ABI does not get W2/W5/W6.~~ **DONE** — `apply_session_hygiene()`
+   with the VAD deferred-merge handling above. The `[seg-hygiene][wiring]`
+   guard now requires the session arm to be defined AND called (>=3 sites),
+   proven red by deleting the call sites — the §W1b state exactly.
+2. ~~No wiring guard for the hygiene call.~~ **DONE** — the `[seg-hygiene]
+   [wiring]` case in `tests/test-segment-hygiene.cpp` source-scans
+   `crispasr_run.cpp` for the `config_from_env` + `apply_all` CALLS (not the
+   `#include` — that is exactly the state §W1b found firered in) and requires
+   them inside `merge_segments`. Proven red by stubbing the call out.
+3. **The sentinel and failover thresholds have never been measured against real
+   field data.** They are reasoned, not fitted. If either turns out to fire on
+   real audio, the numbers are the thing to revisit, not the structure.
+
+### Deliberately NOT porting
+
+- **The hallucination phrase blacklist** (`data/hallucination_filters/`,
+  150 KB `filter_list_v08.json` + `regexp_v09.json`). Heavily JA- and
+  JAV-specific, a maintenance liability, and real false-positive risk — its
+  first regex strips *all* parenthesised content. If we ever want this, take
+  the shape (categories + per-pattern confidence + aggressiveness multiplier),
+  never the payload.
+- Speech-enhancement backends, the ensemble/two-pass orchestrator, translation,
+  the webview GUI. Orchestration-layer, or things we already do differently.
+
+---
+
 ## #316 Kokoro G2P, round 2 — archived from PLAN.md 2026-08-05
 
 Landed `619e74b6..4b875be0`. Round 1 is the entry further down

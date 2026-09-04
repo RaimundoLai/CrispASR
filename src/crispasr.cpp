@@ -204,6 +204,7 @@ static bool ggml_graph_compute_helper(struct ggml_cgraph* graph, int n_threads, 
 // instances (e.g. Ruby bindings) don't race on shared threadpool fields.
 #include <mutex>
 #include <unordered_map>
+#include "core/ggml_cpu_backend.h"
 struct cpu_pool_entry {
     ggml_threadpool_t pool = nullptr;
     int n_threads = 0;
@@ -215,24 +216,23 @@ static void whisper_ensure_cpu_threadpool(ggml_backend_sched_t sched, int n_thre
     std::lock_guard<std::mutex> lock(g_cpu_pools_mtx);
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
-        if (!ggml_backend_is_cpu(backend))
+        if (!core_cpu_backend::is_cpu(backend))
             continue;
 
         auto& entry = g_cpu_pools[backend];
         if (entry.pool && entry.n_threads >= n_threads) {
-            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+            core_cpu_backend::set_threadpool(backend, entry.pool);
             continue;
         }
         // (Re)create with the requested size.
         if (entry.pool) {
-            ggml_backend_cpu_set_threadpool(backend, nullptr);
-            ggml_threadpool_free(entry.pool);
+            core_cpu_backend::set_threadpool(backend, nullptr);
+            core_cpu_backend::threadpool_free(entry.pool);
         }
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
-        entry.pool = ggml_threadpool_new(&tpp);
+        entry.pool = core_cpu_backend::threadpool_new(n_threads);
         entry.n_threads = entry.pool ? n_threads : 0;
         if (entry.pool) {
-            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+            core_cpu_backend::set_threadpool(backend, entry.pool);
         }
     }
 }
@@ -247,8 +247,8 @@ static void whisper_release_cpu_threadpool(ggml_backend_t backend) {
     if (it == g_cpu_pools.end())
         return;
     if (it->second.pool) {
-        ggml_backend_cpu_set_threadpool(backend, nullptr);
-        ggml_threadpool_free(it->second.pool);
+        core_cpu_backend::set_threadpool(backend, nullptr);
+        core_cpu_backend::threadpool_free(it->second.pool);
     }
     g_cpu_pools.erase(it);
 }
@@ -1915,7 +1915,17 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     }
 
     // CPU Extra
+    //
+    // Issue #405: under GGML_BACKEND_DL the registry can have NO CPU device
+    // (every shipped libggml-cpu variant refused by ggml_backend_score() on a
+    // host below their ISA floor). ggml_backend_dev_backend_reg(nullptr)
+    // aborts the process (GGML_ASSERT(device), ggml-backend.cpp:595 — the LID
+    // crash in the report), so return the GPU-only list and let the caller
+    // fail the model load with a real error message.
     auto* cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        return buft_list;
+    }
     auto* cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
     auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(
         cpu_reg, "ggml_backend_dev_get_extra_bufts");
@@ -1928,7 +1938,7 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     }
 
     // CPU
-    buft_list.emplace_back(cpu_dev, ggml_backend_cpu_buffer_type());
+    buft_list.emplace_back(cpu_dev, core_cpu_backend::buffer_type());
 
     return buft_list;
 }
@@ -1939,7 +1949,7 @@ static bool weight_buft_supported(const whisper_hparams& hparams, ggml_tensor* w
 
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
         ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU ||
-        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == ggml_backend_cpu_buffer_type())) {
+        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == core_cpu_backend::buffer_type())) {
         // GPU and default CPU backend support all operators
         op_supported = true;
     } else {
@@ -2326,6 +2336,14 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
 
     // Create a list of available bufts, in priority order
     buft_list_t buft_list = make_buft_list(wctx.params);
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        CRISPASR_LOG_ERROR("%s: no CPU ggml backend is registered — cannot place model weights. "
+                           "If this is a packaged (dynamic-backend) build, the shipped libggml-cpu modules "
+                           "may all require CPU features this host lacks; use the crispasr-*-cpu-legacy "
+                           "artifact or build from source on this machine.\n",
+                           __func__);
+        return false;
+    }
 
     auto create_tensor = [&](asr_tensor type, asr_system system, ggml_tensor* meta, int layer = 0) -> ggml_tensor* {
         ggml_op op = ASR_TENSOR_INFO.at(type);
@@ -5011,7 +5029,7 @@ static bool weight_buft_supported(const whisper_vad_hparams& hparams, ggml_tenso
 
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
         ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU ||
-        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == ggml_backend_cpu_buffer_type())) {
+        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft == core_cpu_backend::buffer_type())) {
         // GPU and default CPU backend support all operators
         op_supported = true;
     } else {
@@ -5269,10 +5287,7 @@ static bool whisper_vad_init_context(whisper_vad_context* vctx) {
     // This avoids creating/destroying a disposable threadpool on every
     // chunk (~250 per 8 s audio).  After many server requests the
     // accumulated malloc/free fragmentation degrades performance (#132).
-    {
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
-        vctx->threadpool = ggml_threadpool_new(&tpp);
-    }
+    { vctx->threadpool = core_cpu_backend::threadpool_new(1); }
 
     return true;
 }
@@ -5425,6 +5440,12 @@ struct whisper_vad_context* whisper_vad_init_with_params(struct whisper_model_lo
     wparams.use_gpu = params.use_gpu;
     wparams.gpu_device = params.gpu_device;
     buft_list_t buft_list = make_buft_list(wparams);
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        CRISPASR_LOG_ERROR("%s: no CPU ggml backend is registered — cannot place VAD weights (see the "
+                           "cpu-legacy note in the ASR loader error above / issue #405).\n",
+                           __func__);
+        return nullptr;
+    }
 
     auto create_tensor = [&](vad_tensor type, ggml_tensor* meta) -> ggml_tensor* {
         ggml_op op = VAD_TENSOR_OPS.at(type);
@@ -5674,7 +5695,7 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
     // ggml_graph_compute directly per chunk.  This bypasses the scheduler
     // overhead and all threadpool creation entirely.
 
-    struct ggml_cplan cplan = ggml_graph_plan(gf, /*n_threads=*/1, vctx->threadpool);
+    struct ggml_cplan cplan = core_cpu_backend::plan(gf, /*n_threads=*/1, vctx->threadpool);
 
     // Persistent work buffer — reused across calls via vctx member.
     if (vctx->work_buf.size() < cplan.work_size) {
@@ -5704,7 +5725,7 @@ bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* sa
         ggml_backend_tensor_set(frame, window.data(), 0, ggml_nelements(frame) * sizeof(float));
 
         // Direct graph compute — no scheduler, no threadpool churn.
-        if (ggml_graph_compute(gf, &cplan) != GGML_STATUS_SUCCESS) {
+        if (core_cpu_backend::compute_planned(gf, &cplan, 1) != GGML_STATUS_SUCCESS) {
             CRISPASR_LOG_ERROR("%s: failed to compute VAD graph\n", __func__);
             break;
         }
@@ -6007,7 +6028,7 @@ void whisper_vad_free(whisper_vad_context* ctx) {
         }
 
         if (ctx->threadpool) {
-            ggml_threadpool_free(ctx->threadpool);
+            core_cpu_backend::threadpool_free(ctx->threadpool);
         }
 
         delete[] ctx->model.hparams.encoder_in_channels;
@@ -8624,12 +8645,33 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                             }
                         }
                         text = "";
-                        while (i < (int)tokens_cur.size() && tokens_cur[i].id > whisper_token_beg(ctx) &&
-                               ctx->vocab.is_timestamp(tokens_cur[i].id)) {
-                            i++;
-                        }
-                        i--;
+                        // Issue #388 (backport of ggml-org/whisper.cpp#2279, fixing
+                        // whisper.cpp#2271): around a pause the model emits TWO
+                        // timestamp tokens — the end of this utterance and the start
+                        // of the next. Consuming them and then setting t0 = t1 threw
+                        // the second one away, so every segment began where the
+                        // previous one ended and the silence between utterances
+                        // vanished from the transcript / SRT.
+                        //
+                        // Look AHEAD at i + 1 instead, and take t0 from the LAST
+                        // timestamp consumed — that is the next utterance's real
+                        // start. Index-equivalent to the old loop (which advanced
+                        // past the run and backed off one), so only t0 and the
+                        // print_special echo change.
+                        //
+                        // The is_timestamp() guard is kept, deliberately diverging
+                        // from upstream: CrispASR has extra special tokens above
+                        // token_beg ([SOLM], <|speakerN|>) that must not be eaten
+                        // as timestamps.
                         t0 = t1;
+                        while (i + 1 < (int)tokens_cur.size() && tokens_cur[i + 1].id > whisper_token_beg(ctx) &&
+                               ctx->vocab.is_timestamp(tokens_cur[i + 1].id)) {
+                            i++;
+                            if (params.print_special) {
+                                text += whisper_token_to_str(ctx, tokens_cur[i].id);
+                            }
+                            t0 = seek + 2 * (tokens_cur[i].tid - whisper_token_beg(ctx));
+                        }
                         i0 = i + 1;
                         speaker_turn_next = false;
                     }
@@ -8647,8 +8689,8 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                                    text.c_str());
                         } else {
                             printf("%s", text.c_str());
-                            fflush(stdout);
                         }
+                        fflush(stdout); // #388: flush the timestamped form too, as whisper.cpp master does
                     }
 
                     result_all.push_back({tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next, {}});

@@ -33,6 +33,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // Debug gate
@@ -1294,13 +1295,13 @@ struct bananamind_tts_context* bananamind_tts_init_from_file(const char* path_mo
     ctx->n_threads = params.n_threads;
     ctx->verbosity = params.verbosity;
 
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     if (!ctx->backend) {
         fprintf(stderr, "bananamind_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend, params.n_threads);
 
     if (!load_model(ctx, path_model)) {
         ggml_backend_free(ctx->backend);
@@ -1315,7 +1316,7 @@ void bananamind_tts_free(struct bananamind_tts_context* ctx) {
     if (!ctx)
         return;
     if (ctx->w_buf)
-        ggml_backend_buffer_free(ctx->w_buf);
+        core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend)

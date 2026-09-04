@@ -11,6 +11,17 @@
 
 set(TARGET crispasr-cli)
 
+# The CLI records consent hashes even when C2PA signing is disabled.  Its
+# header therefore uses the shared SHA-256 shim independently of
+# crispasr_enable_c2pa(), which only configures the optional signing library.
+set(_crispasr_c2pa_audio_include "${CMAKE_SOURCE_DIR}/third_party/c2pa-audio/src")
+if (NOT EXISTS "${_crispasr_c2pa_audio_include}/sha256.h")
+    message(FATAL_ERROR
+        "The c2pa-audio submodule is required by the CLI consent record "
+        "(missing ${_crispasr_c2pa_audio_include}/sha256.h). Initialize submodules with: "
+        "git submodule update --init --recursive")
+endif()
+
 add_executable(${TARGET}
     cli.cpp
     crispasr_backend.cpp
@@ -50,6 +61,7 @@ add_executable(${TARGET}
     crispasr_backend_bark.cpp
     crispasr_backend_dia.cpp
     crispasr_backend_dots_tts.cpp
+    crispasr_backend_confucius4_tts.cpp
     crispasr_backend_voxcpm2_tts.cpp
     crispasr_backend_voxcpm2_vae.cpp
     crispasr_backend_cosyvoice3.cpp
@@ -248,6 +260,7 @@ target_link_libraries(crispasr-diff PRIVATE
     parler-tts
     mini-omni2
     dots-tts
+    confucius4-tts
     miotts
     miocodec
     crepe
@@ -319,7 +332,10 @@ endif()
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
 
 # httplib.h is in the server example directory
-target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/server)
+target_include_directories(${TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/examples/server
+    ${_crispasr_c2pa_audio_include}
+)
 
 include(DefaultTargetOptions)
 
@@ -353,6 +369,7 @@ target_link_libraries(${TARGET} PRIVATE
     bark-tts
     dia-tts
     dots-tts
+    confucius4-tts
     irodori-tts
     pocket-tts
     csm-tts

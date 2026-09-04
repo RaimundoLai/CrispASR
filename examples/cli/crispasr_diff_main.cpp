@@ -62,6 +62,7 @@
 #include "cohere.h"
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
+#include "vibevoice.h"
 #include "ark_asr.h"
 #include "mimo_tokenizer.h"
 #include "core/snac.h"
@@ -141,8 +142,28 @@ static char* portable_mkdtemp(char* tpl) {
     tpl[strlen(unique)] = '\0';
     return tpl;
 }
+// setenv/unsetenv are POSIX; MSVC has only _putenv_s. Two of the ~10 call
+// sites in this file wrapped that by hand in #ifdef _WIN32 / #else, and the
+// rest did not — so crispasr-diff did not compile on MSVC at all
+// (error C3861: 'setenv': identifier not found). Nothing noticed, because
+// ci.yml's Windows job builds only crispasr-cli plus three named tests;
+// build.yml's msbuild ALL_BUILD is the only thing that compiles this file on
+// Windows, and it has been red since 2026-08-18.
+//
+// Shim it the same way mkdtemp and rmdir already are, so every call site
+// works unchanged. _putenv_s always overwrites, which matches every call
+// here (they all pass overwrite=1).
+static int portable_setenv(const char* name, const char* value, int overwrite) {
+    (void)overwrite;
+    return _putenv_s(name, value);
+}
+static int portable_unsetenv(const char* name) {
+    return _putenv_s(name, "");
+}
 #define mkdtemp portable_mkdtemp
 #define rmdir _rmdir
+#define setenv portable_setenv
+#define unsetenv portable_unsetenv
 #else
 #include <unistd.h>
 #endif
@@ -229,6 +250,14 @@ static void print_tada_fm_rows(const crispasr_diff::Ref& ref, const char* name, 
         double cos = 1.0;
         double max_abs = 0.0;
         double rms = 0.0;
+        // |mine| and |ref| per row. Cosine on a near-zero row is numerically
+        // meaningless — a silent frame can read cos 0.95 while both sides are
+        // essentially the same zero — and a 10-30x magnitude gap between the
+        // two sides means "same name, wrong data", i.e. a harness bug rather
+        // than a runtime one. Without these you cannot tell those apart, and
+        // the guide's voxtral-tts post-mortem is exactly that mistake.
+        double norm_a = 0.0;
+        double norm_b = 0.0;
     };
     std::vector<RowMetric> rows;
     rows.reserve(n_rows);
@@ -250,6 +279,8 @@ static void print_tada_fm_rows(const crispasr_diff::Ref& ref, const char* name, 
         m.cos = (na > 0.0 && nb > 0.0) ? dot / std::sqrt(na * nb) : 1.0;
         m.max_abs = ma;
         m.rms = std::sqrt(ss / (double)row_width);
+        m.norm_a = std::sqrt(na);
+        m.norm_b = std::sqrt(nb);
         rows.push_back(m);
     }
     std::sort(rows.begin(), rows.end(), [](const RowMetric& a, const RowMetric& b) {
@@ -259,7 +290,8 @@ static void print_tada_fm_rows(const crispasr_diff::Ref& ref, const char* name, 
     });
     printf("  [FM-ROWS %-14s] worst %zu/%zu calls:", name, std::min(max_rows, rows.size()), rows.size());
     for (size_t i = 0; i < rows.size() && i < max_rows; i++) {
-        printf(" #%zu cos=%.6f max=%.2e rms=%.2e", rows[i].row, rows[i].cos, rows[i].max_abs, rows[i].rms);
+        printf(" #%zu cos=%.6f max=%.2e rms=%.2e |mine|=%.3g |ref|=%.3g", rows[i].row, rows[i].cos, rows[i].max_abs,
+               rows[i].rms, rows[i].norm_a, rows[i].norm_b);
     }
     printf("\n");
 }
@@ -857,6 +889,21 @@ static std::string chatterbox_find_s3gen(const std::string& model_path) {
 
     const size_t sep = model_path.find_last_of("/\\");
     const std::string dir = (sep == std::string::npos) ? "." : model_path.substr(0, sep);
+    const std::string base = (sep == std::string::npos) ? model_path : model_path.substr(sep + 1);
+
+    // Prefer the companion with the exact same release prefix and quant tag:
+    // chatterbox-v3-t3-q8_0.gguf -> chatterbox-v3-s3gen-q8_0.gguf.  Falling
+    // straight to the legacy generic names can silently pair a newly converted
+    // T3 with an older/incompatible S3Gen that happens to share the cache.
+    const size_t marker = base.find("-t3-");
+    if (marker != std::string::npos) {
+        const std::string exact = dir + "/" + base.substr(0, marker) + "-s3gen-" + base.substr(marker + 4);
+        if (file_exists(exact))
+            return exact;
+        const std::string release_f16 = dir + "/" + base.substr(0, marker) + "-s3gen-f16.gguf";
+        if (file_exists(release_f16))
+            return release_f16;
+    }
     for (const char* const* it = candidates; *it; ++it) {
         const std::string path = dir + "/" + *it;
         if (file_exists(path))
@@ -949,7 +996,7 @@ static crispasr_diff::Report compare_logits_strided(const crispasr_diff::Ref& re
     r.n_elem = n_rows * (size_t)row_w;
     if (r.n_elem == 0)
         return r;
-    double sum_abs = 0.0, sum_sq = 0.0;
+    double sum_abs = 0.0, sum_sq = 0.0, sum_data_sq = 0.0, sum_ref_sq = 0.0;
     size_t n_finite = 0;
     r.cos_min = 1.0f;
     double cos_sum = 0.0;
@@ -970,6 +1017,8 @@ static crispasr_diff::Report compare_logits_strided(const crispasr_diff::Ref& re
                 r.max_abs = ad;
             sum_abs += ad;
             sum_sq += (double)d * d;
+            sum_data_sq += (double)a * a;
+            sum_ref_sq += (double)b * b;
             dot += (double)a * b;
             na += (double)a * a;
             nb += (double)b * b;
@@ -986,6 +1035,12 @@ static crispasr_diff::Report compare_logits_strided(const crispasr_diff::Ref& re
     if (n_finite > 0) {
         r.mean_abs = (float)(sum_abs / n_finite);
         r.rms = (float)std::sqrt(sum_sq / n_finite);
+        r.rms_data = (float)std::sqrt(sum_data_sq / n_finite);
+        r.rms_ref = (float)std::sqrt(sum_ref_sq / n_finite);
+        if (r.rms_ref > 1e-20f)
+            r.norm_ratio = r.rms_data / r.rms_ref;
+        else if (r.rms_data > 1e-20f)
+            r.norm_ratio = INFINITY;
     }
     if (cos_rows > 0)
         r.cos_mean = (float)(cos_sum / cos_rows);
@@ -1004,7 +1059,7 @@ static crispasr_diff::Report compare_with_row_width(const crispasr_diff::Ref& re
     r.n_elem = n;
     if (n == 0)
         return r;
-    double sum_abs = 0.0, sum_sq = 0.0;
+    double sum_abs = 0.0, sum_sq = 0.0, sum_data_sq = 0.0, sum_ref_sq = 0.0;
     for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(data[i])) {
             r.n_nonfinite++;
@@ -1016,9 +1071,20 @@ static crispasr_diff::Report compare_with_row_width(const crispasr_diff::Ref& re
             r.max_abs = ad;
         sum_abs += ad;
         sum_sq += (double)d * (double)d;
+        sum_data_sq += (double)data[i] * (double)data[i];
+        sum_ref_sq += (double)pair.first[i] * (double)pair.first[i];
     }
-    r.mean_abs = (float)(sum_abs / n);
-    r.rms = (float)std::sqrt(sum_sq / n);
+    const size_t n_finite = n - r.n_nonfinite;
+    if (n_finite > 0) {
+        r.mean_abs = (float)(sum_abs / n_finite);
+        r.rms = (float)std::sqrt(sum_sq / n_finite);
+        r.rms_data = (float)std::sqrt(sum_data_sq / n_finite);
+        r.rms_ref = (float)std::sqrt(sum_ref_sq / n_finite);
+        if (r.rms_ref > 1e-20f)
+            r.norm_ratio = r.rms_data / r.rms_ref;
+        else if (r.rms_data > 1e-20f)
+            r.norm_ratio = INFINITY;
+    }
     const size_t n_rows = n / (size_t)row_w;
     r.cos_min = 1.0f;
     double cos_sum = 0.0;
@@ -1409,9 +1475,15 @@ int main(int argc, char** argv) {
         // voc_rb_0 sitting at cos_min 0.937 cos_mean 0.998, which passed the 0.95
         // mean check but was already structurally broken.
         constexpr float CHATTERBOX_VOC_STRICT_MIN = 0.999f;
+        constexpr float CHATTERBOX_NORM_RATIO_MIN = 0.80f;
+        constexpr float CHATTERBOX_NORM_RATIO_MAX = 1.25f;
+        auto scale_ok = [&](const crispasr_diff::Report& r) {
+            return std::isfinite(r.norm_ratio) && r.norm_ratio >= CHATTERBOX_NORM_RATIO_MIN &&
+                   r.norm_ratio <= CHATTERBOX_NORM_RATIO_MAX;
+        };
         auto print_row_mean = [&](const char* name, const crispasr_diff::Report& r, float cos_threshold,
                                   const char* extra = "") {
-            const bool pass = r.found && r.n_nonfinite == 0 && r.cos_mean >= cos_threshold;
+            const bool pass = r.found && r.n_nonfinite == 0 && r.cos_mean >= cos_threshold && scale_ok(r);
             const char* tag = r.found ? (pass ? "[PASS]" : "[FAIL]") : "[SKIP]";
             std::string shape_str = "[";
             for (size_t i = 0; i < r.shape.size(); i++) {
@@ -1430,14 +1502,16 @@ int main(int argc, char** argv) {
                        tag, name, shape_str.c_str(), r.n_nonfinite, r.n_elem, *extra ? "  " : "", extra);
                 return pass;
             }
-            printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  max_abs=%.2e  rms=%.2e%s%s\n", tag, name,
-                   shape_str.c_str(), r.cos_min, r.cos_mean, r.max_abs, r.rms, *extra ? "  " : "", extra);
+            printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  norm=%.4f (cpp=%.2e ref=%.2e)  "
+                   "max_abs=%.2e  rms_err=%.2e%s%s\n",
+                   tag, name, shape_str.c_str(), r.cos_min, r.cos_mean, r.norm_ratio, r.rms_data, r.rms_ref, r.max_abs,
+                   r.rms, *extra ? "  " : "", extra);
             return pass;
         };
         auto record_mean = [&](const crispasr_diff::Report& r, float cos_threshold) {
             if (!r.found) {
                 n_skip++;
-            } else if (r.cos_mean >= cos_threshold) {
+            } else if (r.n_nonfinite == 0 && r.cos_mean >= cos_threshold && scale_ok(r)) {
                 n_pass++;
             } else {
                 n_fail++;
@@ -1448,8 +1522,8 @@ int main(int argc, char** argv) {
         // expected divergence is fp32-ULP rounding.
         auto print_row_strict = [&](const char* name, const crispasr_diff::Report& r, float cos_mean_threshold,
                                     float cos_min_threshold, const char* extra = "") {
-            const bool pass =
-                r.found && r.n_nonfinite == 0 && r.cos_mean >= cos_mean_threshold && r.cos_min >= cos_min_threshold;
+            const bool pass = r.found && r.n_nonfinite == 0 && r.cos_mean >= cos_mean_threshold &&
+                              r.cos_min >= cos_min_threshold && scale_ok(r);
             const char* tag = r.found ? (pass ? "[PASS]" : "[FAIL]") : "[SKIP]";
             std::string shape_str = "[";
             for (size_t i = 0; i < r.shape.size(); i++) {
@@ -1468,14 +1542,17 @@ int main(int argc, char** argv) {
                        tag, name, shape_str.c_str(), r.n_nonfinite, r.n_elem, *extra ? "  " : "", extra);
                 return pass;
             }
-            printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  max_abs=%.2e  rms=%.2e%s%s\n", tag, name,
-                   shape_str.c_str(), r.cos_min, r.cos_mean, r.max_abs, r.rms, *extra ? "  " : "", extra);
+            printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  norm=%.4f (cpp=%.2e ref=%.2e)  "
+                   "max_abs=%.2e  rms_err=%.2e%s%s\n",
+                   tag, name, shape_str.c_str(), r.cos_min, r.cos_mean, r.norm_ratio, r.rms_data, r.rms_ref, r.max_abs,
+                   r.rms, *extra ? "  " : "", extra);
             return pass;
         };
         auto record_strict = [&](const crispasr_diff::Report& r, float cos_mean_threshold, float cos_min_threshold) {
             if (!r.found) {
                 n_skip++;
-            } else if (r.cos_mean >= cos_mean_threshold && r.cos_min >= cos_min_threshold) {
+            } else if (r.n_nonfinite == 0 && r.cos_mean >= cos_mean_threshold && r.cos_min >= cos_min_threshold &&
+                       scale_ok(r)) {
                 n_pass++;
             } else {
                 n_fail++;
@@ -1510,14 +1587,30 @@ int main(int argc, char** argv) {
         // The runtime default is 6 CFM steps (a perf default); the reference
         // dump uses 10, so pin 10 here for an apples-to-apples mel/CFM diff.
         chatterbox_set_cfm_steps(ctx, 10);
-        // CHATTERBOX_LANG=<code> selects the multilingual path (prepends [lang]
-        // + enables NFKD normalization, #170). Required for the t3_text_tokens
-        // stage to match a multilingual reference archive. Empty = English.
+        // The reference records the language used by the multilingual Python
+        // oracle. Reuse it automatically so a portable -ref.gguf is sufficient
+        // to reproduce the run; an explicit env override remains useful for
+        // negative/A-B experiments.
+        std::string chatterbox_lang = ref.meta("chatterbox_lang");
         if (const char* env_lang = crispasr_env::get("CRISPASR_CHATTERBOX_LANG")) {
-            if (*env_lang) {
-                chatterbox_set_language(ctx, env_lang);
-                fprintf(stderr, "[crispasr-diff] CHATTERBOX_LANG=%s -> multilingual path\n", env_lang);
-            }
+            if (*env_lang)
+                chatterbox_lang = env_lang;
+        }
+        if (!chatterbox_lang.empty()) {
+            chatterbox_set_language(ctx, chatterbox_lang.c_str());
+            fprintf(stderr, "[crispasr-diff] CHATTERBOX_LANG=%s -> multilingual path\n", chatterbox_lang.c_str());
+        }
+        // The Python Chatterbox blueprint derives T3 and S3Gen conditionals
+        // from the --audio fixture.  Install that same voice in the native
+        // context before comparing conditioning/prefill/encoder stages.  The
+        // previous harness compared the supplied voice front ends in isolation
+        // but then silently drove the model with its unrelated built-in
+        // conds.pt voice, so every downstream voice-clone stage was guaranteed
+        // to diverge despite being reported as a model parity failure.
+        if (chatterbox_set_voice_from_wav(ctx, audio_path.c_str()) != 0) {
+            fprintf(stderr, "failed to derive chatterbox voice conditionals from '%s'\n", audio_path.c_str());
+            chatterbox_free(ctx);
+            return 4;
         }
         // ---- VE pipeline (Module 2 of native voice clone) ----
         // `samples` is the 16 kHz mono float32 PCM that the harness loaded.
@@ -2780,7 +2873,11 @@ int main(int argc, char** argv) {
         auto cp = qwen3_tts_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 0;
-        cp.use_gpu = false;
+        cp.use_gpu = crispasr_env::get("CRISPASR_DIFF_USE_GPU") != nullptr;
+        if (cp.use_gpu) {
+            fprintf(stderr, "[crispasr-diff] CRISPASR_DIFF_USE_GPU=1 -> qwen3-tts-cenc use_gpu=true "
+                            "(set CRISPASR_QWEN3_TTS_HIP_CODEC_NATIVE=1 to test native HIP)\n");
+        }
         qwen3_tts_context* qctx = qwen3_tts_init_from_file(model_path.c_str(), cp);
         if (!qctx) {
             fprintf(stderr, "failed to load talker\n");
@@ -3487,6 +3584,113 @@ int main(int argc, char** argv) {
         }
         mimo_asr_free(ctx);
 
+    } else if (backend_name == "vibevoice" || backend_name == "vibevoice-bitnet") {
+        // VibeVoice-ASR: two sigma-VAE encoders (acoustic 64-d, semantic 128-d)
+        // -> two SpeechConnectors -> summed speech features that condition the
+        // LM. Stage boundaries matter here because the reported symptom (#369)
+        // is the LM LOSING THE LANGUAGE CUE — emitting fluent Italian for Korean
+        // audio — while the LM weights are provably equivalent to upstream
+        // (2 differing ternary weights in 13.76 M). If the conditioning is
+        // faithful, the cause is not in our port; if it is not, the first
+        // diverging stage says where.
+        //
+        // The dumper is weight-layout driven, so the same reference_backends
+        // /vibevoice.py works on the BitNet checkpoint as on the 7B it was
+        // written for.
+        auto cp = vibevoice_context_default_params();
+        cp.n_threads = 4;
+        cp.use_gpu = crispasr_env::get("CRISPASR_VIBEVOICE_GPU") != nullptr;
+        vibevoice_context* ctx = vibevoice_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load vibevoice model '%s'\n", model_path.c_str());
+            return 1;
+        }
+        if (!vibevoice_has_asr(ctx)) {
+            printf("[SKIP] model has no ASR encoders (TTS-only variant)\n");
+            vibevoice_free(ctx);
+            return 0;
+        }
+        // The harness loads audio at 16 kHz; this backend wants 24 kHz
+        // (crispasr_backend_vibevoice.cpp declares input_sample_rate()==24000).
+        // Feeding 16 kHz straight in is silent and catastrophic: the encoder's
+        // 3200-sample compression yields 30 frames instead of 45, so every row
+        // is compared against the wrong frame and cos collapses to ~0.01 with
+        // healthy magnitudes on both sides — which reads exactly like a broken
+        // encoder and is not one. The frame-count mismatch is the tell.
+        std::vector<float> s24;
+        {
+            const int n16 = (int)samples.size();
+            const int n24 = (int)((int64_t)n16 * 24000 / 16000);
+            s24.resize((size_t)n24);
+            for (int i = 0; i < n24; i++) {
+                const float src = (float)i * 16000.0f / 24000.0f;
+                const int i0 = (int)src;
+                const int i1 = std::min(i0 + 1, n16 - 1);
+                const float t = src - (float)i0;
+                s24[(size_t)i] = samples[(size_t)i0] * (1.0f - t) + samples[(size_t)i1] * t;
+            }
+        }
+        int at_n = 0, at_d = 0, st_n = 0, st_d = 0;
+        float* at_mean = vibevoice_run_acoustic_encoder(ctx, s24.data(), (int)s24.size(), &at_n, &at_d);
+        if (at_mean) {
+            auto rep = ref.compare("at_enc_mean", at_mean, (size_t)at_n * at_d);
+            print_row("at_enc_mean", rep, COS_THRESHOLD);
+            record(rep);
+            print_tada_fm_rows(ref, "at_enc_mean", std::vector<float>(at_mean, at_mean + (size_t)at_n * at_d),
+                               (size_t)at_d, 6);
+        } else {
+            printf("[ERR ] at_enc_mean            extract returned null\n");
+            n_fail++;
+        }
+        float* st_mean = vibevoice_run_semantic_encoder(ctx, s24.data(), (int)s24.size(), &st_n, &st_d);
+        if (st_mean) {
+            auto rep = ref.compare("st_enc_mean", st_mean, (size_t)st_n * st_d);
+            print_row("st_enc_mean", rep, COS_THRESHOLD);
+            record(rep);
+            print_tada_fm_rows(ref, "st_enc_mean", std::vector<float>(st_mean, st_mean + (size_t)st_n * st_d),
+                               (size_t)st_d, 6);
+        } else {
+            printf("[ERR ] st_enc_mean            extract returned null\n");
+            n_fail++;
+        }
+        if (at_mean) {
+            int d_lm = 0;
+            float* c = vibevoice_run_connector(ctx, "at_conn", at_mean, at_n, at_d, &d_lm);
+            if (c) {
+                auto rep = ref.compare("at_conn_out", c, (size_t)at_n * d_lm);
+                print_row("at_conn_out", rep, COS_THRESHOLD);
+                record(rep);
+                free(c);
+            }
+        }
+        if (st_mean) {
+            int d_lm = 0;
+            float* c = vibevoice_run_connector(ctx, "se_conn", st_mean, st_n, st_d, &d_lm);
+            if (c) {
+                auto rep = ref.compare("st_conn_out", c, (size_t)st_n * d_lm);
+                print_row("st_conn_out", rep, COS_THRESHOLD);
+                record(rep);
+                free(c);
+            }
+        }
+        free(at_mean);
+        free(st_mean);
+        {
+            int n_frames = 0, d_lm = 0;
+            float* sf = vibevoice_encode_speech(ctx, s24.data(), (int)s24.size(), &n_frames, &d_lm);
+            if (sf) {
+                auto rep = ref.compare("speech_features", sf, (size_t)n_frames * d_lm);
+                print_row("speech_features", rep, COS_THRESHOLD);
+                record(rep);
+                print_tada_fm_rows(ref, "speech_features", std::vector<float>(sf, sf + (size_t)n_frames * d_lm),
+                                   (size_t)d_lm, 6);
+                free(sf);
+            } else {
+                printf("[ERR ] speech_features        extract returned null\n");
+                n_fail++;
+            }
+        }
+        vibevoice_free(ctx);
     } else if (backend_name == "ark-asr" || backend_name == "arkasr") {
         // ARK-ASR-3B: compute mel + encoder/adapter + prefill logits from the
         // raw audio and diff against the Python reference (PLAN §ARK). Three
@@ -3521,6 +3725,13 @@ int main(int argc, char** argv) {
                 auto rep = ref.compare("audio_embeds", emb, (size_t)h * N);
                 print_row("audio_embeds", rep, COS_THRESHOLD);
                 record(rep);
+                // Aggregate cos hides WHICH frames are wrong: jfk shows
+                // cos_mean 0.9996 against cos_min 0.943, i.e. a handful of bad
+                // frames in an otherwise clean tensor. Whether those are the
+                // FIRST or the LAST frames separates a conv-stem padding bug
+                // from a tail bug in the 4-frame adapter merge, and the
+                // aggregate cannot tell you which.
+                print_tada_fm_rows(ref, "audio_embeds", std::vector<float>(emb, emb + (size_t)h * N), (size_t)h, 8);
                 free(emb);
             } else {
                 printf("[ERR ] audio_embeds           extract returned null\n");
@@ -7476,10 +7687,26 @@ int main(int argc, char** argv) {
         }
 
         // Compare encoder_output if present in ref
-        // TODO: expose nemotron_run_encoder as a stage API for per-stage comparison.
-        // For now, only transcript-level regression is checked.
         if (ref.has("encoder_output")) {
-            printf("[SKIP] encoder_output          (stage API not yet wired — transcript-only regression)\n");
+            int n_mels = 0, T_mel = 0;
+            float* mel = nemotron_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+            if (mel) {
+                int T_enc = 0, d_model = 0;
+                float* enc = nemotron_run_encoder_ext(ctx, mel, n_mels, T_mel, &T_enc, &d_model);
+                free(mel);
+                if (enc) {
+                    auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_model);
+                    print_row("encoder_output", rep, COS_THRESHOLD);
+                    record(rep);
+                    free(enc);
+                } else {
+                    printf("[ERR ] encoder_output          nemotron_run_encoder_ext returned null\n");
+                    n_fail++;
+                }
+            } else {
+                printf("[ERR ] encoder_output          nemotron_compute_mel returned null\n");
+                n_fail++;
+            }
         }
 
         nemotron_result_free(r);
@@ -7618,8 +7845,9 @@ int main(int argc, char** argv) {
 
         // conv_stem_out: dump via env, compare against ref
         {
-            std::string conv_dump = "/mnt/volume1/tmp-overflow/moss_diarize_conv_stem.bin";
-            setenv("CRISPASR_MOSS_DIARIZE_CONV_DUMP", conv_dump.c_str(), 1);
+            // Scratch file next to the reference, not a hardcoded machine path.
+            std::string conv_dump = dirname_of(ref_path) + "/.moss-diarize-conv-stem.bin";
+            setenv("CRISPASR_MOSS_DIARIZE_DUMP_CONV", conv_dump.c_str(), 1);
         }
 
         // encoder_output + audio_embeds: full chunked pipeline
@@ -7653,7 +7881,8 @@ int main(int argc, char** argv) {
 
         // conv_stem_out: read dumped file and compare
         {
-            std::string conv_dump = "/mnt/volume1/tmp-overflow/moss_diarize_conv_stem.bin";
+            // Scratch file next to the reference, not a hardcoded machine path.
+            std::string conv_dump = dirname_of(ref_path) + "/.moss-diarize-conv-stem.bin";
             FILE* f = fopen(conv_dump.c_str(), "rb");
             if (f) {
                 fseek(f, 0, SEEK_END);
