@@ -6211,8 +6211,45 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             tk.p = (i < dec.probs.size()) ? dec.probs[i] : -1.0f;
             toks.push_back(std::move(tk));
         }
-        while (!transcript.empty() && (transcript.front() == ' ' || transcript.front() == '\n'))
-            transcript.erase(transcript.begin());
+        // Trim leading whitespace, orphaned invalid UTF-8 bytes, and replacement characters (U+FFFD: 0xEF 0xBF 0xBD)
+        while (!transcript.empty()) {
+            unsigned char c = (unsigned char)transcript.front();
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                transcript.erase(transcript.begin());
+                continue;
+            }
+            if (transcript.size() >= 3 && (unsigned char)transcript[0] == 0xEF &&
+                (unsigned char)transcript[1] == 0xBF && (unsigned char)transcript[2] == 0xBD) {
+                transcript.erase(transcript.begin(), transcript.begin() + 3);
+                continue;
+            }
+            if ((c & 0xC0) == 0x80) { // orphaned continuation byte
+                transcript.erase(transcript.begin());
+                continue;
+            }
+            if ((c & 0xE0) == 0xC0 && (transcript.size() < 2 || ((unsigned char)transcript[1] & 0xC0) != 0x80)) {
+                transcript.erase(transcript.begin());
+                continue;
+            }
+            if ((c & 0xF0) == 0xE0 && (transcript.size() < 3 || ((unsigned char)transcript[1] & 0xC0) != 0x80 ||
+                                       ((unsigned char)transcript[2] & 0xC0) != 0x80)) {
+                transcript.erase(transcript.begin());
+                continue;
+            }
+            break;
+        }
+
+        // Clean leading empty or artifact tokens from toks
+        while (!toks.empty()) {
+            const std::string& tt = toks.front().text;
+            if (tt.empty() || tt == " " || tt == "\t" || tt == "\n" || tt == "\r" || tt == "\xEF\xBF\xBD") {
+                toks.erase(toks.begin());
+            } else if ((unsigned char)tt[0] >= 0x80 && tt.size() == 1) { // standalone raw non-ASCII byte
+                toks.erase(toks.begin());
+            } else {
+                break;
+            }
+        }
 
         crispasr_session_seg seg;
         seg.text = core_ngram::fix_loops(transcript);
