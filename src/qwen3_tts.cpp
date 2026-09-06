@@ -4188,6 +4188,33 @@ static bool load_cenc(qwen3_tts_context* c);
 // ---------------------------------------------------------------------------
 static bool load_codec(qwen3_tts_context* c, const char* path) {
     auto& codec = c->codec;
+    if (codec.loaded) {
+        if (codec.buf_perm) {
+            ggml_backend_buffer_free(codec.buf_perm);
+            codec.buf_perm = nullptr;
+        }
+        if (codec.ctx_perm) {
+            ggml_free(codec.ctx_perm);
+            codec.ctx_perm = nullptr;
+        }
+        if (codec.buf_conv32) {
+            ggml_backend_buffer_free(codec.buf_conv32);
+            codec.buf_conv32 = nullptr;
+        }
+        if (codec.ctx_conv32) {
+            ggml_free(codec.ctx_conv32);
+            codec.ctx_conv32 = nullptr;
+        }
+        if (codec.buf_w) {
+            core_gguf::release_weight_buffer(codec.buf_w);
+            codec.buf_w = nullptr;
+        }
+        if (codec.ctx_w) {
+            ggml_free(codec.ctx_w);
+            codec.ctx_w = nullptr;
+        }
+        codec.loaded = false;
+    }
     auto& hp = codec.hp;
 
     // Pass 1: read hyperparameters
@@ -6242,6 +6269,9 @@ extern "C" int qwen3_tts_set_codec_path(struct qwen3_tts_context* ctx, const cha
     if (!ctx || !path) {
         return -1;
     }
+    if (ctx->codec.loaded && ctx->codec_path == path) {
+        return 0; // Already loaded same codec, avoid redundant reload and leaks
+    }
     ctx->codec_path = path;
     if (!load_codec(ctx, path)) {
         return -1;
@@ -6253,8 +6283,14 @@ extern "C" int qwen3_tts_set_voice_prompt(struct qwen3_tts_context* ctx, const c
     if (!ctx) {
         return -1;
     }
-    ctx->voice_prompt_path = wav_path ? wav_path : "";
-    if (!wav_path || !*wav_path) {
+    const std::string new_wav = wav_path ? wav_path : "";
+    if (!new_wav.empty() && ctx->voice_prompt_path == new_wav &&
+        !ctx->runtime_spk_emb.empty() &&
+        (!ctx->cenc.loaded || !ctx->runtime_ref_codes.empty())) {
+        return 0; // Already loaded and identical voice prompt
+    }
+    ctx->voice_prompt_path = new_wav;
+    if (new_wav.empty()) {
         return 0;
     }
     if (!ctx->spk_enc.loaded) {
@@ -6400,10 +6436,16 @@ extern "C" int qwen3_tts_set_voice_prompt_with_text(struct qwen3_tts_context* ct
     if (!ctx) {
         return -1;
     }
-    ctx->xvec_only = false;
-    if (ref_text) {
-        ctx->runtime_ref_text = ref_text;
+    const std::string new_wav = wav_path ? wav_path : "";
+    const std::string new_ref = ref_text ? ref_text : "";
+    if (!new_wav.empty() && !ctx->xvec_only && ctx->voice_prompt_path == new_wav &&
+        ctx->runtime_ref_text == new_ref &&
+        !ctx->runtime_spk_emb.empty() &&
+        (!ctx->cenc.loaded || !ctx->runtime_ref_codes.empty())) {
+        return 0; // Already loaded and identical voice prompt
     }
+    ctx->xvec_only = false;
+    ctx->runtime_ref_text = new_ref;
     return qwen3_tts_set_voice_prompt(ctx, wav_path);
 }
 
