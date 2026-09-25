@@ -1,5 +1,112 @@
 # Changelog
 
+## 0.8.37
+
+* **Phrase scoring:** `CrispasrSession.scoreTexts(pcm, texts, language:,
+  prompt:)` returns log P(text | audio) and a token count for each candidate
+  (whisper sessions), for picking the likeliest of a known set of phrases.
+  All candidates are decoded in one batch.
+* **Strict grammars:** `setGrammarStrict(true)` forbids end-of-text until the
+  grammar can be complete, so a constrained decode no longer stops
+  mid-phrase. Off by default.
+* **New in the bundled native library:** Raon-Speech-9B speech-to-text,
+  parakeet-ultra / parakeet-redux, and Nemotron-3-Diarization
+  (`sortformer`) with streaming presets.
+* **TTS:** letters followed by digits ("d4", "B52") keep their number in
+  every language; German reads a lone letter by its name.
+
+## 0.8.36
+
+* **New ASR backends in the bundled native library:** Dolphin CN-Dialect
+  (`dolphin`; Mandarin plus Chinese dialects, a two-level
+  `sourceLanguage` such as `zh-SICHUAN`), X-ASR zh-en (`xasr`; streaming
+  Zipformer2 transducer), Hojo-ASR-Multi-V1 (`hojo-asr`), and registry
+  entries for Orukeet and Confucius4-R2T2.
+* **Piano transcription** gains Onsets & Frames and hFT-Transformer
+  (`onsets-and-frames`, `hft-transformer`), both auto-downloading and
+  reachable through the existing piano-notes accessors.
+* **Front-end fixes** in the native library change transcripts for Kaldi-fbank
+  models (FireRedASR, SenseVoice, Paraformer and relatives), whose mel
+  triangles are now built in mel space as the reference does.
+* **Session TTS:** three defects fixed that only the session ABI (and so this
+  package) could hit; see the v0.8.36 release notes for details.
+
+## 0.8.35
+
+* **`pianoNotesWithPrograms()`** reports the General MIDI program of each
+  transcribed note — which instrument played it. `0`-`127` is a GM program,
+  `128` is percussion, and `-1` means the model does not identify an
+  instrument. Only MT3 fills it in; `piano-transcription` and `basic-pitch`
+  report `-1` throughout, and so does any native library predating the
+  export, so callers read the sentinel rather than probing for the symbol.
+  MT3's multi-instrument transcription was previously flattened to a single
+  part before any caller could see it.
+* **Basic Pitch convolutions gain SIMD and threading** in the native library:
+  3.59x on x86-64 and 2.67x on Apple Silicon at four threads, byte-identical
+  output, on by default with `CRISPASR_BASIC_PITCH_FASTCONV=0` as the way
+  back.
+* Fixes two build-guard defects around the piano accessors: note storage
+  accidentally required CREPE to be compiled in, and
+  `crispasr_session_piano_notes` was guarded more narrowly than
+  `crispasr_session_piano_n_notes`, so a build with MT3 or basic-pitch but
+  without piano-transcription reported a note count and returned `nullptr`.
+
+## 0.8.34
+
+* **Breeze-TTS-2 (`bt2-tts`)** adds plain synthesis, voice cloning, and voice
+  design. Its GGUFs retain the upstream non-commercial licence.
+* **Linux CUDA 12 and CUDA 13 CLI packages return** after v0.8.33's release
+  jobs failed to link their dynamically loaded ggml backends (#442).
+* **Parakeet long audio is bounded at the encoder allocation itself** and uses
+  cgroup-aware available memory, preventing the intermittent 123.6 GB request
+  and NULL dereference reported on a 47.5-minute input (#441).
+* **Sidon splits oversized recordings by default** instead of asking users to
+  do it manually, while inputs that fit keep the same single-pass path (#431).
+* M2M100/WMT21 translation now uses each checkpoint's beam-5, 200-token decode
+  defaults in both CLI and library sessions, avoiding repetition collapse
+  (#439). Zonos rejects unsupported voice cloning and switches per-request
+  languages reliably (#435).
+
+## 0.8.33
+
+* **Two new TTS backends**: Supertonic-3 (`--backend supertonic`, 44.1 kHz
+  non-autoregressive flow matching, 10 voices, OpenRAIL-M) and FireRedTTS3
+  (`--backend fireredtts3`, zero-shot voice cloning, Apache-2.0) — closing the
+  last model in #377.
+* **Sidon accepts long audio** (#431). The input cap now derives from a memory
+  budget instead of a hardcoded frame count, and `CRISPASR_SIDON_SPLIT=1`
+  restores very long files as N exact passes cut at energy minima.
+* **Zonos no longer emits noise for non-Latin scripts** (#435). A missing
+  phonemizer now refuses loudly instead of synthesising a near-empty prompt,
+  and the per-request language is honoured.
+* **New API**: `set_voice_samples()` (#432), `backend_caps()` /
+  `list_backends_with_caps()` and `detect_backends()` (#433) — the last names
+  every backend that can open a given file, not just one.
+* **Built-in G2P replaces espeak-ng for en/de/fr** in zonos, removing that
+  GPL-3.0 dependency for those languages.
+* Fixes: supertonic q4_k was unloadable; a shared CAM++ pooling defect affecting
+  five backends; `voxcpm2-vae` reachable by `-m auto`.
+
+## 0.8.32
+
+* **Four new backends**: Raon-OpenTTS speech synthesis, Quds Persian
+  recognition, and MT3 / Basic Pitch on the music surface, with Standard MIDI
+  output (#250, #387). mel-band-roformer, already present on CPU, gains a
+  fused GPU graph (#422).
+* **Source separation runs on the GPU by default** where one is present —
+  HTDemucs and the new fused mel-band-roformer graph (#413, #414, #422).
+* **Nemotron `-l auto` no longer conditions on English regardless of the
+  detected language**, and reads its 121-entry language table from the model,
+  reaching 51 languages that were previously unnameable (#425).
+* Subtitle output returns the original script instead of transliterated text,
+  and Canary reports wrong-language conditioning instead of failing silently
+  (#419).
+* Live/streaming WebM decodes past the first 100 ms timeslice (#417), and a
+  malformed sample rate can no longer amplify a small file into a
+  multi-gigabyte allocation.
+* Kokoro honours `--tts-speed` (#423); FunASR, piano transcription, the
+  Bananamind vocoder and Sidon all get bit-identical speedups (#305, #416).
+
 ## 0.8.31
 
 * **Pocket-TTS** now supports German, Spanish, Italian, Portuguese, and French

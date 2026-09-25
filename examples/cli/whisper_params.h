@@ -36,6 +36,7 @@ struct whisper_params {
     float logprob_thold = -1.00f;
     float no_speech_thold = 0.6f;
     float grammar_penalty = 100.0f;
+    bool grammar_strict = false;
     float temperature = 0.0f;
     float temperature_inc = 0.2f;
     uint64_t seed = 0; // RNG seed for sampling (0 = non-deterministic)
@@ -324,6 +325,25 @@ struct whisper_params {
     bool diarize_embedder_is_foxnose() const {
         return diarize_method == "foxnose" || diarize_method == "foxnose-diarize";
     }
+    // #466: NVIDIA Nemotron-3-Diarization (streaming Sortformer). Like foxnose
+    // it diarizes in one global pass (speakers are numbered by first arrival,
+    // so per-slice runs would renumber them). Model from --diarize-model.
+    bool diarize_is_sortformer() const {
+        return diarize_method == "sortformer" || diarize_method == "nemotron3-diar" || diarize_method == "nemotron3";
+    }
+    // Methods that label speakers in one pass over the whole recording.
+    bool diarize_is_global_method() const { return diarize_embedder_is_foxnose() || diarize_is_sortformer(); }
+    // The legacy whisper path labels speakers in a post-step after decoding
+    // (crispasr_apply_diarize). Only the stereo methods can be estimated live
+    // in the per-segment print callback; for every other method the live line
+    // would carry whisper's stereo-energy guess, "(speaker ?)" on mono input.
+    bool diarize_labels_after_decode() const {
+        return diarize && !diarize_method.empty() && diarize_method != "energy" && diarize_method != "xcorr";
+    }
+    // GGUF for --diarize-method sortformer ("auto" / empty: NVIDIA's q8_0 GGUF).
+    std::string diarize_model;
+    // #466: sortformer chunk schedule, "offline" (default) or a streaming preset.
+    std::string sortformer_mode;
     bool stream = false;
     bool mic = false;
     bool stream_continuous = false;
@@ -652,7 +672,13 @@ struct whisper_params {
     //     / `-trtl` flags only matter when the primary backend's
     //     `-sl`/`-tl` mean something else (e.g., 2-stage piping).
     std::string text_input;
-    int translate_max_tokens = 256;
+    // 0 = let the backend apply its own documented default (#439). Both
+    // translate runtimes already default to 200 when passed <= 0, matching
+    // m2m100/wmt21's config.json max_length; madlad declares none and 200 is
+    // the runtime's own figure. This was 256 — a number from nowhere that
+    // SILENTLY OVERRODE both, because `translate_max_tokens > 0` is true for
+    // the default, so every "fall back to the backend" branch was dead code.
+    int translate_max_tokens = 0;
     std::string translate_source_lang; // overrides source_lang for the translator stage
     std::string translate_target_lang; // overrides target_lang for the translator stage
 

@@ -340,6 +340,106 @@ impl Session {
             .collect()
     }
 
+    /// What can this backend actually *do*? (#433)
+    ///
+    /// [`detect_backend`](Self::detect_backend) returns a name and nothing
+    /// else, but several backends serve more than one purpose — `lfm2-audio`
+    /// and `mini-omni2` are both `tts` **and** `s2s`, and `gemma4-e2b` does
+    /// recognition and translation. Pair the two calls to answer "what can I do
+    /// with this file?".
+    ///
+    /// Returns the capability names, e.g. `["auto-download", "tts", "s2s"]`.
+    /// An unknown backend is an error rather than an empty list, because a
+    /// backend that genuinely declares no capabilities is a different answer.
+    pub fn backend_caps(backend: &str) -> Result<Vec<String>, String> {
+        let name = CString::new(backend).map_err(|e| format!("invalid backend: {e}"))?;
+        let mut buf = [0i8; 1024];
+        let n = unsafe {
+            crispasr_sys::crispasr_backend_caps_abi(name.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
+        };
+        if n == -3 {
+            return Err(format!("unknown backend '{backend}'"));
+        }
+        if n < 0 {
+            return Err(format!("backend_caps failed (code {n})"));
+        }
+        let s = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+        Ok(s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect())
+    }
+
+    /// Every backend paired with its verbs (#433).
+    ///
+    /// The "available backend list containing verb info" the issue asked for —
+    /// without shelling out to `crispasr --list-backends-json` and parsing
+    /// stdout, which was previously the only way to reach this data.
+    pub fn list_backends_with_caps() -> Result<Vec<(String, Vec<String>)>, String> {
+        // Ask once with an empty buffer: a negative return is the required size,
+        // so the buffer is never guessed and never silently truncated.
+        let need = unsafe { crispasr_sys::crispasr_backend_caps_list_abi(std::ptr::null_mut(), 0) };
+        let cap = if need < 0 { (-need) as usize } else { 65536 };
+        let mut buf = vec![0i8; cap.max(1024)];
+        let n = unsafe {
+            crispasr_sys::crispasr_backend_caps_list_abi(buf.as_mut_ptr(), buf.len() as i32)
+        };
+        if n < 0 {
+            return Err(format!("list_backends_with_caps failed (code {n})"));
+        }
+        let s = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+        Ok(s.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let mut it = l.splitn(2, '\t');
+                let name = it.next().unwrap_or("").to_string();
+                let caps = it
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|x| !x.is_empty())
+                    .map(|x| x.to_string())
+                    .collect();
+                (name, caps)
+            })
+            .collect())
+    }
+
+    /// Every backend that can open this GGUF, primary first (#433).
+    ///
+    /// [`detect_backend`](Self::detect_backend) is 1:1 — one architecture
+    /// string, one backend — and that is not always the whole truth. A voxcpm2
+    /// GGUF opens both as `voxcpm2-tts` (the full TTS pipeline) and as
+    /// `voxcpm2-vae` (the standalone causal VAE upscaler): the VAE entry point
+    /// calls the same loader with `vae_only`, and there is no separate VAE
+    /// model to download. Before this, a caller had no way to discover the
+    /// second name.
+    ///
+    /// The relation is DECLARED, not inferred: nothing in a GGUF says "another
+    /// backend can also read this", so it is a recorded fact about the runtimes
+    /// (`core_arch::alternates`).
+    ///
+    /// An unknown architecture is an `Err`, matching `detect_backend` — an
+    /// empty list would not distinguish "not recognised" from "recognised, no
+    /// alternates".
+    pub fn detect_backends(model_path: &str) -> Result<Vec<String>, String> {
+        let path = CString::new(model_path).map_err(|e| format!("invalid path: {e}"))?;
+        // Sized for the longest plausible list; the ABI returns -5 rather than
+        // truncating, so a too-small buffer can never under-report.
+        let mut buf = [0i8; 512];
+        let n = unsafe {
+            crispasr_sys::crispasr_detect_backends_from_gguf(
+                path.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            )
+        };
+        if n <= 0 {
+            return Err(format!("backend detection failed (code {n})"));
+        }
+        let s = unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok(s.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect())
+    }
+
     /// Detect the backend from a GGUF file without opening it.
     pub fn detect_backend(model_path: &str) -> Result<String, String> {
         let path = CString::new(model_path).map_err(|e| format!("invalid path: {e}"))?;
@@ -853,6 +953,53 @@ impl Session {
         };
         if rc != 0 {
             return Err(format!("set_voice failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set the reference voice from samples you already hold (#432).
+    ///
+    /// [`set_voice`](Self::set_voice) takes a path, which forces a temp file
+    /// whenever the reference is a *segment* of a WAV you have already decoded.
+    /// This takes the buffer directly.
+    ///
+    /// `pcm` is mono float32 at `sample_rate`. `ref_text` follows the same rule
+    /// as `set_voice`: backends that clone from raw audio need the reference
+    /// transcript.
+    ///
+    /// The library still serialises to a temp WAV internally and routes through
+    /// the same code path as `set_voice`, so consent handling and AI-Act
+    /// marking are identical for both — a clone does not get a different audit
+    /// trail for arriving as a buffer. That write is an implementation detail
+    /// and can be removed per-backend later without changing this signature.
+    pub fn set_voice_samples(
+        &self,
+        pcm: &[f32],
+        sample_rate: i32,
+        ref_text: Option<&str>,
+    ) -> Result<(), String> {
+        if pcm.is_empty() {
+            return Err("set_voice_samples: empty sample buffer".to_string());
+        }
+        if sample_rate <= 0 {
+            return Err(format!("set_voice_samples: invalid sample_rate {sample_rate}"));
+        }
+        let crt = match ref_text {
+            Some(t) => Some(CString::new(t).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        let rt_ptr = crt.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_voice_samples(
+                self.handle,
+                pcm.as_ptr(),
+                pcm.len() as i32,
+                sample_rate,
+                rt_ptr,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("set_voice_samples failed (rc={rc})"));
         }
         Ok(())
     }
@@ -2673,6 +2820,11 @@ pub enum DiarizeMethod {
     /// it derives speaker turns from the audio and attributes each caller
     /// segment to the turn it overlaps most.
     FoxNose = 4,
+    /// Mono-friendly, ML-based (#466): NVIDIA Nemotron-3-Diarization
+    /// (streaming Sortformer v3). The GGUF path goes in
+    /// [`DiarizeOptions::pyannote_model_path`]. Derives speaker turns like
+    /// [`DiarizeMethod::FoxNose`].
+    Sortformer = 5,
 }
 
 /// Construct via [`Default`] and set fields as needed — the struct grows
@@ -2718,8 +2870,9 @@ impl Default for DiarizeOptions {
 /// A speaker turn the diarizer derived from the AUDIO, independent of the
 /// caller's segment grid (#395).
 ///
-/// Only [`DiarizeMethod::FoxNose`] produces these; the other methods label
-/// the caller's segments directly and yield none. `t0` / `t1` are seconds on
+/// Only [`DiarizeMethod::FoxNose`] and [`DiarizeMethod::Sortformer`] produce
+/// these; the other methods label the caller's segments directly and yield
+/// none. `t0` / `t1` are seconds on
 /// the same absolute timeline as [`DiarizeSegment`] (i.e.
 /// [`DiarizeOptions::slice_t0`] is already accounted for), so a turn and a
 /// segment compare directly. `speaker` is dense and zero-based — a turn is
@@ -2763,8 +2916,8 @@ pub fn diarize_segments(
 /// The turns are what let a caller resolve a speaker change INSIDE one of its
 /// own segments — split a merged run wherever the turn id changes, instead of
 /// accepting the majority label for the whole span. Only
-/// [`DiarizeMethod::FoxNose`] derives turns; every other method returns an
-/// empty `Vec`, which is not an error.
+/// [`DiarizeMethod::FoxNose`] and [`DiarizeMethod::Sortformer`] derive turns;
+/// every other method returns an empty `Vec`, which is not an error.
 ///
 /// The segments are labelled exactly as [`diarize_segments`] would label
 /// them; asking for turns changes nothing about the labels.
@@ -2791,7 +2944,7 @@ fn diarize_inner(
     }
 
     let path_c = match (&opts.pyannote_model_path, opts.method) {
-        (Some(p), DiarizeMethod::Pyannote) => Some(
+        (Some(p), DiarizeMethod::Pyannote | DiarizeMethod::Sortformer) => Some(
             CString::new(p.as_str())
                 .map_err(|e| format!("pyannote_model_path contains NUL: {e}"))?,
         ),
@@ -3139,10 +3292,11 @@ impl Drop for PyannoteCache {
 unsafe impl Send for PyannoteCache {}
 
 // =========================================================================
-// FireRedPunc — punctuation restoration post-processor
+// Punctuation restoration post-processor
 // =========================================================================
 
-/// BERT-based punctuation restoration model (FireRedPunc).
+/// Punctuation restoration model: FireRedPunc, fullstop-punc,
+/// punctuate-all or PCS (see [`PuncModel::open`]).
 ///
 /// Adds punctuation and capitalization to unpunctuated ASR output.
 /// Particularly useful for CTC-based backends (wav2vec2, omniasr,
@@ -3151,7 +3305,7 @@ unsafe impl Send for PyannoteCache {}
 /// ```no_run
 /// use crispasr::PuncModel;
 ///
-/// let punc = PuncModel::open("fireredpunc-q8_0.gguf").unwrap();
+/// let punc = PuncModel::open("fullstop").unwrap(); // or "pcs", or a .gguf path
 /// let text = punc.process("and so my fellow americans ask not");
 /// println!("{text}"); // "And so my fellow americans, ask not..."
 /// ```
@@ -3162,8 +3316,14 @@ pub struct PuncModel {
 unsafe impl Send for PuncModel {}
 
 impl PuncModel {
-    /// Load a FireRedPunc GGUF model.
-    pub fn open(model_path: &str) -> Result<Self, String> {
+    /// Load a punctuation model. `model` is what `--punc-model` accepts: an
+    /// alias (`auto`, `firered`, `fullstop`, `punctuate-all`, `pcs`;
+    /// downloaded on first use) or a `.gguf` path of either family -
+    /// FireRedPunc / fullstop-punc / punctuate-all, or PCS (punctuation +
+    /// capitalisation + segmentation). The loader follows the GGUF's
+    /// architecture; a GGUF that is not a punctuation model is an `Err`.
+    pub fn open(model: &str) -> Result<Self, String> {
+        let model_path = model;
         let c_path = CString::new(model_path).map_err(|e| e.to_string())?;
         let handle = unsafe { crispasr_sys::crispasr_punc_init(c_path.as_ptr()) };
         if handle.is_null() {

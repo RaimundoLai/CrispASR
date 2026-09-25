@@ -14,7 +14,9 @@
 
 #include "parakeet.h"
 #include "core/crispasr_env.h"
+#include "core/sys_mem.h"
 #include "parakeet_ja_detect.h"
+#include "parakeet_memory_policy.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -24,6 +26,9 @@
 #include "ggml-backend.h"
 #include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -897,6 +902,29 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
         return {};
     }
 
+    // #441: enforce the physical-memory invariant at the allocation boundary,
+    // independently of every CLI/session routing decision. If an explicit
+    // chunk flag is ever lost again, or a direct library caller invokes the
+    // single-pass API on a multi-hour buffer, the full-attention graph is
+    // refused before ggml asks the OS for it. Normal orchestration selects
+    // streamed windows before reaching this last line of defence.
+    const int sub = std::max(1, (int)ctx->model.hparams.subsampling_factor);
+    const int T_est = std::max(1, T_mel / sub);
+    const int H = std::max(1, (int)ctx->model.hparams.n_heads);
+    double coeff = 8.0;
+    if (const char* e = getenv("CRISPASR_PARAKEET_MEM_COEFF"))
+        coeff = atof(e);
+    double available = core_sys_mem::available_mb();
+    if (const char* e = getenv("CRISPASR_PARAKEET_AVAILABLE_MB"))
+        available = atof(e); // deterministic CI/live-test override
+    if (!parakeet_encoder_fits_available_memory(T_est, H, available, coeff)) {
+        fprintf(stderr,
+                "crispasr[parakeet]: refusing encoder graph: est %.0f MiB exceeds safe share of %.0f MiB "
+                "available (T=%d, H=%d); use streamed/chunked orchestration\n",
+                parakeet_est_singlepass_peak_mb(T_est, H, coeff), available, T_est, H);
+        return {};
+    }
+
     if (!ctx->sched) {
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
@@ -1069,6 +1097,8 @@ static void lstm_init_state(parakeet_lstm_state& s, int H) {
 
 // Read an F16/F32 ggml tensor into a flat F32 std::vector for CPU stepping.
 static std::vector<float> tensor_to_f32(ggml_tensor* t) {
+    if (!t)
+        return {}; // single-LSTM predictors (#387) have no layer-1 tensors
     const size_t n = ggml_nelements(t);
     std::vector<float> out(n);
     if (t->type == GGML_TYPE_F32) {
@@ -1152,7 +1182,12 @@ static void predictor_step(const parakeet_predictor_weights& W, int token_id, pa
                     state.c0.data(), h0_new.data(), H, H);
     state.h0 = h0_new;
 
-    // Layer 1 — input is layer 0's hidden
+    // Layer 1 — input is layer 0's hidden. Single-LSTM predictors (#387:
+    // quds-fa, and parakeet-tdt_ctc-110m's RNNT head) stop at layer 0.
+    if (W.w_ih_1.empty()) {
+        pred_out = state.h0;
+        return;
+    }
     std::vector<float> h1_new(H);
     lstm_step_layer(state.h0.data(), W.w_ih_1.data(), W.b_ih_1.data(), W.w_hh_1.data(), W.b_hh_1.data(),
                     state.h1.data(), state.c1.data(), h1_new.data(), H, H);
@@ -1383,6 +1418,30 @@ static bool parakeet_ggml_decode_active(const parakeet_context* ctx) {
     return ggml_dec;
 }
 
+// Issue #81 measured the TDT decoder at 66% of Q4 wall time on a P100. Its
+// first operation was still the T*640*1024 encoder projection in a scalar CPU
+// loop on non-Apple builds. The Q4 P100 A/B cut varied-audio TDT wall time from
+// 2.56 s to 1.15 s with an identical 301-word transcript, so use the backend
+// projection by default on the measured CUDA path. Other GPU backends remain
+// opt-in until they have the same transcript and timing evidence; `=0` retains
+// the measured scalar fallback everywhere.
+static bool parakeet_gpu_encoder_projection(const parakeet_context* ctx) {
+    if (const char* e = crispasr_env::get("CRISPASR_RNNT_GPU_ENC_PROJ"))
+        return *e == '1';
+#if defined(GGML_USE_CUDA)
+    // ggml_backend_is_cuda() is a CUDA-MODULE symbol: linking it into
+    // libcrispasr.so fails with "undefined reference" in the release CUDA
+    // build. Test the backend NAME instead, which is core ggml and is what
+    // granite_speech, dots_tts and omnivoice already do. ROCm is included
+    // for the same reason granite_speech includes it.
+    const char* be_name = ctx->backend ? ggml_backend_name(ctx->backend) : nullptr;
+    return be_name && (std::strstr(be_name, "CUDA") || std::strstr(be_name, "ROCm"));
+#else
+    (void)ctx;
+    return false;
+#endif
+}
+
 extern "C" int parakeet_decode_uses_backend(struct parakeet_context* ctx) {
     return (ctx && parakeet_ggml_decode_active(ctx)) ? 1 : 0;
 }
@@ -1487,8 +1546,14 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     // Replaces T_enc individual sgemv calls inside the decode loop with
     // a single bulk computation. On macOS uses batched sgemm; on Linux
     // falls back to per-frame sgemv (still benefits from locality).
-    std::vector<float> all_proj_e((size_t)T_enc * J.joint_hidden);
-    {
+    std::vector<float> all_proj_e;
+    const auto _proj_t0 = std::chrono::steady_clock::now();
+    const bool gpu_enc_proj =
+        ggml_dec && parakeet_gpu_encoder_projection(ctx) &&
+        core_rnnt_ggml::decoder_project_encoder(gdec, ctx->model.joint.enc_w, ctx->model.joint.enc_b, enc, T_enc,
+                                                d_model, all_proj_e);
+    if (!gpu_enc_proj) {
+        all_proj_e.resize((size_t)T_enc * J.joint_hidden);
         for (int t = 0; t < T_enc; t++) {
             float* dst = all_proj_e.data() + (size_t)t * J.joint_hidden;
             std::copy(J.enc_b.begin(), J.enc_b.end(), dst);
@@ -1513,6 +1578,7 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
         }
 #endif
     }
+    const auto _proj_t1 = std::chrono::steady_clock::now();
 
     // Sampling state — only touched when ctx->decode_temperature > 0.
     // We initialize unconditionally because seeding a mt19937_64 is
@@ -1696,9 +1762,10 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
 
     if (time_dec) {
         auto _dt1 = std::chrono::steady_clock::now();
-        fprintf(stderr, "parakeet: tdt_decode %.1f ms (%s, T_enc=%d, %zu tokens)\n",
+        fprintf(stderr, "parakeet: tdt_decode %.1f ms (%s, T_enc=%d, %zu tokens, enc_proj=%.1f ms %s)\n",
                 std::chrono::duration<double, std::milli>(_dt1 - _dt0).count(), ggml_dec ? "ggml" : "cblas", T_enc,
-                emitted.size());
+                emitted.size(), std::chrono::duration<double, std::milli>(_proj_t1 - _proj_t0).count(),
+                gpu_enc_proj ? "backend" : "cpu");
     }
     return emitted;
 }
@@ -2914,8 +2981,10 @@ extern "C" struct parakeet_context* parakeet_init_from_file(const char* path_mod
     }
 
     // Hybrid TDT+CTC models with a single-LSTM predictor (parakeet-tdt_ctc-110m
-    // has pred_layers=1) can only decode via the CTC head — TDT decode requires
-    // a 2-layer LSTM. Default to CTC so the model just works out of the box.
+    // has pred_layers=1) default to the CTC head — historically the RNNT
+    // decode required 2 LSTM layers. Since #387 (quds-fa: single-LSTM RNNT
+    // with NO CTC head) both decode paths handle pred_layers=1, so this is a
+    // preference for hybrids, not a requirement.
     if (ctx->model.hparams.pred_layers < 2 && ctx->model.has_ctc) {
         ctx->decode_ctc = true;
         fprintf(stderr, "parakeet: single-LSTM predictor + CTC head detected → defaulting to CTC decode\n");
@@ -3157,7 +3226,10 @@ static ggml_cgraph* parakeet_build_graph_encoder_dump(parakeet_context* ctx, int
         cur = tag; // chain next layer off the tagged tensor (numerics fix)
     }
 
-    ggml_set_name(cur, "enc_out");
+    // Do NOT rename cur here: after the loop it IS the dump_layer_{n-1} tag.
+    // Naming it "enc_out" deleted that tag from the graph, so the last layer's
+    // dump was never read and crispasr-diff compared the reference against an
+    // untouched zero buffer, which scored PASS (#445).
     ggml_build_forward_expand(gf, cur);
     ggml_free(ctx0);
     return gf;
@@ -3474,6 +3546,10 @@ extern "C" float* parakeet_encode(struct parakeet_context* ctx, const float* sam
         fprintf(stderr, "parakeet: encoder OK (%d frames)\n", T_enc);
     const int d = (int)ctx->model.hparams.d_model;
     float* out = (float*)malloc(enc.size() * sizeof(float));
+    if (!out) {
+        fprintf(stderr, "parakeet: failed to allocate %zu-byte encoder output\n", enc.size() * sizeof(float));
+        return nullptr;
+    }
     memcpy(out, enc.data(), enc.size() * sizeof(float));
     if (out_T_enc)
         *out_T_enc = T_enc;
@@ -3486,7 +3562,7 @@ extern "C" float* parakeet_encode(struct parakeet_context* ctx, const float* sam
 // (single-pass) and parakeet_decode_frames (streamed / chunked) so every path
 // emits a word list — previously decode_frames left r->words null and the CLI
 // adapter only *copies* r->words, so streamed/chunked output had no words.
-static void parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
+static bool parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
     // ----- Group sub-word tokens into words -----
     //
     // Latin SentencePiece convention: a token starting with U+2581 (▁ → ' ')
@@ -3614,8 +3690,14 @@ static void parakeet_group_words(parakeet_result* r, int frame_dur_cs) {
 
     r->n_words = (int)words.size();
     r->words = (parakeet_word_data*)calloc(r->n_words > 0 ? r->n_words : 1, sizeof(parakeet_word_data));
+    if (!r->words) {
+        fprintf(stderr, "parakeet: failed to allocate word results\n");
+        r->n_words = 0;
+        return false;
+    }
     for (int i = 0; i < r->n_words; i++)
         r->words[i] = words[i];
+    return true;
 }
 
 extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_context* ctx, const float* enc_frames,
@@ -3652,8 +3734,14 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
 
     // Build result (same as the tail of parakeet_transcribe_ex)
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
+    if (!r)
+        return nullptr;
     r->n_tokens = (int)emitted.size();
     r->tokens = (parakeet_token_data*)calloc(r->n_tokens > 0 ? r->n_tokens : 1, sizeof(parakeet_token_data));
+    if (!r->tokens) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
     std::string text;
     const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
     for (int i = 0; i < r->n_tokens; i++) {
@@ -3674,10 +3762,17 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
     if (!text.empty() && text[0] == ' ')
         text = text.substr(1);
     r->text = strdup(text.c_str());
+    if (!r->text) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
 
     // Word grouping (issue #257): the streamed / chunked paths funnel through
     // here, so build words too — otherwise those paths emit none.
-    parakeet_group_words(r, frame_dur_cs);
+    if (!parakeet_group_words(r, frame_dur_cs)) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
 
     return r;
 }
@@ -3814,8 +3909,14 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
 
     // 3. Build result (reuse the same result-building code as transcribe_ex)
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
+    if (!r)
+        return nullptr;
     r->n_tokens = (int)emitted.size();
     r->tokens = (parakeet_token_data*)calloc(r->n_tokens > 0 ? r->n_tokens : 1, sizeof(parakeet_token_data));
+    if (!r->tokens) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
     std::string text;
     const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
     for (int i = 0; i < r->n_tokens; i++) {
@@ -4079,8 +4180,15 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     if (!text.empty() && text[0] == ' ')
         text = text.substr(1);
     r->text = strdup(text.c_str());
+    if (!r->text) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
 
-    parakeet_group_words(r, frame_dur_cs);
+    if (!parakeet_group_words(r, frame_dur_cs)) {
+        parakeet_result_free(r);
+        return nullptr;
+    }
 
     return r;
 }

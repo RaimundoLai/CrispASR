@@ -146,13 +146,19 @@ add_library(crispasr-lib
             # and by the C-ABI `crispasr_align_words_abi`. Both canary-ctc
             # and qwen3-forced-aligner paths route through one call.
             crispasr_aligner.cpp
-            # Built-in G2P phonemizers (EN/DE/FR/ES) live in the kokoro
-            # target (phonemizer.cpp) — only kokoro calls them.
+            # Built-in G2P phonemizers (EN/DE/FR/ES/RU) live in crispasr-core
+            # (phonemizer.cpp), NOT here and no longer in kokoro — #435 needs
+            # them from zonos too, and any backend that links crispasr-core now
+            # reaches them without a new edge in the link graph.
             # HF download + filesystem cache (`crispasr_cache.cpp`) lives in
-            # crispasr-core, NOT here — kokoro's phonemizer.cpp calls
-            # crispasr_cache::ensure_cached_file (#316 CMUdict auto-download) and
-            # only links crispasr-core, so a static build (BUILD_SHARED_LIBS=OFF)
-            # left crispasr-diff's link unresolved when it lived here (#316 AUR).
+            # crispasr-core, NOT here — phonemizer.cpp calls
+            # crispasr_cache::ensure_cached_file (#316 CMUdict auto-download), and
+            # a static build (BUILD_SHARED_LIBS=OFF) links crispasr-lib BEFORE the
+            # backend libs, so the linker dropped crispasr_cache.o before
+            # phonemizer.o asked for it and crispasr-diff failed to link (#316 AUR).
+            # Both now sit in the SAME archive, which is stronger than the old
+            # arrangement: ld rescans a single archive to closure, so the
+            # phonemizer -> cache reference cannot be order-dependent at all.
             # Known-model registry lookup (backend → canonical GGUF URL).
             # CLI keeps the TTY prompting shim; the library does the
             # non-interactive resolve.
@@ -666,6 +672,43 @@ endif()
 # to find_package(BLAS) for OpenBLAS/MKL/Accelerate, which bundle the cblas
 # symbols. Sets BLAS_FOUND / BLAS_LIBRARIES for the caller. Pass QUIET to
 # suppress the "found" message. Header (cblas.h) discovery stays at call sites.
+#
+# #453: when that fallback lands on THREADED MKL (`libmkl_intel_thread`, what
+# find_package(BLAS) returns on a host that merely has Debian's MKL installed),
+# swap it for `libmkl_sequential` and drop `libiomp5`. The Intel threading
+# layer brings its own OpenMP runtime into a process that already carries
+# libgomp, and cblas_sgemm then returns its upper output columns multiplied by
+# the thread count (tests/test-mel-blas-parity.cpp). Every caller of this macro
+# uses sgemm for a small projection, so the sequential layer costs nothing
+# measurable. COHERE_MKL=ON is exempt: ggml's own BLAS backend then links the
+# threaded layer into the same process, and two MKL threading layers cannot
+# be mixed in one link.
+function(crispasr_mkl_sequential out_var)
+    set(_libs ${${out_var}})
+    set(_swapped OFF)
+    set(_result "")
+    foreach(_lib IN LISTS _libs)
+        if(_lib MATCHES "mkl_intel_thread")
+            string(REPLACE "mkl_intel_thread" "mkl_sequential" _seq "${_lib}")
+            if(NOT EXISTS "${_seq}")
+                message(WARNING "BLAS resolved to threaded MKL (${_lib}) but ${_seq} is missing; "
+                                "the mel projection may be wrong (#453) — run ctest -R mel-blas-parity")
+                return()
+            endif()
+            list(APPEND _result "${_seq}")
+            set(_swapped ON)
+        elseif(_lib MATCHES "iomp5")
+            # The Intel OpenMP runtime is only needed by the threaded layer.
+        else()
+            list(APPEND _result "${_lib}")
+        endif()
+    endforeach()
+    if(_swapped)
+        message(STATUS "BLAS: threaded MKL replaced by mkl_sequential (#453: two OpenMP runtimes corrupt sgemm)")
+        set(${out_var} "${_result}" PARENT_SCOPE)
+    endif()
+endfunction()
+
 macro(crispasr_prefer_cblas)
     find_package(CBLAS ${ARGN})
     if(CBLAS_FOUND)
@@ -673,6 +716,9 @@ macro(crispasr_prefer_cblas)
         set(BLAS_LIBRARIES ${CBLAS_LIBRARIES})
     else()
         find_package(BLAS ${ARGN})
+    endif()
+    if(BLAS_FOUND AND NOT COHERE_MKL)
+        crispasr_mkl_sequential(BLAS_LIBRARIES)
     endif()
 endmacro()
 
@@ -697,7 +743,21 @@ else()
     # so this find_package(BLAS) call is steered toward MKL automatically.
     # cohere.cpp also does a bare `#include <cblas.h>` under HAVE_BLAS — gate on
     # the header being reachable (see crispasr-core note above re: MSYS2).
-    crispasr_prefer_cblas()
+    #
+    # Without that explicit opt-in, prefer OpenBLAS for the same reason
+    # crispasr-core does (see the comment there): find_package(BLAS) on a host
+    # that merely HAS Debian's MKL installed returns the threaded MKL, whose
+    # sgemm is silently wrong once libgomp is also in the process. COHERE_MKL=ON
+    # is a deliberate choice and still wins.
+    if(NOT COHERE_MKL)
+        find_library(COHERE_OPENBLAS NAMES openblas openblasp openblaso QUIET)
+    endif()
+    if(COHERE_OPENBLAS)
+        set(BLAS_FOUND ON)
+        set(BLAS_LIBRARIES ${COHERE_OPENBLAS})
+    else()
+        crispasr_prefer_cblas()
+    endif()
     find_path(CBLAS_INCLUDE_DIR cblas.h PATH_SUFFIXES openblas)
     if(BLAS_FOUND AND CBLAS_INCLUDE_DIR)
         target_link_libraries(cohere PUBLIC ${BLAS_LIBRARIES})
@@ -882,7 +942,30 @@ add_library(crispasr-core STATIC
             # find the symbol in the leaf lib, not the higher crispasr-lib (#316).
             crispasr_cache.h
             crispasr_cache.cpp
+            # Built-in G2P (EN/DE/FR/ES/RU) + the espeak-ng dlopen/popen fallbacks.
+            # MOVED HERE FROM kokoro (#435): zonos links only crispasr-core and
+            # needs a phonemizer whose licence is not GPL-3.0, and kokoro is not
+            # a dependency any other backend should acquire just to phonemise.
+            # The one special dependency — crispasr_cache::ensure_cached_file for
+            # the #316 dictionary auto-download — is the file directly above, so
+            # this move puts caller and callee in one archive and makes the
+            # #316 AUR static-link ordering failure unreachable rather than fixed.
+            phonemizer.h
+            phonemizer.cpp
             )
+# #316/#435: CRISPASR_BUILD gates phonemizer.cpp's `#include "crispasr_cache.h"`
+# and its CRISPASR_HAS_CACHE define — without it every G2P dictionary
+# auto-download in that file is dead code and English silently falls back to the
+# letter-to-sound rules ("this" -> θˈɪs).
+#
+# Scoped to the ONE SOURCE rather than to the target on purpose. CRISPASR_BUILD
+# is also the dllexport switch in include/crispasr*.h (`#ifdef CRISPASR_SHARED /
+# #ifdef CRISPASR_BUILD`), so defining it for all of crispasr-core would flip
+# every public declaration this target sees from dllimport to dllexport on a
+# Windows shared build. A source property is directory-scoped, so it also does
+# not leak into tests/CMakeLists.txt, where test-g2p-en deliberately compiles
+# phonemizer.cpp standalone WITHOUT the cache library.
+set_source_files_properties(phonemizer.cpp PROPERTIES COMPILE_DEFINITIONS CRISPASR_BUILD)
 target_include_directories(crispasr-core PUBLIC . ../include)
 if (WIN32)
     # crispasr_cache.cpp's HF auto-download uses WinHTTP. MSVC auto-links via
@@ -897,7 +980,11 @@ endif()
 # here as a private include path for this target only.
 target_include_directories(crispasr-core PRIVATE ../ggml/src)
 target_compile_features   (crispasr-core PUBLIC cxx_std_17)
-target_link_libraries     (crispasr-core PUBLIC ggml-base ggml)
+# ${CMAKE_DL_LIBS} for phonemizer.cpp's espeak_dlopen.h (dlopen/dlsym). It was
+# never listed while the file lived in kokoro because every executable happened
+# to pull -ldl in via crispasr-lib; crispasr-core is linked by targets that do
+# not (tests, crispasr-diff), so state the dependency where it is incurred.
+target_link_libraries     (crispasr-core PUBLIC ggml-base ggml ${CMAKE_DL_LIBS})
 # §176f: the STFT frame loop in core/mel.cpp is OpenMP-parallel (each frame's
 # FFT is independent → bit-identical output). Link OpenMP when available; the
 # pragma is #ifdef _OPENMP-guarded so non-OMP builds keep the serial path.
@@ -927,18 +1014,33 @@ if(CRISPASR_MEL_BLAS AND NOT MSVC)
         # OpenBLAS) cblas.h lives under an `openblas/` subdir not on the default
         # include path — so only enable HAVE_BLAS when cblas.h is actually
         # reachable, otherwise fall back to the scalar mel projection.
-        crispasr_prefer_cblas(QUIET)
+        #
+        # PREFER OPENBLAS EXPLICITLY, exactly as mel-band-roformer does below,
+        # and for a second reason on top of that one's "the Netlib reference
+        # cblas is a scalar loop": on a host carrying Debian's MKL,
+        # find_package(BLAS) returns `libmkl_intel_thread`, which lands in a
+        # process that already has libgomp. Two OpenMP runtimes in one process,
+        # and the resulting cblas_sgemm returns its upper output columns
+        # MULTIPLIED BY THE THREAD COUNT — ln(4) of log-domain error at four
+        # threads, ln(3) at three, lower columns correct, nothing raised. Every
+        # core_mel backend reads a mis-shaped spectrum and simply scores worse.
+        # tests/test-mel-blas-parity.cpp is the guard; this is the preference
+        # that keeps it green on hosts where OpenBLAS is also installed.
+        find_library(CRISPASR_CORE_OPENBLAS NAMES openblas openblasp openblaso QUIET)
         find_path(CBLAS_INCLUDE_DIR cblas.h PATH_SUFFIXES openblas)
-        if(BLAS_FOUND AND CBLAS_INCLUDE_DIR)
-            target_link_libraries     (crispasr-core PRIVATE ${BLAS_LIBRARIES})
+        if(CRISPASR_CORE_OPENBLAS AND CBLAS_INCLUDE_DIR)
+            target_link_libraries     (crispasr-core PRIVATE ${CRISPASR_CORE_OPENBLAS})
             target_include_directories(crispasr-core PRIVATE ${CBLAS_INCLUDE_DIR})
             target_compile_definitions(crispasr-core PRIVATE HAVE_BLAS)
+            message(STATUS "crispasr-core: linking OpenBLAS ${CRISPASR_CORE_OPENBLAS} for the mel projection")
         else()
-            find_library(OPENBLAS_LIB openblas QUIET)
-            if(OPENBLAS_LIB AND CBLAS_INCLUDE_DIR)
-                target_link_libraries     (crispasr-core PRIVATE ${OPENBLAS_LIB})
+            crispasr_prefer_cblas(QUIET)
+            if(BLAS_FOUND AND CBLAS_INCLUDE_DIR)
+                target_link_libraries     (crispasr-core PRIVATE ${BLAS_LIBRARIES})
                 target_include_directories(crispasr-core PRIVATE ${CBLAS_INCLUDE_DIR})
                 target_compile_definitions(crispasr-core PRIVATE HAVE_BLAS)
+                message(STATUS "crispasr-core: OpenBLAS not found; mel projection uses ${BLAS_LIBRARIES} "
+                               "— run ctest -R mel-blas-parity to confirm it is correct")
             else()
                 message(STATUS "crispasr-core: cblas.h not found — using scalar mel projection")
             endif()
@@ -1101,6 +1203,36 @@ if(APPLE)
     endif()
     target_link_libraries(gigaam PUBLIC ${ACCELERATE_LIB})
     target_compile_definitions(gigaam PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
+endif()
+
+# ---------------------------------------------------------------------------
+# Dolphin (DataoceanAI) — E-Branchformer + Transformer decoder + CTC (#436)
+# ---------------------------------------------------------------------------
+add_library(dolphin STATIC
+            dolphin.h
+            dolphin.cpp
+            )
+target_include_directories(dolphin PUBLIC . ../include)
+target_compile_features   (dolphin PUBLIC cxx_std_17)
+set_target_properties(dolphin PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (dolphin PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(dolphin PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# X-ASR — icefall streaming Zipformer2 transducer (#436)
+# ---------------------------------------------------------------------------
+add_library(xasr STATIC
+            xasr.h
+            xasr.cpp
+            )
+target_include_directories(xasr PUBLIC . ../include)
+target_compile_features   (xasr PUBLIC cxx_std_17)
+set_target_properties(xasr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (xasr PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(xasr PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1591,6 +1723,19 @@ if(GGML_CUDA)
 endif()
 
 # ---------------------------------------------------------------------------
+# hojo_asr — HojoAI/Hojo-ASR-Multi-V1 (Qwen3-Omni audio tower + WeNet Conformer
+# adapter + Qwen3-4B LLM). Shares the audio tower with moss_transcribe.
+# ---------------------------------------------------------------------------
+add_library(hojo_asr STATIC hojo_asr.h hojo_asr.cpp)
+set_target_properties(hojo_asr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(hojo_asr PUBLIC .)
+target_compile_features   (hojo_asr PUBLIC cxx_std_17)
+target_link_libraries     (hojo_asr PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if (NOT MSVC)
+    target_compile_options(hojo_asr PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # moss_transcribe — OpenMOSS-Team/MOSS-Transcribe-preview-2B (Qwen3-Omni audio encoder + Qwen3-1.7B LLM)
 # ---------------------------------------------------------------------------
 add_library(moss_transcribe STATIC moss_transcribe.h moss_transcribe.cpp)
@@ -1624,6 +1769,25 @@ target_compile_features   (qwen3_tts PUBLIC cxx_std_17)
 target_link_libraries     (qwen3_tts PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 if(NOT MSVC)
     target_compile_options(qwen3_tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# breeze_tts_2 — Breeze TTS 2 (#412). T5Gemma2 text encoder + Qwen3 backbone
+# + 12L depth decoder over 16 codebooks.
+#
+# Links qwen3_tts PUBLIC, and not for convenience: Breeze's bundled audio
+# tokenizer is bit-identical to Qwen3-TTS-Tokenizer-12Hz, so the codec is that
+# backend's, loaded from a companion GGUF. The weights this backend runs are
+# NON-COMMERCIAL (BreezeBlue Research and Non-Commercial License); the code is
+# a port of Apache-2.0 inference code and carries no such restriction.
+# ---------------------------------------------------------------------------
+add_library(breeze_tts_2 STATIC breeze_tts_2.h breeze_tts_2.cpp)
+set_target_properties(breeze_tts_2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(breeze_tts_2 PUBLIC .)
+target_compile_features   (breeze_tts_2 PUBLIC cxx_std_17)
+target_link_libraries     (breeze_tts_2 PUBLIC crispasr-core qwen3_tts ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(breeze_tts_2 PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1680,6 +1844,56 @@ target_compile_features   (piano-transcription PUBLIC cxx_std_17)
 target_link_libraries     (piano-transcription PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 if(NOT MSVC)
     target_compile_options(piano-transcription PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# onsets-and-frames — Onsets & Frames piano transcription (MIT, 26.5M params:
+# 107 MB F32 / 32 MB Q8_0 / 20 MB Q4_0)
+# ---------------------------------------------------------------------------
+add_library(onsets-and-frames STATIC onsets_and_frames.h onsets_and_frames.cpp)
+set_target_properties(onsets-and-frames PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(onsets-and-frames PUBLIC .)
+target_compile_features   (onsets-and-frames PUBLIC cxx_std_17)
+target_link_libraries     (onsets-and-frames PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(onsets-and-frames PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# hft-transformer — hFT-Transformer piano transcription (MIT, 5.5M params:
+# 22 MB F32 / 7 MB Q8_0 / 5 MB Q4_0)
+# ---------------------------------------------------------------------------
+add_library(hft-transformer STATIC hft_transformer.h hft_transformer.cpp)
+set_target_properties(hft-transformer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(hft-transformer PUBLIC .)
+target_compile_features   (hft-transformer PUBLIC cxx_std_17)
+target_link_libraries     (hft-transformer PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(hft-transformer PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# basic-pitch — Spotify Basic Pitch, polyphonic note events (Apache-2.0, ~110 KB F16)
+# ---------------------------------------------------------------------------
+add_library(basic-pitch STATIC basic_pitch.h basic_pitch.cpp)
+set_target_properties(basic-pitch PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(basic-pitch PUBLIC .)
+target_compile_features   (basic-pitch PUBLIC cxx_std_17)
+target_link_libraries     (basic-pitch PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(basic-pitch PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# mt3 — Magenta MT3 multi-instrument transcription (Apache-2.0, ~96 MB F16)
+# ---------------------------------------------------------------------------
+add_library(mt3 STATIC mt3.h mt3.cpp)
+set_target_properties(mt3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mt3 PUBLIC .)
+target_compile_features   (mt3 PUBLIC cxx_std_17)
+target_link_libraries     (mt3 PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(mt3 PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1887,31 +2101,15 @@ endif()
 # ---------------------------------------------------------------------------
 # kokoro — hexgrad/Kokoro-82M + yl4579/StyleTTS2-LJSpeech (iSTFTNet TTS)
 # ---------------------------------------------------------------------------
-# phonemizer.cpp lives here — only kokoro calls phonemize_builtin_*.
-add_library(kokoro STATIC kokoro.h kokoro.cpp phonemizer.cpp phonemizer.h)
+# phonemizer.cpp USED to live here ("only kokoro calls phonemize_builtin_*").
+# It moved to crispasr-core in #435 — zonos needs the built-in G2P too, and it
+# links crispasr-core only. kokoro keeps the same calls; it just resolves them
+# from the leaf lib it already links PUBLIC.
+add_library(kokoro STATIC kokoro.h kokoro.cpp)
 set_target_properties(kokoro PROPERTIES POSITION_INDEPENDENT_CODE ON)
-# #316: enable the G2P dictionary auto-download in phonemizer.cpp.
-#
-# CRISPASR_HAS_CACHE was referenced there but DEFINED NOWHERE, so every
-# auto-download in that file — CMUdict included — was dead code. A user without
-# a pre-seeded ~/.cache/crispasr/cmudict.dict silently got no English dictionary
-# at all and fell through to the letter-to-sound rules ("this" -> θˈɪs), which
-# is a large part of what #316 sounded like.
-#
-# The gate is CRISPASR_BUILD, which guards both the #include and the
-# CRISPASR_HAS_CACHE define — and it was only ever set on crispasr-lib, and only
-# under BUILD_SHARED_LIBS, so it was never true where phonemizer.cpp is
-# compiled.
-#
-# crispasr_cache.cpp now lives in crispasr-core (the leaf lib kokoro already
-# links), NOT crispasr-lib. Originally it was in crispasr-lib and the reference
-# was left for the final executable to resolve — but a static build
-# (BUILD_SHARED_LIBS=OFF) links crispasr-lib BEFORE kokoro, so the linker
-# discarded crispasr_cache.o before phonemizer.o referenced it and crispasr-diff
-# failed to link (#316 AUR report). Moving the symbol to crispasr-core — which
-# every backend static lib depends on — resolves it in all link configs with no
-# cycle (mirrors crispasr_imatrix).
-target_compile_definitions(kokoro PRIVATE CRISPASR_BUILD)
+# #316's CRISPASR_BUILD define moved with phonemizer.cpp to crispasr-core, as a
+# SOURCE property on that one file (see the crispasr-core block above for why it
+# must not be a target-wide define). Nothing else in kokoro.cpp reads it.
 target_include_directories(kokoro PUBLIC .)
 target_compile_features   (kokoro PUBLIC cxx_std_17)
 target_link_libraries     (kokoro PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
@@ -2001,6 +2199,15 @@ if(NOT MSVC)
     target_compile_options(outetts PRIVATE -O3)
 endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# supertonic-tts — Supertonic-3 non-AR flow-matching TTS (#434, native ggml)
+# ---------------------------------------------------------------------------
+add_library(supertonic-tts STATIC supertonic_tts.h supertonic_tts.cpp)
+set_target_properties(supertonic-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(supertonic-tts PUBLIC .)
+target_compile_features   (supertonic-tts PUBLIC cxx_std_17)
+target_link_libraries     (supertonic-tts PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 
 # ---------------------------------------------------------------------------
 # irodori-tts — Aratako/Irodori-TTS RF-DiT flow matching TTS (native ggml)
@@ -2132,6 +2339,18 @@ target_compile_features   (dots-tts PUBLIC cxx_std_17)
 target_link_libraries     (dots-tts PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 if(NOT MSVC)
     target_compile_options(dots-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# fireredtts3 — FireRedTeam/FireRedTTS3 continuous-latent AR TTS (#377)
+# ---------------------------------------------------------------------------
+add_library(fireredtts3 STATIC fireredtts3_tts.h fireredtts3_tts.cpp)
+set_target_properties(fireredtts3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(fireredtts3 PUBLIC .)
+target_compile_features   (fireredtts3 PUBLIC cxx_std_17)
+target_link_libraries     (fireredtts3 PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu chatterbox)
+if(NOT MSVC)
+    target_compile_options(fireredtts3 PRIVATE -O3)
 endif()
 
 # confucius4-tts — Confucius4-TTS (§377)
@@ -2389,6 +2608,18 @@ target_link_libraries     (pyannote-seg PUBLIC crispasr-core ggml ggml-base cris
 set_target_properties(pyannote-seg PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
     target_compile_options(pyannote-seg PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# nemotron3-diar — NVIDIA Nemotron-3-Diarization / streaming Sortformer v3 (#466)
+# ---------------------------------------------------------------------------
+add_library(nemotron3-diar STATIC nemotron3_diar.h nemotron3_diar.cpp)
+set_target_properties(nemotron3-diar PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nemotron3-diar PUBLIC .)
+target_compile_features   (nemotron3-diar PUBLIC cxx_std_17)
+target_link_libraries     (nemotron3-diar PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(nemotron3-diar PRIVATE -O3)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -2697,6 +2928,12 @@ endif()
 if (TARGET gigaam)
     target_link_libraries(crispasr-lib PUBLIC gigaam)
 endif()
+if (TARGET xasr)
+    target_link_libraries(crispasr-lib PUBLIC xasr)
+endif()
+if (TARGET dolphin)
+    target_link_libraries(crispasr-lib PUBLIC dolphin)
+endif()
 if (TARGET wespeaker)
     target_link_libraries(crispasr-lib PUBLIC wespeaker)
 endif()
@@ -2804,6 +3041,18 @@ endif()
 if (TARGET piano-transcription)
     target_link_libraries(crispasr-lib PUBLIC piano-transcription)
 endif()
+if (TARGET basic-pitch)
+    target_link_libraries(crispasr-lib PUBLIC basic-pitch)
+endif()
+if (TARGET onsets-and-frames)
+    target_link_libraries(crispasr-lib PUBLIC onsets-and-frames)
+endif()
+if (TARGET hft-transformer)
+    target_link_libraries(crispasr-lib PUBLIC hft-transformer)
+endif()
+if (TARGET mt3)
+    target_link_libraries(crispasr-lib PUBLIC mt3)
+endif()
 if (TARGET kugelaudio)
     target_link_libraries(crispasr-lib PUBLIC kugelaudio)
 endif()
@@ -2840,6 +3089,9 @@ endif()
 if (TARGET moss_tts_local)
     target_link_libraries(crispasr-lib PUBLIC moss_tts_local)
 endif()
+if (TARGET hojo_asr)
+    target_link_libraries(crispasr-lib PUBLIC hojo_asr)
+endif()
 if (TARGET moss_transcribe)
     target_link_libraries(crispasr-lib PUBLIC moss_transcribe)
 endif()
@@ -2848,6 +3100,9 @@ if (TARGET moss_transcribe_diarize)
 endif()
 if (TARGET qwen3_tts)
     target_link_libraries(crispasr-lib PUBLIC qwen3_tts)
+endif()
+if (TARGET breeze_tts_2)
+    target_link_libraries(crispasr-lib PUBLIC breeze_tts_2)
 endif()
 if (TARGET omnivoice)
     target_link_libraries(crispasr-lib PUBLIC omnivoice)
@@ -2915,6 +3170,9 @@ endif()
 if (TARGET dia-tts)
     target_link_libraries(crispasr-lib PUBLIC dia-tts)
 endif()
+if (TARGET fireredtts3)
+    target_link_libraries(crispasr-lib PUBLIC fireredtts3)
+endif()
 if (TARGET dots-tts)
     target_link_libraries(crispasr-lib PUBLIC dots-tts)
 endif()
@@ -2923,6 +3181,9 @@ if (TARGET confucius4-tts)
 endif()
 if (TARGET irodori-tts)
     target_link_libraries(crispasr-lib PUBLIC irodori-tts)
+endif()
+if (TARGET supertonic-tts)
+    target_link_libraries(crispasr-lib PUBLIC supertonic-tts)
 endif()
 if (TARGET fastpitch-tts)
     target_link_libraries(crispasr-lib PUBLIC fastpitch-tts)
@@ -3020,6 +3281,10 @@ endif()
 # so the native diarizer's symbols resolve at libcrispasr load time.
 if (TARGET pyannote-seg)
     target_link_libraries(crispasr-lib PUBLIC pyannote-seg)
+endif()
+# Nemotron-3-Diarization likewise: the "sortformer" --diarize-method (#466).
+if (TARGET nemotron3-diar)
+    target_link_libraries(crispasr-lib PUBLIC nemotron3-diar)
 endif()
 # WeSpeaker is likewise not a backend — crispasr_diarize.cpp consumes it for
 # the "foxnose" method (#324).

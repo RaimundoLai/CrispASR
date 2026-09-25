@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  # Manual runs on a feature branch: heavy builds and tests belong on CI, not
+  # on the shared dev box (`gh workflow run ci.yml --ref <branch>`).
+  workflow_dispatch:
   push:
     branches: [main, master, integrated_cli]
   pull_request:
@@ -76,6 +79,13 @@ jobs:
       # only on a REQUIRED gap; registry/test/README gaps stay advisory. Run on
       # Linux deliberately: the script's Go cgo-LDFLAGS drift check is unreliable
       # on macOS, where Metal/BLAS default on and pollute the linux link line.
+      #
+      # NOT covered here: the script's shipped-library check, which reads a
+      # built libcrispasr's symbol table. This job configures without
+      # BUILD_SHARED_LIBS, so there is no .so to read and that one check prints
+      # "skipped". It has teeth in bindings-rust.yml, the job that does build a
+      # shared libcrispasr on Linux — and which triggers on exactly the paths a
+      # new backend touches (src/crispasr_c_api.cpp, src/CMakeLists.txt).
       - name: Backend wiring audit
         run: python3 tools/check-backend-wiring.py --crispasr ./build/bin/crispasr
 
@@ -315,7 +325,24 @@ jobs:
           # Inputs that once crashed a parser. A seeded 45 s run rediscovers a
           # crash only by luck — replaying these makes each fixed bug a
           # deterministic gate instead of a coin flip.
-          cp tests/fuzz/regressions/*.ogg fuzz-corpus/ 2>/dev/null || true
+          #
+          # COUNTED, not globbed-and-hoped. The previous form was
+          # `cp .../*.ogg ... || true`, and tests/.gitignore excludes *.ogg, so
+          # the one documented seed was never committed and the glob matched
+          # nothing on every run since. A gate that replays an empty set reports
+          # exactly what a passing gate reports, so it has to be able to say so.
+          n_seeds=0
+          for f in tests/fuzz/regressions/*; do
+            case "$f" in *README.md|*.gitignore) continue ;; esac
+            [ -f "$f" ] || continue
+            cp "$f" fuzz-corpus/
+            n_seeds=$((n_seeds + 1))
+          done
+          echo "replaying $n_seeds regression seed(s)"
+          if [ "$n_seeds" -eq 0 ]; then
+            echo "::error::tests/fuzz/regressions/ contributed no seeds — check tests/.gitignore"
+            exit 1
+          fi
           ./build-fuzz/bin/crispasr-fuzz-audio -max_total_time=45 -max_len=1048576 \
              -rss_limit_mb=4096 -artifact_prefix=fuzz-artifacts/ fuzz-corpus
 

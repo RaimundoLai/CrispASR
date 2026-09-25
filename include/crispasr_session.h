@@ -228,6 +228,13 @@ CRISPASR_SESSION_API void crispasr_parakeet_result_free(parakeet_result* r);
 CRISPASR_SESSION_API void crispasr_set_gpu_backend(const char* name);
 
 CRISPASR_SESSION_API int crispasr_detect_backend_from_gguf(const char* path, char* out_name, int out_cap);
+// #433: EVERY backend that can open this file, newline-separated, primary
+// first. detect_backend() above is 1:1, which is not always the whole truth —
+// a voxcpm2 GGUF opens both as `voxcpm2-tts` and as `voxcpm2-vae` (the same
+// loader with vae_only=true; there is no separate VAE model). Returns bytes
+// written, or -5 if `out_cap` is too small — never a truncated list, because a
+// silently cut list would name fewer backends than exist.
+CRISPASR_SESSION_API int crispasr_detect_backends_from_gguf(const char* path, char* out, int out_cap);
 CRISPASR_SESSION_API crispasr_session* crispasr_session_open_explicit(const char* model_path, const char* backend_name,
                                                                       int n_threads);
 CRISPASR_SESSION_API crispasr_session* crispasr_session_open(const char* model_path, int n_threads);
@@ -287,7 +294,8 @@ CRISPASR_SESSION_API int crispasr_diarize_segments_abi(const float* left_pcm, co
 // 0.8.30+ (issue #395): diarize AND hand back the speaker turns the method
 // derived from the audio, so a caller can split one of its own segments that
 // spans a speaker change — labelling alone can never resolve finer than the
-// segment grid the caller sent in. Only FoxNose (method 4) derives turns; the
+// segment grid the caller sent in. FoxNose (method 4) and Sortformer (method 5,
+// #466) derive turns; the
 // other methods report 0, which is not an error.
 //
 // A NEW SYMBOL rather than a signature change, so the existing ABI stays
@@ -339,6 +347,19 @@ CRISPASR_SESSION_API int crispasr_registry_lookup_by_filename_abi(const char* fi
                                                                   int32_t filename_cap, char* out_url, int32_t url_cap,
                                                                   char* out_size, int32_t size_cap);
 CRISPASR_SESSION_API int crispasr_registry_list_backends_abi(char* out_csv, int32_t out_cap);
+
+// #433: what VERBS can this backend perform? detect_backend() returns a name
+// only, and several backends serve more than one purpose (voxcpm: tts + s2s;
+// gemma: asr + translate). Capabilities are comma-separated names such as
+// "tts,voice-cloning,auto-download".
+//   crispasr_backend_caps_abi:      one backend. >=0 = length, -3 = unknown name.
+//   crispasr_backend_caps_list_abi: all of them, "<name>\t<caps>\n" per line.
+//                                   Call with (nullptr, 0) to SIZE it: the return
+//                                   is the negative required byte count. A too-small
+//                                   buffer returns the same, so a caller never has
+//                                   to guess and a truncation can never pass as data.
+CRISPASR_SESSION_API int crispasr_backend_caps_abi(const char* backend, char* out_csv, int32_t out_cap);
+CRISPASR_SESSION_API int crispasr_backend_caps_list_abi(char* out_buf, int32_t out_cap);
 typedef enum crispasr_registry_artifact_kind {
     CRISPASR_REGISTRY_ARTIFACT_PRIMARY = 0,
     CRISPASR_REGISTRY_ARTIFACT_COMPANION = 1,
@@ -405,11 +426,23 @@ CRISPASR_SESSION_API int crispasr_session_set_parakeet_att_context(crispasr_sess
 // is its HiggsAudioV2 tokenizer; for Chatterbox it is S3Gen.
 CRISPASR_SESSION_API int crispasr_session_set_codec_path(crispasr_session* s, const char* path);
 // Set the active TTS backend's voice from its native format. Chatterbox accepts
-// a conditioning GGUF or reference WAV; OmniVoice accepts a reference WAV and
-// uses ref_text_or_null as its transcript. Returns -3 when the active backend
+// a conditioning GGUF or reference WAV; Pocket-TTS accepts a reference WAV or
+// an official prepared *.safetensors voice state; OmniVoice accepts a reference
+// WAV and uses ref_text_or_null as its transcript. Returns -3 when the active backend
 // has no voice-setting implementation.
 CRISPASR_SESSION_API int crispasr_session_set_voice(crispasr_session* s, const char* path,
                                                     const char* ref_text_or_null);
+
+// #432: same thing, from samples you already hold — no temp file of your own.
+// `pcm` is mono float32 at `sample_rate`; `ref_text_or_null` follows the same
+// rule as above (required for WAV-style cloning on backends that need it).
+//
+// The library serialises the samples to a temp WAV internally and routes them
+// through crispasr_session_set_voice, so consent handling and the Art. 50(4)
+// marking behave identically for both entry points — a clone must not acquire a
+// different audit trail by arriving as a buffer instead of a path.
+CRISPASR_SESSION_API int crispasr_session_set_voice_samples(crispasr_session* s, const float* pcm, int32_t n_samples,
+                                                            int32_t sample_rate, const char* ref_text_or_null);
 // #201: configure the TADA encoder + aligner GGUFs used for on-the-fly voice
 // cloning, i.e. crispasr_session_set_voice(s, "ref.wav", "<transcript>") on a
 // TADA session. The .wav clone path is opt-in (experimental) — enable it with
@@ -622,8 +655,11 @@ CRISPASR_SESSION_API float crispasr_session_beats_tempo_bpm(crispasr_session* s)
 // resampling: silently resampling audio would move every beat time.
 CRISPASR_SESSION_API int crispasr_session_beats_sample_rate(crispasr_session* s);
 
-// Polyphonic piano transcription: mono PCM at the model's native rate
-// (16000 Hz for piano-transcription) -> note events.
+// Polyphonic note transcription: mono PCM at the model's native rate
+// -> note events. Served by piano-transcription (16000 Hz), basic-pitch
+// (22050) and MT3 (16000) alike; query crispasr_session_piano_sample_rate
+// rather than assuming, and note the pcm_16k parameter name is a fossil of
+// the first backend to use this entry point.
 //
 // Returns note count (>0) on success, 0 for "ran, found nothing", -1 on error
 // or a backend with no piano arm. Retrieve the notes with
@@ -644,6 +680,22 @@ CRISPASR_SESSION_API int crispasr_session_piano_n_notes(crispasr_session* s);
 // typed-array read (the same reason crispasr_session_pitch_frames is flat).
 // midi_note is 21-108 (A0-C8); velocity is 0-127.
 CRISPASR_SESSION_API const float* crispasr_session_piano_notes(crispasr_session* s, int* out_n_notes);
+// GM program per note, session-owned, parallel to crispasr_session_piano_notes
+// and the same length in notes. Valid until the next crispasr_session_piano
+// call or session close.
+//
+//   0-127  General MIDI program — which instrument played the note
+//   128    percussion (GM channel 10), which carries no meaningful program
+//   -1     the model does not identify an instrument
+//
+// A separate array rather than a fifth float in the note record, because
+// widening that record would break every existing reader of this ABI. A
+// caller that does not ask is unaffected.
+//
+// Only MT3 fills this with real values; piano-transcription and basic-pitch
+// report -1 throughout. -1 rather than 0 because 0 is "Acoustic Grand Piano"
+// and would be indistinguishable from a genuine answer.
+CRISPASR_SESSION_API const int* crispasr_session_piano_note_programs(crispasr_session* s, int* out_n_notes);
 CRISPASR_SESSION_API int crispasr_session_piano_sample_rate(crispasr_session* s);
 CRISPASR_SESSION_API const char* crispasr_session_last_synth_error(crispasr_session* s);
 CRISPASR_SESSION_API char* crispasr_session_translate_text(crispasr_session* s, const char* text, const char* src_lang,
@@ -653,7 +705,11 @@ CRISPASR_SESSION_API crispasr_stream* crispasr_session_stream_open(crispasr_sess
                                                                    int length_ms, int keep_ms, const char* language,
                                                                    int translate);
 CRISPASR_SESSION_API void crispasr_session_close(crispasr_session* s);
-CRISPASR_SESSION_API void* crispasr_punc_init(const char* model_path);
+// Standalone punctuation restoration. `model` is a --punc-model value: an
+// alias (auto|firered|fullstop|punctuate-all|pcs; auto-downloaded) or a .gguf
+// path of the FireRedPunc family or PCS - dispatched on general.architecture.
+// Returns NULL for anything that is not a loadable punctuation model.
+CRISPASR_SESSION_API void* crispasr_punc_init(const char* model);
 CRISPASR_SESSION_API const char* crispasr_punc_process(void* ctx, const char* text);
 CRISPASR_SESSION_API void crispasr_punc_free_text(const char* text);
 CRISPASR_SESSION_API void crispasr_punc_free(void* ctx);
@@ -746,6 +802,14 @@ CRISPASR_SESSION_API int crispasr_session_set_beam_size(crispasr_session* s, int
 CRISPASR_SESSION_API int crispasr_session_set_return_logits(crispasr_session* s, int enable);
 CRISPASR_SESSION_API int crispasr_session_set_grammar_text(crispasr_session* s, const char* gbnf_text,
                                                            const char* root_rule, float penalty);
+// No end-of-text until the grammar is complete (whisper; off by default).
+CRISPASR_SESSION_API int crispasr_session_set_grammar_strict(crispasr_session* s, int strict);
+// log P(text | audio) for each candidate text, teacher-forced; the audio is
+// encoded once (whisper only; returns -10 for other backends).
+CRISPASR_SESSION_API int crispasr_session_score_texts(crispasr_session* s, const float* pcm, int n_samples,
+                                                      const char* language, const char* initial_prompt,
+                                                      const char** texts, int n_texts, float* out_logprobs,
+                                                      int* out_n_tokens);
 CRISPASR_SESSION_API int crispasr_session_set_fallback_thresholds(crispasr_session* s, float entropy_thold,
                                                                   float logprob_thold, float no_speech_thold,
                                                                   float temperature_inc);

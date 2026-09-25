@@ -229,7 +229,7 @@ document (issue #228).
 | `--lcs-dedup auto\|on\|off` | NeMo-style sub-word LCS dedup across chunk boundaries (default `auto` — fires when chunking with overlap) |
 | `--lcs-min-length N` | Minimum LCS length to act on (default 1; raise to 3-4 on long-silence audio where blank tokens dominate boundaries) |
 | `--parakeet-decoder ctc\|tdt\|maes` | Select decode strategy: `ctc` (CTC head), `tdt` (TDT greedy/beam, default), `maes` (MAES beam search — requires `-bs N` with N>1) |
-| `-bs N`, `--beam-size N` | Parakeet TDT/RNNT beam search width (default: unset = greedy). `2`–`4` recommended with hotwords or MAES. CTC decode is frame-synchronous and always greedy |
+| `-bs N`, `--beam-size N` | Parakeet TDT/RNNT beam search width (default: unset = greedy). `2`–`4` recommended with hotwords or MAES. CTC decode is frame-synchronous and always greedy. `dolphin`: CTC prefix-beam + attention-rescoring width (default 10, upstream's) |
 | `--sensitivity conservative\|balanced\|aggressive` | Named bundle of the four whisper fallback thresholds (`-et`, `-lpt`, `-nth`, temperature step). `balanced` is the shipped default and always a no-op. See below |
 
 #### `--sensitivity` — the four decode thresholds as one knob
@@ -329,6 +329,7 @@ Distinct exit codes let a caller tell *which* stage failed:
 | Exit | Meaning |
 |---|---|
 | `2` | Config error — a `--require-*` whose stage was never requested |
+| `4` | An input file could not be decoded (bad container, or a header asking for an absurd resample) |
 | `30` | Required VAD model failed to load |
 | `31` | Required word timestamps missing (aligner failed to load, or no native/aligned words on a non-empty segment) |
 | `32` | Required punctuation model failed to load |
@@ -476,8 +477,8 @@ multilingual / v3 / EN models behave very differently:
 | `CRISPASR_PARAKEET_INTERNAL_CHUNKING` | non-JA on, JA off | `0` = revert to the dispatcher's chunk-30 + overlap-save + LCS-merge path (A/B). |
 | `CRISPASR_PARAKEET_STREAM_CHUNK` | 0 (auto: 8 JA / 30 non-JA) | Streamed-path encoder chunk size (seconds). |
 | `CRISPASR_PARAKEET_STREAM_OVERLAP` | 2 | Streamed-path encoder overlap (seconds). |
-| `CRISPASR_PARAKEET_VRAM_BUDGET_MB` | 0 (off) | Proactive memory policy: if single-pass full attention's estimated O(T²) rel-pos bias exceeds this, use the streamed (bounded-window) encoder *before* allocating — avoids the OOM spike on small GPUs. 0 = disabled (single-pass as before; the reactive OOM fallback still backstops). |
-| `CRISPASR_PARAKEET_MEM_POLICY` | `auto` | `auto` honours the VRAM budget; `single`/`streamed` force that path; `off` disables the proactive check (reactive-only). |
+| `CRISPASR_PARAKEET_VRAM_BUDGET_MB` | half available memory | Proactive memory policy: if single-pass full attention's estimated O(T²) rel-pos bias exceeds this, use the streamed (bounded-window) encoder before allocating. `0` disables proactive routing; the physical-memory guard at the encoder remains active. |
+| `CRISPASR_PARAKEET_MEM_POLICY` | `auto` | `auto` honours the memory budget; `streamed` forces that path; `off` disables proactive routing. No mode can disable the encoder's physical-memory guard. |
 | `CRISPASR_PARAKEET_MEM_COEFF` | 8.0 | O(T²) estimate coefficient. Default calibrated so a ~4 min clip (T≈2800, 8 heads) estimates ~1.9 GiB, matching a measured CUDA allocation. |
 | `CRISPASR_SESSION_UNIFIED_DISPATCH` | 1 | No effect on the CLI. `0` makes the session/bindings API use its older parakeet code path instead of the one shared with the CLI — for troubleshooting comparisons only. |
 
@@ -835,7 +836,7 @@ causing `--max-len` to silently have no effect.
 | `-tp F`, `--temperature F` | Sampling temperature. `0` = pure argmax (default, bit-identical). `> 0` enables multinomial sampling for whisper, voxtral, voxtral4b, qwen3, granite |
 | `--seed N` | RNG seed for sampling. `0` = non-deterministic. Used by temperature-sampling ASR backends and TTS backends that sample; CLI values override backend-specific env seeds |
 | `-bo N`, `--best-of N` | Number of best candidates to keep when temperature > 0 (whisper + some AR backends) |
-| `-bs N`, `--beam-size N` | Beam search width. Unset means greedy; whisper substitutes 5 when beam search is engaged. Supported on: whisper, parakeet, nemotron, canary, canary-qwen, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, sensevoice, granite-nle, moss-audio, moss-transcribe, moss-diarize, higgs-stt, ark-asr, mimo-asr, m2m100, madlad/t5. Also lfm2-audio (stub). Not applicable to paraformer (NAR) |
+| `-bs N`, `--beam-size N` | Beam search width. Unset means greedy for ASR backends; whisper substitutes 5 when beam search is engaged. **m2m100 / wmt21 default to 5 when unset** (#439) — every checkpoint in that family declares `num_beams: 5` in its own `config.json`, and greedy decoding on them collapses into repetition; pass `--beam-size 1` for greedy. Supported on: whisper, parakeet, nemotron, canary, canary-qwen, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, sensevoice, granite-nle, moss-audio, moss-transcribe, moss-diarize, raon-speech, hojo-asr (greedy by default; -bs 4 is the checkpoint's recipe but costs O(B*T^2) via replay-from-prefix), higgs-stt, ark-asr, mimo-asr, m2m100, madlad/t5. Also lfm2-audio (stub). Not applicable to paraformer (NAR) |
 | `-tpi F`, `--temperature-inc F` | Whisper temperature-fallback increment |
 | `-nf`, `--no-fallback` | Disable temperature fallback (equivalent to `--temperature-inc 0`) |
 | `--frequency-penalty F` | Opt-in repeated generated-token penalty for autoregressive ASR backends (`0.0` disabled). Applied to generated output tokens before greedy/sampling selection. |
@@ -1060,6 +1061,7 @@ crispasr -m auto --backend cohere -f podcast.wav \
 | `xcorr` | stereo | TDOA via cross-correlation, ±5 ms search window |
 | `vad-turns` | mono | Alternates 0/1 every >600 ms gap (mono-friendly proxy) |
 | `foxnose` | mono | **Recommended.** WeSpeaker ResNet34-LM embeddings over sliding windows -> PCA + full-covariance GMM/BIC speaker counting -> Ng-Jordan-Weiss spectral clustering -> Viterbi temporal smoothing. Estimates the speaker count; `--diarize-num-speakers N` pins it. Needs `--diarize-embedder auto` (or a WeSpeaker GGUF path). Weights are CC-BY-4.0 — see `THIRD_PARTY_NOTICES.txt` |
+| `sortformer` (alias `nemotron3-diar`) | mono | NVIDIA [Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) (streaming Sortformer v3, #466): one end-to-end network that emits a speaker-activity probability for up to 8 speakers every 10 ms, speakers numbered in order of first appearance, overlap handled natively. Runs once globally; ASR segments are labelled by probability mass and split at speaker turns. `--diarize-model auto` (default) fetches NVIDIA's 107 MB q8_0 GGUF; OpenMDW-1.1 weights (commercial use allowed). English-trained; no embedder, no clustering, no speaker-count estimate — it never finds more than 8 |
 | `pyannote` | mono | Native GGUF pyannote-seg-3.0; runs once globally over the full audio, splits ASR segments at speaker-turn boundaries when per-word timestamps exist. Auto-downloads the GGUF via `--sherpa-segment-model auto` |
 | `sherpa` / `ecapa` | mono | External `sherpa-onnx` subprocess with segmentation + speaker-embedding model. Since #110, runs once globally over the full audio (not per-slice), producing consistent speaker IDs across the whole file. Splits ASR segments at speaker-turn boundaries when per-word timestamps exist. Requires `--sherpa-bin`, `--sherpa-segment-model`, `--sherpa-embedding-model` |
 
@@ -1074,6 +1076,8 @@ Supporting flags:
 | `--diarize-cluster-threshold F` | Cosine merge threshold (default 0.5) — consulted only when passed explicitly (#326) |
 | `--diarize-max-speakers N` | Hard cap on the cluster count (default 8) |
 | `--diarize-num-speakers N` | Pin the speaker count outright, skipping estimation (`foxnose`; `0` = estimate) |
+| `--diarize-model PATH` | Nemotron-3-Diarization GGUF for `sortformer` (`auto` = NVIDIA's q8_0; `models/convert-nemotron3-diar-to-gguf.py` makes F32/F16) |
+| `--sortformer-mode MODE` | `sortformer` chunk schedule: `offline` (default, best accuracy) or a streaming preset, `low_latency` (1.04 s), `very_low_latency` (0.64 s), `ultra_low_latency` (0.32 s) — the labels a live session with that latency would give |
 | `--sherpa-bin PATH` | `sherpa-onnx-offline-speaker-diarization` binary (default: found on `PATH`) |
 | `--sherpa-segment-model PATH` | Segmentation model for the `sherpa`/`pyannote` paths (`auto` downloads the GGUF) |
 | `--sherpa-embedding-model PATH` | Speaker-embedding ONNX for the `sherpa` path |
@@ -1205,7 +1209,7 @@ otherwise they are pyannote-local track IDs.
 | `-am FNAME`, `--aligner-model FNAME` | CTC aligner GGUF for word-level timestamps |
 | `-n N`, `--max-new-tokens N` | Max tokens the LLM may generate (default 512) |
 | `--frequency-penalty F` | Penalize repeated generated token IDs on supported autoregressive backends. Useful with `-n` as a retry knob after cap-triggered degeneration. |
-| `--ask "TEXT"` | Replace the transcription instruction with a free-form question about the audio (audio-QA). Honoured by ark-asr, glm-asr, granite, higgs-stt, mimo-asr, voxtral |
+| `--ask "TEXT"` | Replace the transcription instruction with a free-form question about the audio (audio-QA). Honoured by ark-asr, glm-asr, granite, higgs-stt, mimo-asr, qwen3, raon-speech (replaces "Transcribe the audio into text"), voxtral |
 | `--prefix-text "TEXT"` | Seed the assistant turn with an already-decoded transcript so the model continues from it instead of re-decoding; the output is the continuation only (granite-speech, #205) |
 | `--context "TEXT"` | Free-form prompt/context injection — vibevoice-asr only; see [Hotwords](#hotwords--contextual-biasing) |
 
@@ -1422,11 +1426,32 @@ beats and you never have to merge two lists to reconstruct the grid.
 
 Another standalone task: audio in, **note events** out — onset, offset, MIDI
 pitch, name and velocity. Routes to its own dispatcher before any ASR backend
-is built, like `--pitch` / `--chords` / `--separate`.
+is built, like `--pitch` / `--chords` / `--separate`. Three backends share the
+surface, selected by GGUF architecture: **`piano-transcription`** (ByteDance
+CRNN, 88-key piano, the higher-accuracy piano specialist), **`basic-pitch`**
+(Spotify, ~110 KB, polyphonic any-instrument, #250 — no pedal events), and
+**`mt3`** (Google Magenta, ~96 MB, MULTI-INSTRUMENT — every note carries a
+General MIDI program and drums are a separate class; alias
+`music-transcription`).
+
+`--piano-format` takes `text` (default), `json`, or **`midi`**. The MIDI form
+writes a format-1 Standard MIDI File — one track per program, drums on GM
+channel 10 — to the matching `-of` name, or the input path with its extension
+replaced. That is the only form that reaches a DAW or notation editor; text and
+JSON are for inspection and diffing.
+
+MT3's per-note program survives into `--piano-format json` (`program`,
+`instrument`, `is_drum` keys) and adds one trailing column to the text form
+(`prog=<n>` or `drum`) after the existing five. It is NOT carried by the
+session C ABI, whose note quad is fixed-width.
 
 ```bash
 crispasr --piano -m auto --auto-download -f piano.wav
 crispasr --piano --piano-format json -m piano-transcription-f16.gguf -f piano.wav
+# any-instrument polyphonic, tiny model:
+crispasr --piano --backend basic-pitch -m auto --auto-download -f guitar.wav
+# multi-instrument, straight to a MIDI file:
+crispasr --piano --backend mt3 -m auto --auto-download -f band.wav --piano-format midi
 ```
 
 Default output is one tab-separated line per note — `onset_sec`, `offset_sec`,
@@ -1629,7 +1654,7 @@ default quantized model for the selected backend into
 | parakeet | `cstr/parakeet-tdt-0.6b-v3-GGUF` | ~467 MB |
 | canary | `cstr/canary-1b-v2-GGUF` | ~600 MB |
 | voxtral | `cstr/voxtral-mini-3b-2507-GGUF` | ~2.5 GB |
-| voxtral4b | `cstr/voxtral-mini-4b-realtime-GGUF` | ~3.3 GB |
+| voxtral4b | `cstr/voxtral-mini-4b-realtime-GGUF` | ~2.4 GB |
 | granite | `cstr/granite-speech-4.0-1b-GGUF` | ~2.94 GB |
 | granite-4.1 | `cstr/granite-speech-4.1-2b-GGUF` | ~2.94 GB |
 | granite-4.1-plus | `cstr/granite-speech-4.1-2b-plus-GGUF` | ~2.96 GB |
@@ -1641,6 +1666,7 @@ default quantized model for the selected backend into
 | omniasr-llm | `cstr/omniasr-llm-300m-v2-GGUF` | ~1019 MB |
 | hubert | `cstr/hubert-large-ls960-ft-GGUF` | ~200 MB |
 | data2vec | `cstr/data2vec-audio-960h-GGUF` | ~60 MB |
+| vibevoice-streaming | `cstr/vibevoice-asr-streaming-1.5b-GGUF` (Q4_K) | ~1.86 GB |
 
 **TTS backends** — all auto-download the model + a default voice pack:
 
@@ -1655,6 +1681,7 @@ default quantized model for the selected backend into
 | orpheus | `cstr/orpheus-3b-0.1-ft-GGUF` (Q8_0) + SNAC codec | ~3.7 GB + ~80 MB | Llama-3 based; US-English |
 | chatterbox | `cstr/chatterbox-GGUF` (Q8_0 T3 + Q8_0 S3Gen) | ~610 MB + ~349 MB | S3Gen + T3; multilingual |
 | chatterbox-nano | `cstr/chatterbox-nano-GGUF` (Q8_0 T3) + Turbo S3Gen companion | ~345 MB + ~627 MB | GPT2-small T3 on the Turbo S3Gen (#382); English |
+| raon | `cstr/raon-opentts-0.3b-GGUF` (F16, single GGUF) | ~959 MB | KRAFTON Raon-OpenTTS 0.3B on the F5 runtime; EN zero-shot cloning; **CC-BY-NC-4.0** (non-commercial, license gate) |
 | chatterbox-finnish-nano | `JJarvinen/chatterbox-finnish-nano-GGUF` (Q8_0 T3) + Turbo S3Gen companion | ~329 MB + ~627 MB | Finnish-only Nano v0.1.3; MIT |
 | piper | `cstr/piper-en_US-lessac-medium-GGUF` (F16) | ~30 MB | Lightweight, many voices via `--voice` |
 | tada-1b | `cstr/tada-tts-1b-GGUF` (Q4_K + F16 codec) | ~1.7 GB + ~250 MB | English-only; `--voice tada-ref.gguf` |

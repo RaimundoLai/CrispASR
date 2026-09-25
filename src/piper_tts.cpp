@@ -32,11 +32,10 @@
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
 #include "phonemizer.h" // strip_espeak_lang_markers (#169)
-// crispasr_cache is part of crispasr-lib, not piper-tts; guard behind CRISPASR_BUILD.
-#ifdef CRISPASR_BUILD
+// G2P dictionaries are fetched through crispasr-core, which piper-tts links.
+// Keep this capability explicit: CRISPASR_BUILD describes the shared C ABI and
+// is not defined while this standalone backend target is compiled.
 #include "crispasr_cache.h"
-#define PIPER_HAS_CACHE 1
-#endif
 
 #include <algorithm>
 #include <cassert>
@@ -370,8 +369,7 @@ static void g2p_ensure_espeak_dict() {
             return;
         }
     }
-    // Auto-download from HuggingFace (only when linked into crispasr-lib)
-#ifdef PIPER_HAS_CACHE
+    // Auto-download from HuggingFace through crispasr-core.
     std::string path = crispasr_cache::ensure_cached_file(
         "espeak_en_us.tsv", "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/espeak_en_us.tsv",
         /*quiet=*/true, "crispasr", "");
@@ -380,7 +378,6 @@ static void g2p_ensure_espeak_dict() {
         if (n > 0)
             fprintf(stderr, "piper_tts: espeak IPA dict loaded (%d entries)\n", n);
     }
-#endif
 }
 
 static void g2p_ensure_cmudict() {
@@ -406,14 +403,12 @@ static void g2p_ensure_cmudict() {
         if (g2p_en::load_cmudict_file(g_g2p_ctx.dict, base + "cmudict.dict") > 0)
             return;
     }
-    // 3. Auto-download from HuggingFace (only when linked into crispasr-lib)
-#ifdef PIPER_HAS_CACHE
+    // 3. Auto-download from HuggingFace through crispasr-core.
     std::string path = crispasr_cache::ensure_cached_file(
         "cmudict.dict", "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/cmudict.dict",
         /*quiet=*/true, "crispasr", "");
     if (!path.empty())
         g2p_en::load_cmudict_file(g_g2p_ctx.dict, path);
-#endif
 }
 
 // Per-language G2P contexts (lazy-loaded, same pattern as kokoro.cpp).
@@ -435,6 +430,17 @@ static bool phonemize_builtin(const std::string& voice, const std::string& text,
         out = g2p_es::text_to_ipa(g_g2p_es_ctx, text);
         return !out.empty();
     }
+    // Russian goes through crispasr-core's phonemizer rather than a bare
+    // g2p_ru::context, because that is what owns the 813K-entry dictionary and
+    // its auto-download. A local context would give the letter-to-sound rules
+    // only, which is a different and much worse thing wearing the same name.
+    //
+    // This whole function is the tier BELOW espeak (see phonemize_espeak), so
+    // this changes nothing on a machine that has espeak-ng — it is the
+    // difference between Russian speech and no Russian at all on one that does
+    // not.
+    if (voice.find("ru") != std::string::npos)
+        return crispasr::phonemize_builtin_ru(voice, text, out, /*tts_punctuation=*/false);
     // English: LTS + CMUdict (always available)
     {
         std::lock_guard<std::mutex> g(g_g2p_mu);

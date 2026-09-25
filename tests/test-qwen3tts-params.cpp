@@ -57,3 +57,32 @@ TEST_CASE("qwen3_tts HIP policy defaults known-bad paths to CPU", "[unit][qwen3_
     REQUIRE_FALSE(code_predictor_must_use_cpu("ROCm0", false, 28, 2048, true));
     REQUIRE_FALSE(code_predictor_must_use_cpu("CUDA0", false, 5, 1024, true));
 }
+
+TEST_CASE("qwen3_tts F32 down-projection promotion follows the narrowing backends", "[unit][qwen3_tts][hip]") {
+    using namespace qwen3_tts_hip_policy;
+
+    for (const char* be : {"CUDA0", "ROCm0", "Vulkan0", "SYCL0"}) {
+        INFO(be);
+        REQUIRE(f16_matmul_narrows_activations(be));
+        REQUIRE(promote_cp_down_to_f32(be, true, -1));
+        REQUIRE_FALSE(promote_cp_down_to_f32(be, false, -1)); // quantized / F32 weights: nothing to promote
+        REQUIRE_FALSE(promote_cp_down_to_f32(be, true, 0));   // explicit opt-out
+    }
+    for (const char* be : {"CPU", "Metal", "BLAS"}) {
+        INFO(be);
+        REQUIRE_FALSE(f16_matmul_narrows_activations(be));
+        REQUIRE_FALSE(promote_cp_down_to_f32(be, true, -1));
+        REQUIRE(promote_cp_down_to_f32(be, true, 1)); // forced for A/B
+    }
+    REQUIRE_FALSE(f16_matmul_narrows_activations(nullptr));
+}
+
+TEST_CASE("qwen3_tts Vulkan talker runs natively unless asked (#337)", "[unit][qwen3_tts][hip]") {
+    using namespace qwen3_tts_hip_policy;
+    REQUIRE_FALSE(vulkan_talker_on_cpu(nullptr, nullptr)); // new default: native
+    REQUIRE_FALSE(vulkan_talker_on_cpu("0", nullptr));
+    REQUIRE_FALSE(vulkan_talker_on_cpu(nullptr, "1")); // legacy opt-in is now a no-op
+    REQUIRE(vulkan_talker_on_cpu("1", nullptr));       // escape hatch
+    REQUIRE(vulkan_talker_on_cpu(nullptr, "0"));       // legacy explicit opt-out
+    REQUIRE(vulkan_talker_on_cpu("1", "1"));           // the CPU request wins
+}

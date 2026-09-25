@@ -93,6 +93,21 @@ constexpr Entry k_registry[] = {
      "~458 MB", nullptr, nullptr},
     {"parakeet", "parakeet-tdt-0.6b-v3-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)"},
+    // Quds v4 (#387): Persian ASR, FastConformer-RNNT fine-tune of the
+    // CC-BY-4.0 NVIDIA stt_fa base, by hojreh (converted from the author's
+    // ONNX export — models/convert-nemo-rnnt-onnx-to-gguf.py). Rides the
+    // parakeet runtime (pred_layers=1, no CTC head in the export). Q8_0 is
+    // transcript-identical to F16 on the CV-fa validation clips.
+    {"quds", "quds-v4-fa-q8_0.gguf",
+     "https://huggingface.co/cstr/quds-v4-fa-GGUF/resolve/main/quds-v4-fa-q8_0.gguf", "~122 MB", nullptr, nullptr,
+     nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (Quds v4 by hojreh, "
+     "https://huggingface.co/hojreh/Quds-v4-onnx; base model nvidia/stt_fa_fastconformer_hybrid_large, CC-BY-4.0)"},
+    {"quds-fa", "quds-v4-fa-q8_0.gguf",
+     "https://huggingface.co/cstr/quds-v4-fa-GGUF/resolve/main/quds-v4-fa-q8_0.gguf", "~122 MB", nullptr, nullptr,
+     nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (Quds v4 by hojreh, "
+     "https://huggingface.co/hojreh/Quds-v4-onnx; base model nvidia/stt_fa_fastconformer_hybrid_large, CC-BY-4.0)"},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/canary-1b-v2)"},
     {"canary-qwen", "canary-qwen-2.5b-q8_0.gguf",
@@ -124,11 +139,34 @@ constexpr Entry k_registry[] = {
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
      "~80 MB"},
+    // Voxtral Mini 3B. Q4_K stays the auto-download default (first row wins
+    // for a bare backend lookup): identical transcript to F16 on jfk.wav at
+    // 2.2x the speed. `-m auto:f16` does not need the F16 row — it reaches the
+    // q4_k row and apply_quant_to_filename() rewrites the suffix — which is
+    // exactly how #437 stayed invisible: the rewrite happily SYNTHESISED a URL
+    // for an F16 that had never been uploaded, and only a 404 at download time
+    // said so. The F16/Q8_0 rows below are what
+    // crispasr_registry_lookup_by_filename() resolves, so a user naming the
+    // file gets its real size instead of an empty one, and
+    // tools/check-registry-urls.py now HEADs all three per backend — a
+    // published-or-not check the synthesised URL never got.
     {"voxtral", "voxtral-mini-3b-2507-q4_k.gguf",
      "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-q4_k.gguf", "~2.5 GB", nullptr, nullptr},
+    {"voxtral", "voxtral-mini-3b-2507-q8_0.gguf",
+     "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-q8_0.gguf", "~4.6 GB", nullptr, nullptr},
+    {"voxtral", "voxtral-mini-3b-2507-f16.gguf",
+     "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-f16.gguf", "~8.7 GB", nullptr, nullptr},
+    // Voxtral Mini 4B Realtime, same layering. The q4_k size here read
+    // "~3.3 GB" until #437 measured the published file: it is 2.35 GiB.
     {"voxtral4b", "voxtral-mini-4b-realtime-q4_k.gguf",
      "https://huggingface.co/cstr/voxtral-mini-4b-realtime-GGUF/resolve/main/voxtral-mini-4b-realtime-q4_k.gguf",
-     "~3.3 GB", nullptr, nullptr},
+     "~2.4 GB", nullptr, nullptr},
+    {"voxtral4b", "voxtral-mini-4b-realtime-q8_0.gguf",
+     "https://huggingface.co/cstr/voxtral-mini-4b-realtime-GGUF/resolve/main/voxtral-mini-4b-realtime-q8_0.gguf",
+     "~4.4 GB", nullptr, nullptr},
+    {"voxtral4b", "voxtral-mini-4b-realtime-f16.gguf",
+     "https://huggingface.co/cstr/voxtral-mini-4b-realtime-GGUF/resolve/main/voxtral-mini-4b-realtime-f16.gguf",
+     "~8.3 GB", nullptr, nullptr},
     {"granite", "granite-speech-4.0-1b-q4_k.gguf",
      "https://huggingface.co/cstr/granite-speech-4.0-1b-GGUF/resolve/main/granite-speech-4.0-1b-q4_k.gguf", "~2.94 GB", nullptr, nullptr},
     {"granite-4.1", "granite-speech-4.1-2b-q4_k.gguf",
@@ -144,6 +182,22 @@ constexpr Entry k_registry[] = {
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
      "~1.3 GB", nullptr, nullptr},
+    // confucius4-r2t2 (#445) — NetEase Youdao's streaming Qwen3-ASR-1.7B
+    // fine-tune (tied lm_head). Carries qwen3asr.streaming_recipe=r2t2, which
+    // enables the prefix-rollback realtime session (CrispasrRealtimeSession).
+    // Weights are under the NetEase Youdao Model Use License, not open source.
+    {"confucius4-r2t2", "confucius4-r2t2-q4_k.gguf",
+     "https://huggingface.co/cstr/confucius4-r2t2-GGUF/resolve/main/confucius4-r2t2-q4_k.gguf", "~1.5 GB", nullptr,
+     nullptr, nullptr, "NetEase Youdao Model Use License (see https://huggingface.co/cstr/confucius4-r2t2-GGUF)"},
+    // raon-speech (#455) — KRAFTON/Raon-Speech-9B, speech-to-text subset only
+    // (Qwen3-Omni audio tower + EmbeddingAdaptor + Qwen3 36L LLM); runs on the
+    // qwen3-asr runtime (qwen3asr.variant = raon-speech). English + Korean.
+    // CC-BY-NC-4.0: NON-COMMERCIAL, like the raon TTS entries.
+    {"raon-speech", "raon-speech-9b-q4_k.gguf",
+     "https://huggingface.co/cstr/raon-speech-9b-GGUF/resolve/main/raon-speech-9b-q4_k.gguf", "~5.0 GB", nullptr,
+     nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (KRAFTON/Raon-Speech-9B, "
+     "https://huggingface.co/KRAFTON/Raon-Speech-9B)"},
     // Qwen3-ASR-1.7B fine-tuned for Japanese anime/galgame speech (Apache-2.0).
     // Same architecture as qwen3-1.7b; uses the standard qwen3 backend.
     {"qwen3-ja-anime", "qwen3-asr-1.7b-ja-anime-q4_k.gguf",
@@ -312,6 +366,9 @@ constexpr Entry k_registry[] = {
      "mimo-tokenizer-q4_k.gguf",
      "https://huggingface.co/cstr/mimo-tokenizer-GGUF/resolve/main/mimo-tokenizer-q4_k.gguf",
      "~395 MB"},
+    {"hojo-asr", "hojo-asr-multi-v1-q4_k.gguf",
+     "https://huggingface.co/cstr/Hojo-ASR-Multi-V1-GGUF/resolve/main/hojo-asr-multi-v1-q4_k.gguf",
+     "~4.4 GB", nullptr, nullptr},
     {"moss-audio", "moss-audio-4b-instruct-q4_k.gguf",
      "https://huggingface.co/cstr/MOSS-Audio-4B-Instruct-GGUF/resolve/main/moss-audio-4b-instruct-q4_k.gguf", "~3.8 GB",
      nullptr, nullptr},
@@ -335,6 +392,9 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/data2vec-audio-960h-GGUF/resolve/main/data2vec-audio-base-960h-q4_k.gguf", "~60 MB", nullptr, nullptr},
     {"vibevoice", "vibevoice-asr-q4_k.gguf",
      "https://huggingface.co/cstr/vibevoice-asr-GGUF/resolve/main/vibevoice-asr-q4_k.gguf", "~4.5 GB", nullptr, nullptr},
+    {"vibevoice-streaming", "vibevoice-asr-streaming-1.5b-q4_k.gguf",
+     "https://huggingface.co/cstr/vibevoice-asr-streaming-1.5b-GGUF/resolve/main/vibevoice-asr-streaming-1.5b-q4_k.gguf",
+     "~1.86 GB", nullptr, nullptr},
     {"vibevoice-bitnet", "vibevoice-asr-bitnet-tq2.gguf",
      "https://huggingface.co/cstr/vibevoice-asr-bitnet-GGUF/resolve/main/vibevoice-asr-bitnet-tq2.gguf", "~1.6 GB",
      nullptr, nullptr},
@@ -657,6 +717,42 @@ constexpr Entry k_registry[] = {
     {"parakeet-v2", "parakeet-tdt-0.6b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v2-GGUF/resolve/main/parakeet-tdt-0.6b-v2-q4_k.gguf",
      "~468 MB", nullptr, nullptr},
+    // parakeet-ultra (#454) — moondream/parakeet-ultra: parakeet-tdt-0.6b-v3
+    // architecture in transformers' ParakeetForTDT format (converter --hf).
+    // Transcripts equal transformers and moondream Photon at F16/Q8_0/Q4_K.
+    {"parakeet-ultra", "parakeet-ultra-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-ultra-GGUF/resolve/main/parakeet-ultra-q4_k.gguf", "~402 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/moondream/parakeet-ultra)"},
+    // parakeet-redux (#454) — moondream/parakeet-redux: parakeet-tdt-0.6b-v3
+    // architecture shipped in transformers' ParakeetForTDT format with a
+    // base-3 packed ternary encoder; the converter dequantises it exactly
+    // (--hf). Transcripts equal transformers and moondream Photon at F16,
+    // Q8_0 and Q4_K on en + de.
+    {"parakeet-redux", "parakeet-redux-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-redux-GGUF/resolve/main/parakeet-redux-q4_k.gguf", "~402 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/moondream/parakeet-redux)"},
+    // orukeet (#445) — oruk/orukeet r3, a fine-tune of parakeet-tdt-0.6b-v3
+    // with the architecture unchanged (half of the encoder's depthwise conv
+    // kernels replaced by fitted Gabor functions, then re-adapted). Same 25
+    // languages, same runtime; the backend is detected from the GGUF. Its
+    // final adaptation trained on LibriSpeech test-other, so its scores on
+    // that split are not a held-out measurement.
+    {"orukeet", "orukeet-q4_k.gguf", "https://huggingface.co/cstr/orukeet-GGUF/resolve/main/orukeet-q4_k.gguf",
+     "~402 MB", nullptr, nullptr, nullptr, "CC-BY-SA-4.0 (see https://huggingface.co/oruk/orukeet)"},
+    // Dolphin CN-Dialect small streaming (#436) — DataoceanAI, E-Branchformer +
+    // Transformer decoder + CTC, Mandarin plus 20+ Chinese dialects. Q4_K is the
+    // default: on 15 in-domain clips it matched F16 exactly on 13 and differed by
+    // one trailing particle on the other two, as Q8_0 did (tools/kaggle/dolphin-quant-text).
+    {"dolphin", "dolphin-cn-dialect-small-streaming-q4_k.gguf",
+     "https://huggingface.co/cstr/dolphin-cn-dialect-small-streaming-GGUF/resolve/main/"
+     "dolphin-cn-dialect-small-streaming-q4_k.gguf",
+     "~258 MB", nullptr, nullptr},
+    // X-ASR zh-en (#436) — GilgameshWind, icefall streaming Zipformer2
+    // transducer (zh + en, punctuation + casing). One GGUF serves all four
+    // upstream chunk sizes (CRISPASR_XASR_CHUNK_MS). Q8_0 by default: zh
+    // transcripts match F16 at Q8_0 and Q4_K; Q4_K drops English punctuation.
+    {"xasr", "x-asr-zh-en-q8_0.gguf", "https://huggingface.co/cstr/x-asr-zh-en-GGUF/resolve/main/x-asr-zh-en-q8_0.gguf",
+     "~168 MB", nullptr, nullptr},
     // parakeet-tdt-1.1b — larger TDT, English-only, 42-layer encoder
     // (vs 24 for 0.6b). Lowercase + no punctuation output. Slower but
     // wins on very long-tail vocabulary.
@@ -727,9 +823,69 @@ constexpr Entry k_registry[] = {
     {"miotts", "miotts-0.6b-q8_0.gguf",
      "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/miotts-0.6b-q8_0.gguf",
      "~723 MB"},
+    // Onsets & Frames (Hawthorne et al. 2018, MIT): piano note events, from
+    // the ddPn08/onsets-and-frames checkpoint's ONNX export. q8_0 rather than
+    // f16 or q4_0 deliberately — measured on all ten MusicNet test pieces it
+    // is F1-identical to fp32 (49.6% overall, 69.0% solo piano) at a third of
+    // the size, while q4_0 costs 0.5 points of F1-with-offsets because it
+    // perturbs the frame head, which sets note durations, five times as hard
+    // as the onset head. q4_0 and f32 are in the same repo for callers that
+    // want them.
+    // hFT-Transformer (Toyama et al., ISMIR 2023, sony/hFT-Transformer, MIT):
+    // piano note events from a hierarchical frequency-time transformer.
+    // q4_0 deliberately, and unusually: measured on all ten MusicNet test
+    // pieces it LOSES nothing against fp32 (52.55% vs 52.21% overall, 70.71%
+    // vs 70.52% solo piano). The head q4_0 perturbs most here is velocity,
+    // and velocity feeds the decoder's ignore_zero gate rather than a note
+    // duration -- so its errors change which notes survive, not how long
+    // they last. Contrast onsets-and-frames above, where q4_0 damages the
+    // frame head and costs 0.5 points of F1-with-offsets.
+    // Read docs/music-transcription/HFT_TRANSFORMER.md before choosing this
+    // over onsets-and-frames: it is 1.4 points better on solo piano and
+    // roughly 5x the compute.
+    {"hft-transformer", "hft-transformer-q4_0.gguf",
+     "https://huggingface.co/cstr/hft-transformer-GGUF/resolve/main/hft-transformer-q4_0.gguf",
+     "~4.5 MB"},
+    {"onsets-and-frames", "onsets-and-frames-q8_0.gguf",
+     "https://huggingface.co/cstr/onsets-and-frames-GGUF/resolve/main/onsets-and-frames-q8_0.gguf",
+     "~31 MB"},
+    // hFT-Transformer (Toyama et al., ISMIR 2023, MIT): piano note events from
+    // a hierarchical frequency-time transformer, 5.5 M parameters. The
+    // smallest strong piano transcriber measured here — 70.5% note F1 on
+    // MusicNet's solo-piano pieces against Onsets & Frames' 69.0% — at 7 MiB
+    // of q8_0 weights, and quantisation is free on accuracy: 52.23% overall
+    // and 70.51% solo piano at q8_0 against fp32's 52.21% / 70.52%. It is also
+    // by far the most EXPENSIVE to run: 249 GFLOP of matrix multiply per 2 s
+    // of audio, and q8_0 costs 29% MORE cpu than f32 rather than less, on a
+    // CPU without int8 dot-product instructions. Read
+    // docs/music-transcription/HFT_TRANSFORMER.md before choosing it over
+    // onsets-and-frames. NOTE: the HF repo is not uploaded yet, so
+    // auto-download will 404; build the GGUF locally with
+    // models/convert-hft-transformer-to-gguf.py.
+    {"hft-transformer", "hft-transformer-q8_0.gguf",
+     "https://huggingface.co/cstr/hft-transformer-GGUF/resolve/main/hft-transformer-q8_0.gguf",
+     "~7 MB"},
     {"piano-transcription", "piano-transcription-f16.gguf",
      "https://huggingface.co/cstr/piano-transcription-GGUF/resolve/main/piano-transcription-f16.gguf",
      "~77 MB"},
+    // Basic Pitch (Spotify, ICASSP 2022, Apache-2.0): polyphonic note events.
+    // Tiny — the CQT kernels are most of the file. NOTE: the HF repo is not
+    // uploaded yet, so auto-download will 404; build the GGUF locally with
+    // models/convert-basic-pitch-to-gguf.py against the nmp.onnx that ships
+    // inside the basic-pitch package.
+    {"basic-pitch", "basic-pitch-f16.gguf",
+     "https://huggingface.co/cstr/basic-pitch-GGUF/resolve/main/basic-pitch-f16.gguf",
+     "~110 KB"},
+    // Magenta MT3 (ISMIR 2021 / ICLR 2022, Apache-2.0): multi-instrument
+    // transcription — every note carries a General-MIDI program. The GGUF is
+    // published (d8bdabcd) and auto-download resolves; an earlier note here
+    // said the repo was not uploaded and `-m auto` would 404, which stopped
+    // being true and would now send a reader to build it by hand for nothing.
+    // models/convert-mt3-to-gguf.py still rebuilds it from the T5X checkpoint
+    // at gs://mt3/checkpoints/mt3 if you want your own.
+    {"mt3", "mt3-f16.gguf",
+     "https://huggingface.co/cstr/mt3-GGUF/resolve/main/mt3-f16.gguf",
+     "~96 MB"},
     {"moss-tts", "moss-tts-v1.5-q4_k.gguf",
      "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-q4_k.gguf",
      "~5 GB",
@@ -987,6 +1143,17 @@ constexpr Entry k_registry[] = {
     // Qwen2.5-1.5B LLM + 18L DiT flow-matching + BigVGAN vocoder.
     // No discrete codec tokens — generates continuous latents patch-by-patch.
     // BPE text input (no phonemes). Vocoder is a separate GGUF companion.
+    // FireRedTTS3 (#377): FireRedTeam zero-shot voice-cloning TTS —
+    // Qwen3-1.7B LLM + PatchEncoder + DiT flow head over continuous RedAE
+    // latents (24 kHz). The redae companion carries the RedAE autoencoder +
+    // CAM++ speaker encoder. ICL cloning: --voice ref.wav --ref-text "...";
+    // without --voice a default English prompt baked into the core is used.
+    {"fireredtts3", "fireredtts3-base-q4_k.gguf",
+     "https://huggingface.co/cstr/fireredtts3-GGUF/resolve/main/fireredtts3-base-q4_k.gguf",
+     "~1.6 GB",
+     "fireredtts3-redae-f16.gguf",
+     "https://huggingface.co/cstr/fireredtts3-GGUF/resolve/main/fireredtts3-redae-f16.gguf",
+     "~1.2 GB", "Apache-2.0 (base FireRedTeam/FireRedTTS3)"},
     {"dots-tts", "dots-tts-soar-f16.gguf",
      "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-f16.gguf",
      "~4.4 GB",
@@ -1058,8 +1225,59 @@ constexpr Entry k_registry[] = {
     {"f5-tts", "f5-tts-v1-base-f16.gguf",
      "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-f16.gguf",
      "~953 MB", nullptr, nullptr},
+    // Raon-OpenTTS 0.3B (#387-adj): KRAFTON's F5-TTS DiT + sbhifigan16k
+    // HiFi-GAN, English zero-shot voice cloning. Rides the f5-tts runtime
+    // (same DiT; norm_type=rmsnorm is dead metadata with post_norm=False).
+    // Single GGUF carries DiT + HiFi-GAN + the shipped slaney mel fb/window.
+    // TTS→ASR roundtrip validated on Kaggle (word overlap 0.90). The HiFi-GAN
+    // vocoder runs through the shared GPU-capable core_hifigan graph (#387);
+    // the DiT ODE loop is the remaining cost and runs on-device in a GPU build.
+    // Breeze TTS 2 (#412): T5Gemma2 text encoder -> Qwen3 backbone -> 12L depth
+    // decoder over 16 codebooks at 12.5 Hz, en + zh. The codec is NOT in the
+    // model file — Breeze's bundled audio tokenizer is bit-identical to
+    // Qwen3-TTS-Tokenizer-12Hz, so it rides along as the companion below
+    // rather than being repacked.
+    //
+    // The licence string MUST begin with the bare word "other": license_tag()
+    // takes everything up to the first space, and "other" is on the restricted
+    // list, which is what makes crispasr_license_requires_acceptance() true and
+    // makes -m auto refuse without CRISPASR_ACCEPT_LICENSE=other. Rewording
+    // this to lead with anything else silently un-gates non-commercial weights.
+    // tests/test-registry.cpp pins that, including a control that the same
+    // predicate returns false for a permissive string.
+    {"bt2-tts", "breeze-tts-2-q4_k.gguf",
+     "https://huggingface.co/cstr/breeze-tts-2-GGUF/resolve/main/breeze-tts-2-q4_k.gguf",
+     "~2.2 GB",
+     "qwen3-tts-tokenizer-12hz.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
+     "~60 MB",
+     "other — NON-COMMERCIAL use only (BreezeBlue Research and Non-Commercial License Agreement v1.1, "
+     "RESONIA INC; quantization is a Derivative Model under §1.3 so this GGUF inherits the terms; "
+     "hosting-as-a-service is commercial under §1.7(b); https://huggingface.co/BreezeBlue/Breeze-TTS-2)"},
+    {"raon", "raon-opentts-0.3b-f16.gguf",
+     "https://huggingface.co/cstr/raon-opentts-0.3b-GGUF/resolve/main/raon-opentts-0.3b-f16.gguf",
+     "~959 MB", nullptr, nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (KRAFTON/Raon-OpenTTS-0.3B, "
+     "https://huggingface.co/KRAFTON/Raon-OpenTTS-0.3B)"},
+    // Raon-OpenTTS 1B: larger DiT (dim=1408 depth=28 heads=24x64 ff_mult=4);
+    // same sbhifigan16k mel + HiFi-GAN vocoder as the 0.3B. Roundtrip validated
+    // on Kaggle. Use --backend raon-1b (or -m auto with this key).
+    {"raon-1b", "raon-opentts-1b-f16.gguf",
+     "https://huggingface.co/cstr/raon-opentts-1b-GGUF/resolve/main/raon-opentts-1b-f16.gguf",
+     "~2.8 GB", nullptr, nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (KRAFTON/Raon-OpenTTS-1B, "
+     "https://huggingface.co/KRAFTON/Raon-OpenTTS-1B)"},
     // Irodori-TTS v3 500M: RF-DiT flow-matching TTS with zero-shot voice
     // cloning via DAC-VAE latents. 48 kHz output, Japanese-focused.
+    // Supertonic-3 (#434): Supertone/supertonic-3, non-AR flow-matching TTS,
+    // 44.1 kHz, 31 languages, 10 preset voices baked into the single GGUF
+    // (unicode indexer + NFKD tables included — no companions). Weights are
+    // OpenRAIL-M: permissive incl. commercial, but carries use restrictions +
+    // attribution, so the license field prints on first download.
+    {"supertonic", "supertonic3-f16.gguf",
+     "https://huggingface.co/cstr/supertonic-3-GGUF/resolve/main/supertonic3-f16.gguf",
+     "~200 MB", nullptr, nullptr, nullptr,
+     "OpenRAIL-M — use restrictions + attribution: https://huggingface.co/Supertone/supertonic-3"},
     {"irodori-tts", "irodori-tts-500m-v3-q4_k.gguf",
      "https://huggingface.co/cstr/irodori-tts-GGUF/resolve/main/irodori-tts-500m-v3-q4_k.gguf",
      "~852 MB",
@@ -1254,6 +1472,24 @@ constexpr Entry k_registry[] = {
     // Apache 2.0. Tokenizer-free, voice cloning via reference audio.
     // Default: Q4_K (1.6 GB, practical for CPU). F16 at same repo.
     {"voxcpm2-tts", "voxcpm2-q4_k.gguf",
+     "https://huggingface.co/cstr/voxcpm2-GGUF/resolve/main/voxcpm2-q4_k.gguf",
+     "~1.6 GB", nullptr, nullptr},
+    // #433: the SAME artifact, reachable under the VAE backend's own name.
+    //
+    // voxcpm2-vae is a second backend over one file, not a second model:
+    // voxcpm2_vae_init_from_file() calls the same voxcpm2_init_internal()
+    // loader with vae_only=true. Without an entry here `-m auto --backend
+    // voxcpm2-vae` could not resolve anything and the user had to know to pass
+    // the TTS GGUF by path — which is exactly the discoverability gap the
+    // reporter hit.
+    //
+    // Deliberately the same filename, not a separate VAE-only export. The cache
+    // keys on the filename, so anyone who already pulled it for TTS gets the VAE
+    // backend for free, and there is no second artifact to convert, host,
+    // version and keep in sync — a VAE-only GGUF cut from the same weights is a
+    // divergence risk for a saving that only matters to someone who wants the
+    // upscaler and nothing else. Split it out if that case turns up.
+    {"voxcpm2-vae", "voxcpm2-q4_k.gguf",
      "https://huggingface.co/cstr/voxcpm2-GGUF/resolve/main/voxcpm2-q4_k.gguf",
      "~1.6 GB", nullptr, nullptr},
     // CosyVoice3 0.5B-2512: FunAudioLLM streaming multilingual TTS,
@@ -1850,6 +2086,14 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
         if (f) {
             fclose(f);
             return model_arg;
+        }
+        // A bare explicit filename is also allowed to live in the configured
+        // model roots.  Preserve its exact identity: do this before registry
+        // matching, whose backend fallback may name a different voice (#397).
+        if (model_arg.find_first_of("/\\") == std::string::npos) {
+            const std::string cached_explicit = crispasr_cache::probe_cached_file(model_arg, cache_dir_override);
+            if (!cached_explicit.empty())
+                return cached_explicit;
         }
 
         // File not found — try registry-based download when permitted.

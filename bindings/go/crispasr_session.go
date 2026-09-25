@@ -5,7 +5,7 @@ package whisper
 // qwen3-tts, moss-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
 // bananamind-tts, melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
 // cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio,
-// dots-tts, ...)
+// dots-tts, fireredtts3, ...)
 // and S2S-capable backends (lfm2-audio, mini-omni2), plus the kokoro
 // per-language model + voice resolver (PLAN #56 opt 2b).
 
@@ -590,7 +590,7 @@ func (s *CrispasrSession) SetFrequencyPenalty(penalty float32) error {
 }
 
 // SetTTSSteps sets the diffusion / CFM / masked-iterative step count for
-// step-based TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori,
+// step-based TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori, supertonic,
 // omnivoice). Higher = better fidelity, slower. Other backends silently no-op.
 func (s *CrispasrSession) SetTTSSteps(steps int) error {
 	rc := C.crispasr_session_set_tts_steps(s.handle, C.int(steps))

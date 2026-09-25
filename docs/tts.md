@@ -1,7 +1,8 @@
 # Text-to-Speech (TTS)
 
-CrispASR ships **thirty-five open-weights TTS engine families** (55 registered
-TTS backends once variants are counted — see `docs/feature-matrix.md`) behind
+CrispASR ships **62 registered open-weights TTS backends** — roughly three
+dozen distinct engine families once variants are folded; the authoritative
+auto-generated list is [`docs/feature-matrix.md`](feature-matrix.md) — behind
 the same `crispasr` binary, each with a distinct voice / quality / footprint
 trade-off:
 
@@ -15,6 +16,7 @@ trade-off:
 - [Output language and cross-lingual cloning](#output-language-and-cross-lingual-cloning--tl---sl) — `-tl` / `-sl`, what each backend does
 - [G2P Phonemization](#g2p-phonemization---g2p-dict) — `--g2p-dict`, number expansion, phoneme dialects
   - [Driving the phonemes directly (`--tts-phonemes`)](#driving-the-phonemes-directly---tts-phonemes)
+  - [Zonos G2P strategy (`CRISPASR_ZONOS_G2P`)](#zonos-g2p-strategy-crispasr_zonos_g2p) — built-in vs espeak, measured per language
 - [Kokoro](#kokoro--multilingual-smallest) — multilingual, smallest
 - [Qwen3-TTS](#qwen3-tts--voice-cloning-highest-fidelity) — voice cloning, highest fidelity
   - [qwen3-tts environment switches](#qwen3-tts-environment-switches)
@@ -32,6 +34,7 @@ trade-off:
 - [IndexTTS](#indextts--chineseenglish-voice-cloning) — Chinese/English voice cloning
   - [Chinese text normalization](#indextts-chinese-text-normalization)
 - [Irodori-TTS](#irodori-tts--japanese-voice-cloning--emoji-emotion-control) — Japanese, emoji emotion control
+- [Supertonic-3](#supertonic-3--fast-multilingual-on-device-tts) — 31 languages, non-AR flow matching, 44.1 kHz
 - [Reference-conditioning cache](#reference-conditioning-cache)
 - [Local speaker output (`--tts-play`)](#local-speaker-output---tts-play)
 - [AI-generated audio provenance & watermarking](#ai-generated-audio-provenance--watermarking)
@@ -42,7 +45,7 @@ trade-off:
 | Backend | Why pick it | Voice cloning | First-run download |
 |---|---|---|---|
 | **`melotts`** | Multilingual VITS2 (MeloTTS). 4 English speakers (US/BR/India/AU). 44.1 kHz output, ~102 MB GGUF. Neural G2P + CMU dict. BERT companion (Q4_K 52 MB) auto-downloads with `-m auto`; also via `--codec-model` or `CRISPASR_MELOTTS_BERT` env. | No (per-speaker ID) | ~154 MB via `-m auto` |
-| **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
+| [`piper`](#piper--community-voices) | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | ~30 MB default via `-m auto`; other voices are manual downloads |
 | [`kokoro`](#kokoro--multilingual-smallest) | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
 | [`qwen3-tts`](#qwen3-tts--voice-cloning-highest-fidelity) | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
 | **`miotts`** | MioTTS-0.6B (Qwen3 LLM + MioCodec-v2). EN/JA. Single GGUF, 24 kHz output. Codec-aware mixed quantization (LLM Q4_K + codec F16). | Yes — `--voice preset.emb.gguf` (preset speaker embeddings) | 502 MB Q4_K via `-m auto` |
@@ -55,12 +58,59 @@ trade-off:
 | [`chatterbox`](#chatterbox--flow-matching-tts-voice-cloning--multilingual) | T3 AR + S3Gen flow-matching + HiFTGenerator. Built-in voice baked into the T3 GGUF; clones via a baked voice GGUF (see workflow below). EN/AR/DE variants share runtime. | Yes (`--voice <voice.gguf>`, baked from a WAV with `models/bake-chatterbox-voice-from-wav.py`) | ~880 MB via `-m auto` (T3 Q8 + S3Gen Q8) |
 | **`outetts`** | OuteTTS-0.3-1B: OLMo-1B LLM + WavTokenizer single-codebook VQ-GAN. CC-BY-NC-SA-4.0 (non-commercial, ShareAlike). 24 kHz output. | Yes (`--voice <speaker.json>`, created with `tools/reference_backends/outetts_create_speaker.py`) | ~2.5 GB via `-m auto` (talker F16 + WavTokenizer decoder) |
 | [`f5-tts`](#f5-tts--dit-flow-matching-voice-cloning) | F5-TTS v1 Base: 22-layer DiT flow-matching TTS + Vocos iSTFT vocoder. MIT license. High-quality zero-shot voice cloning from 3-15s reference audio. 24 kHz output. English + Chinese (built-in pinyin g2p, #294). | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~953 MB via `-m auto` (single F16 GGUF, DiT + Vocos) |
+| [`raon`](#f5-tts--dit-flow-matching-voice-cloning) | Raon-OpenTTS 0.3B (KRAFTON): F5-TTS DiT on the same runtime, paired with a 16 kHz HiFi-GAN vocoder (sbhifigan16k, slaney mel). English zero-shot voice cloning. **CC-BY-NC-4.0** (non-commercial; auto-download prints the restriction). TTS→ASR roundtrip validated (0.90). Note: CPU vocoder ~40s/utterance. | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~959 MB via `-m auto` (single GGUF: DiT + HiFi-GAN) |
+| [`raon-1b`](#f5-tts--dit-flow-matching-voice-cloning) | Raon-OpenTTS 1B (KRAFTON): the larger DiT (dim 1408, depth 28, 24x64 heads) on the same runtime and the same sbhifigan16k HiFi-GAN vocoder as `raon`. **CC-BY-NC-4.0** (non-commercial; auto-download prints the restriction). TTS->ASR roundtrip validated on Kaggle GPU. Needs the default manual-SDPA attention path — `CRISPASR_F5_FLASH=1` reintroduces the F16 KQ accumulation that made this size diverge to NaN on kernels ignoring the precision hint. | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~2.8 GB via `-m auto` (single GGUF: DiT + HiFi-GAN) |
+| [`supertonic`](#supertonic-3--fast-multilingual-on-device-tts) | Supertonic-3: non-autoregressive flow-matching TTS (Supertone). ConvNeXt+attention text encoder, 8-step Euler flow with baked-in CFG (4·cond − 3·uncond), ConvNeXt vocoder at 512 samples/frame. 44.1 kHz, 31 languages, ~99 M params. OpenRAIL-M weights (use restrictions + attribution). 10 fixed preset voices baked into the single GGUF — no cloning in the open release. `--voice F1..F5/M1..M5`, `--tts-speed`, `--tts-steps`. | No (fixed presets) | ~200 MB F16 (single file) |
 | [`irodori-tts`](#irodori-tts--japanese-voice-cloning--emoji-emotion-control) | Irodori-TTS: RF-DiT flow-matching TTS with LowRankAdaLN + JointAttention + half-RoPE + SwiGLU. 48 kHz via Semantic-DACVAE-Japanese-32dim codec. MIT license. Japanese-focused (llm-jp-3 tokenizer). Zero-shot voice cloning from any reference WAV (DAC-VAE encoder + speaker CFG); emoji emotion control; duration predictor for output length. **VoiceDesign** (600M-v3): adds caption encoder for style/emotion control via text descriptions (`--instruct "calm adult male, deep voice"`); independent text/speaker/caption CFG. | Yes (`--voice <ref.wav> --i-have-rights`) | ~526 MB Q4_K (VoiceDesign) / ~852 MB Q4_K (base) + DAC-VAE codec |
 | [`indextts`](#indextts--chineseenglish-voice-cloning) | IndexTTS-1.5: GPT-2 AR (24L/1280d) mel-code generator + BigVGAN vocoder. Designed for Chinese+English. Zero-shot voice cloning from any reference WAV. | Yes (`--voice <ref.wav>`) | ~2.4 GB via `-m auto` (GPT F16 + BigVGAN F16) |
 | [`cosyvoice3-tts`](#cosyvoice3--voice-cloning-from-a-wav) | Fun-CosyVoice3-0.5B-2512: Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) @ 24 kHz. 9 languages + 18 Chinese dialects. Ships an 8-voice baked bank (`zero_shot` + `fleurs-{en,de,zh,ja,fr,es,ko}`). | Yes — baked-bank name via `--voice <name>`, **or** native arbitrary-WAV cloning via `--voice <ref.wav> --ref-text "..."` (ports speech_tokenizer_v3 + CAMPPlus + matcha mel to ggml; speech tokens byte-exact vs ONNX). | ~1.2 GB via `-m auto` (Q4_K LLM + Q8_0 flow + HiFT + s3tok + campplus + voices) |
+
+## Piper — community voices
+
+The default US Lessac voice needs no manual model download:
+
+```powershell
+.\crispasr.exe --backend piper -m auto --tts "Hello from Piper." --tts-output piper.wav
+```
+
+For another voice, download its GGUF from
+[`cstr/piper-voices-GGUF`](https://huggingface.co/cstr/piper-voices-GGUF).
+Either pass the full path, or put it in `CRISPASR_MODELS_DIR` and pass its bare
+filename. CrispASR resolves that exact file; it does not replace an unknown
+community voice with the registered US default (#397).
+
+```powershell
+$env:CRISPASR_MODELS_DIR = 'D:\ai\crispasr'
+.\crispasr.exe --backend piper -m piper-en_GB-cori-medium-f16.gguf `
+  --tts "Hello from the Cori voice." --tts-output cori.wav
+```
+
+For the HTTP server and PowerShell, keep `-t 8` separate from `-l en` and call
+the real curl executable (PowerShell aliases `curl` in some versions):
+
+```powershell
+.\crispasr.exe --server --backend piper `
+  -m piper-en_GB-cori-medium-f16.gguf -l en -t 8 --port 8089 `
+  --no-spoken-disclaimer --accept-marking-responsibility
+
+curl.exe -sS http://localhost:8089/v1/audio/speech `
+  -H 'Content-Type: application/json' `
+  --data-raw '{"model":"piper","input":"Hello, how are you today?","spoken_disclaimer":false,"response_format":"wav"}' `
+  --output piper-server.wav
+```
+
+Writing a WAV with `--output` avoids sending binary audio through PowerShell's
+object pipeline. To test raw streaming in `cmd.exe`, request
+`"stream":true,"response_format":"pcm"` and pipe `curl.exe` to
+`ffplay.exe -f s16le -ar 22050 -ac 1 -nodisp -`.
+
+## More TTS backends
+
+| Backend | Why pick it | Voice cloning | First-run download |
+|---|---|---|---|
 | **`csm`** | Sesame CSM-1B: Llama-3.2 1B backbone (first-codebook AR) + 100M depth decoder (codebooks 1–31) + Kyutai Mimi codec (32-codebook RVQ → SEANet) @ 24 kHz. Single GGUF. Apache-2.0. | No (single built-in voice) | ~1.4 GB via `-m auto` (single Q4_K GGUF) |
 | **`dia`** | Nari Labs Dia 1.6B: byte-level text encoder (12L) + AR audio decoder (18L GQA) + 9-codebook DAC codec @ 44.1 kHz. CFG-guided, dialogue-style with `[S1]`/`[S2]` speaker tags. Apache-2.0. | No (dialogue via speaker tags) | ~1.6 GB via `-m auto` |
-| **`zonos-tts`** | Zyphra Zonos-v0.1-transformer: 26-layer GQA AR transformer → 9-codebook DAC @ 44.1 kHz. Rich conditioning: speaker embedding + text + emotion + FWHM pitch/tempo. CFG guided. Voice cloning from any reference WAV (pass via `CRISPASR_ZONOS_SPEAKER_EMB_PATH` or `--voice <ref.wav>`). Apache-2.0. | Yes (`--voice <ref.wav>`) | ~1.6 GB Q8_0 (default) or ~931 MB selective-Q4_K (heads/embeddings kept F16, auto-retry guard) or ~3.0 GB F16, via `-m auto` + 104 MB DAC codec. |
+| **`zonos-tts`** | Zyphra Zonos-v0.1-transformer: 26-layer GQA AR transformer → 9-codebook DAC @ 44.1 kHz. Rich conditioning: speaker embedding + text + emotion + FWHM pitch/tempo. CFG guided. Voice cloning from any reference WAV (pass via `CRISPASR_ZONOS_SPEAKER_EMB_PATH` or `--voice <ref.wav>`). Apache-2.0. | No — `zonos_tts_set_voice()` is a stub; the ResNet293 speaker encoder is not ported and no CLI/ABI route to a speaker embedding exists (#435) | ~1.6 GB Q8_0 (default) or ~931 MB selective-Q4_K (heads/embeddings kept F16, auto-retry guard) or ~3.0 GB F16, via `-m auto` + 104 MB DAC codec. |
 | **`bark`** | Suno Bark: 3-stage GPT-2 (text→semantic→coarse→fine) + EnCodec 24 kHz decoder. All sub-models packed into one GGUF. Supports speaker conditioning via `.npz` prompts. MIT license. | Yes (`--voice <speaker.npz>`) | ~423 MB via `-m auto` (selective Q4_K) |
 | **`speecht5`** | Microsoft SpeechT5 80M: char-level encoder (12L) + AR mel decoder (6L) + 5-conv postnet + HiFi-GAN @ 16 kHz. MIT. Speaker via 512-d x-vector. | Yes (`--voice <xvector.bin>`, raw float32) | ~300 MB via `-m auto` (F16 GGUF) |
 | **`fastpitch`** | NVIDIA FastPitch 60M: non-autoregressive parallel TTS — 6L FFTransformer encoder + duration/pitch predictors + length regulator + 6L FFTransformer decoder + HiFi-GAN @ 22 kHz. Deterministic (no sampling). CC-BY-4.0. | No (single speaker) | ~230 MB via `-m auto` (Q8_0 GGUF) |
@@ -73,11 +123,13 @@ trade-off:
 | [`tada` / `tada-3b-ml`](#tada--multilingual-and-voice-cloning) | HumeAI TADA 3B Multilingual: same architecture, 3B params. Supports **ar, ch, de, es, fr, it, ja, pl, pt** in addition to English. `-l <lang>` auto-downloads `tada-ref-<lang>.gguf`. | Yes (`--voice <tada-ref.gguf>`) | ~4 GB Q4_K + ~1 GB codec |
 | **`lfm2-audio`** | LiquidAI LFM2.5-Audio 1.5B: FastConformer encoder + LFM2 hybrid conv+attention backbone + 6L depthformer (8-codebook Mimi) + ISTFT detokenizer → 24 kHz. Interleaved text+audio generation. Also does ASR and speech-to-speech. LFM Open License v1.0 ($10M revenue cap). | No | ~1.5 GB Q4_K (JP) / ~1.6 GB Q5_K (EN) + ~157 MB detokenizer companion |
 | [`dots-tts`](#dotstts--voice-cloning-and-performance) | rednote-hilab dots.tts-soar: Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (16-step Euler CFG) + BigVGAN vocoder → 48 kHz. Continuous-latent AR (patch-by-patch). Apache-2.0. **The CFG flow-match needs an F16 DiT — a full-q8 core derails; use the mixed quant (`crispasr-quantize` keeps the DiT at F16, quantizes the LLM+PatchEncoder to Q8_0 or Q4_K).** CAM++ reference-WAV voice cloning is supported when the speaker companion is present. | Yes (`--voice ref.wav --i-have-rights`) | ~3.1 GB mixed-Q8 / ~2.2 GB mixed-Q4_K core + 330–345 MB vocoder companion |
+| [`fireredtts3`](architecture.md#fireredtts3) | FireRedTeam/FireRedTTS3: Qwen3-1.7B LLM + 8L PatchEncoder + 11L DiT flow head over continuous 64-d 25 Hz RedAE latents; RedAE Qwen3 encoder/decoder + Vocos ISTFT head -> 24 kHz; CAM++ 512-d speaker encoder. Zero-shot ICL voice cloning (24 languages + 21 Chinese dialects): `--voice ref.wav --ref-text "<transcript>"` (auto-transcribed when --ref-text is absent); without `--voice`, a default English prompt baked into the core GGUF is used. Apache-2.0. **Like dots-tts, the DiT flow head must stay F16 — `crispasr-quantize` quantizes only the LLM backbone.** | Yes (`--voice ref.wav --i-have-rights`) | ~1.6 GB mixed-Q4_K core + ~1.0 GB RedAE companion |
+| **`bt2-tts`** | MediaTek Breeze-TTS-2 (BreezeBlue): T5Gemma2 text encoder + Sesame-style backbone/depth AR decoder over qwen3-tts-tokenizer-12hz codec codes (16 codebooks @ 12 Hz) → 24 kHz. Plain TTS, Voice Clone (reference clip + its transcript) and Voice Design (natural-language style instruction). **NON-COMMERCIAL use only** — BreezeBlue Research and Non-Commercial License v1.1; quantization is a Derivative Model under §1.3, so the GGUFs inherit the terms. Default q4_k: an A/B against q8_0 and f16 found q4_k and q8_0 perceptually indistinguishable (f16 is published for reference quality), so the extra 1.14 GiB buys code exactness that does not reach the audio. | Yes (`--voice ref.wav --ref-text <transcript> --i-have-rights`) | ~2.2 GB Q4_K + ~60 MB codec via `-m auto` |
 | **`confucius4-tts`** | NetEase Youdao Confucius4-TTS: GPT-2 T2S (24L/1280d, beam-sample num_beams=3, LlamaTokenizer vocab baked) + flow-matching DiT+WaveNet S2A (25-step Euler CFG 0.7, native w2v-BERT + CAMPPlus style/reference-mel conditioning) + BigVGAN vocoder → 22.05 kHz. Zero-shot voice cloning; 14 languages via Chinese `LANGUAGE_TOKEN_MAP` prompts (`-l <lang>`). Apache-2.0. **Zero-shot only: without `--voice` conditioning the output is unintelligible by design.** | Yes (`--voice ref.wav --i-have-rights`) | ~376 MB Q4_K T2S + ~135 MB S2A + ~214 MB BigVGAN + w2v companion via `-m auto` |
 | **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
 | **`voxtral-tts`** | Mistral Voxtral-4B-TTS-2603: Ministral-3B AR backbone (26L GQA, NORMAL/adjacent-pair RoPE) + 3L bidirectional flow-matching acoustic transformer (8-step Euler ODE + CFG α=1.2, no positional encoding) + Voxtral codec decoder (ALiBi sliding-window attention + reflect-causal conv + ConvTranspose upsampling) → 24 kHz. 20 preset voices across 9 languages (en/fr/de/es/it/pt/nl/ar/hi); strong on French technical text. CC-BY-NC-4.0. | No (20 preset voices via `--voice <name>`, e.g. `fr_female`) | ~2.4 GB Q4_K / ~4.3 GB Q8_0 / ~8.2 GB F16 via `-m auto` |
 
-All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch/bananamind-tts/confucius4-tts, 16 kHz for speecht5, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts/dots-tts/irodori-tts/moss-tts-local/sidon, 24 kHz for most others). Programmatic callers don't need this table: `crispasr_session_output_sample_rate()` returns the active backend's output rate, with `crispasr_session_input_channels()` / `output_channels()` alongside (everything is mono today) — #332.
+All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch/bananamind-tts/confucius4-tts, 16 kHz for speecht5, 44.1 kHz for melotts/dia/parler-tts/zonos-tts/supertonic, 48 kHz for voxcpm2-tts/dots-tts/irodori-tts/moss-tts-local/sidon, 24 kHz for most others). Programmatic callers don't need this table: `crispasr_session_output_sample_rate()` returns the active backend's output rate, with `crispasr_session_input_channels()` / `output_channels()` alongside (everything is mono today) — #332.
 
 ## dots.tts — voice cloning and performance
 
@@ -753,7 +805,62 @@ The phonemization cascade tries in order:
 
 Override per-language dict paths with env vars:
 `CRISPASR_CMUDICT_PATH`, `CRISPASR_DE_DICT_PATH`,
-`CRISPASR_FR_DICT_PATH`, `CRISPASR_ES_DICT_PATH`.
+`CRISPASR_FR_DICT_PATH`, `CRISPASR_ES_DICT_PATH`,
+`CRISPASR_RU_DICT_PATH`.
+
+### Russian G2P — and the one thing it cannot do
+
+Russian is covered by a 812,953-entry IPA dictionary with lexical stress
+already resolved ([`bene-ges/ru_g2p_ipa_bert_large`](https://huggingface.co/bene-ges/ru_g2p_ipa_bert_large),
+**CC-BY-4.0**), published as `ru_g2p_ipa.tsv` on
+[cstr/g2p-dicts](https://huggingface.co/datasets/cstr/g2p-dicts), in front of
+letter-to-sound rules covering palatalisation, voicing assimilation, final
+devoicing, and stress-driven vowel reduction. Stress is the hard half of
+Russian G2P — it is not predictable from spelling and it changes the VOWELS,
+not just the prosody (`молоко` is `[məɫɐkˈo]`: the same letter as three
+different sounds, chosen entirely by distance from the stress).
+
+**Heteronyms are a real, stated limitation, not a rough edge.** The upstream
+project shipped a second file listing 17,359 words it judged genuinely
+ambiguous — and it *removed* them from the vocabulary. The two files are
+disjoint: 0 of the 17,359 appear in the dictionary. They are not entries with a
+chosen reading; they are the words upstream could not choose for. So there is
+no "dictionary reading" to take for `замок` (castle / lock) or `мука`
+(flour / torment), and the letter-to-sound rules pick ONE reading from spelling
+alone. On a genuine heteronym that is wrong roughly half the time.
+
+A dictionary cannot carry sentence context and this one does not pretend to.
+Resolving these needs a model that sees the sentence.
+
+Frequent words are in that set, largely for a mechanical reason: the
+dictionary's keys fold `ё` to `е`, so every `ё`/`е` minimal pair (`всё`/`все`,
+`нёбо`/`небо`) collapses into one ambiguous key and was dropped. Two things
+you can do about it, both honoured by the G2P:
+
+- **write the `ё`.** It is always stressed, so it fixes the stress and the
+  vowel quality at once — `всё` and `все` come out different.
+- **write an explicit stress mark** (combining acute, U+0301) where it matters:
+  `за́мок` → `[ˈzamək]`, `замо́к` → `[zɐmˈok]`. An explicit mark outranks the
+  dictionary when the two disagree, because it is the writer disambiguating on
+  purpose. It is stripped before lookup and never reaches the phoneme string.
+
+Set `CRISPASR_G2P_RU_HETERONYM_WARN=1` to have each ambiguous input word named
+on stderr as it occurs.
+
+Measured, so the two tiers are not read as equally good:
+
+| | |
+|---|---|
+| Dictionary coverage on running text | 89.7% of word tokens (1,073 tokens of Russian Wikipedia summaries) |
+| Rule path, stressed-syllable index correct | 93.9% (control, analogy tier off: 47.1%) |
+| Rule path, exact IPA match vs the dictionary | 79.4% (control: 40.9%) |
+| Rule path, symbol accuracy | 96.6% (control: 82.3%) |
+
+The rule-path rows are a 10,000-word holdout: each word was *removed* from the
+dictionary before the rules were asked for it. That sample is mostly inflected
+forms whose stem is still in the dictionary, which is what the analogy tier
+feeds on — it is not representative of a surname or a neologism, for which only
+the by-syllable-count fallback is left (right 27-61% of the time).
 
 ### Kokoro G2P strategy (`CRISPASR_KOKORO_G2P`)
 
@@ -776,6 +883,114 @@ Dictionary sources at [cstr/g2p-dicts](https://huggingface.co/datasets/cstr/g2p-
 - **Pre-generated IPA** (primary): piper-compatible phonetic transcriptions for EN/DE/FR/ES
 - **CMUdict** (BSD): [cmusphinx/cmudict](https://github.com/cmusphinx/cmudict), English ARPAbet
 - **OLaPh** (MIT): [iisys-hof/olaph](https://github.com/iisys-hof/olaph), 13 languages
+
+### Zonos G2P strategy (`CRISPASR_ZONOS_G2P`)
+
+Zonos conditions on IPA phonemes, and until #435 it could only get them from
+espeak-ng (GPL-3.0). It now also reaches the built-in EN/DE/FR/ES/RU G2P that
+`crispasr-core` ships:
+
+| Value | Behavior |
+|-------|----------|
+| `auto` | espeak-ng first, built-in G2P as a fallback below it (default) |
+| `espeak` | espeak-ng only — the built-in is never consulted |
+| `builtin` | Built-in G2P first, espeak-ng only where no built-in covers the language |
+
+**The default stays espeak-first, deliberately.** The built-ins emit IPA in the
+espeak dialect, but zonos's phoneme inventory is its own 185-symbol
+`conditioning.py` list and anything outside it is dropped *silently* — so
+"the built-in produced audio" is not evidence that it produced the right audio.
+`CRISPASR_ZONOS_G2P_DEBUG=1` prints the path taken, the IPA, the phoneme-ID
+sequence and the count of unmapped codepoints, which is what that question
+actually needs.
+
+#### Measured (Kaggle, CPU, zonos q8_0, ASR roundtrip via parakeet-tdt-0.6b-v3)
+
+`lev` is token-level Levenshtein similarity between the espeak and built-in
+phoneme-ID sequences; `F1` is word-F1 of an ASR roundtrip against the input.
+
+| Lang | lev | F1 espeak | F1 built-in | Verdict |
+|------|-----|-----------|-------------|---------|
+| en | 0.95 | 1.00 | 1.00 | Built-in matches espeak. **Needs CMUdict** — see below. |
+| de | 0.94 | 1.00 | 1.00 | Built-in matches espeak; transcripts identical. |
+| fr | 0.95 | 0.84 | 0.95 | Built-in *beats* espeak (`renard` vs `renarbre`), reproduced across runs. |
+| es | 0.82–0.94 | 0.57 | 0.81 | Built-in higher on all 3 sentences, but the espeak baseline is itself weak — see below. |
+| ru | 0.77 / 0.76 / 0.63 | 0.585 | 0.293 | **Default stays espeak.** All 7 controls fire, so the numbers are evidence — and the evidence does not support a flip: zero dropped symbols on either path, but the built-in is lower and the espeak baseline is itself below the 0.60 floor. See below. |
+
+With espeak-ng physically removed, en/de/fr/es/ru all synthesise and produce
+byte-identical phoneme IDs to the with-espeak built-in run. A language with no
+built-in at all (`ja`) still refuses with a non-zero exit and a zero-byte file —
+the #435 guarantee did not weaken when Russian gained a G2P.
+
+Caveats, because these numbers are easy to over-read:
+
+- **English depends on CMUdict actually loading.** Without it,
+  `phonemize_builtin_en` keeps returning true and falls through to the
+  letter-to-sound rules — "quick brown" becomes `kˈʌɪk bɹˈoʊn`, which an ASR
+  reads back as "cook bone" (F1 1.00 → 0.80). The dictionary auto-downloads; set
+  `CRISPASR_CMUDICT_PATH` if your machine cannot reach the network.
+- **Russian is inconclusive, and not for the reason it looks like.** Measured on
+  three sentences with espeak physically removed and the removal verified
+  (`chr1s4/crispasr-zonos-g2p-ru`). What the run settles:
+
+  - the built-in path drops **zero** codepoints — and that number means
+    something because a control fires on that exact path: a one-line dictionary
+    carrying the upstream backtick stress marker, injected through
+    `CRISPASR_RU_DICT_PATH`, makes the counter report `dropped=1 {U+0060: 1}`.
+    Without that arm, "dropped nothing" is a negative the instrument has never
+    been shown capable of contradicting. espeak's own `ru` voice, by contrast,
+    emits `^` (U+005E) which zonos cannot map — 0.0172% against the built-in's
+    0.0000%, which is asserted by a unit test rather than merely observed;
+  - zonos still synthesises Russian with **no GPL dependency present at all**,
+    producing byte-identical phoneme IDs to the with-espeak built-in run;
+  - the #435 guarantee survives: a language with no built-in (`ja`) still
+    refuses with a non-zero exit and a zero-byte file.
+
+  What it does **not** settle is the default. The espeak arm scores 0.585 —
+  below the 0.60 floor — and 0.000 on one of the three sentences. Zonos-v0.1
+  does not list Russian among its languages, so the roundtrip is measuring
+  zonos's Russian more than it is measuring the G2P. A built-in that "wins"
+  against a collapsed baseline proves nothing; that is exactly the mistake
+  Spanish was nearly passed on.
+
+- **The phoneme-ID gap for Russian is a SPELLING difference, not an error.**
+  espeak's `ru` voice and the built-in transcribe the same sounds in different
+  symbols:
+
+  ```
+  ours    məɫɐkˈo i xlʲep lʲɪʐˈat na stɐlʲˈe v bɐlʲʂˈoj kˈomnətʲe
+  espeak  mʌɭʌkˈo ɪ xɭʲˈep ɭʲiʒˈɑt nə stʌɭʲˈe v bʌɭʃˈoj kˈomnʌtʲi
+  ```
+
+  Over 2,200 dictionary words phonemised both ways, raw symbol agreement is
+  57.7% and not one word matches exactly — and **every symbol on both sides is
+  inside zonos's inventory, so the drop counter is blind to this by
+  construction.** `CRISPASR_ZONOS_RU_DIALECT=espeak` rewrites the built-in's
+  output into espeak's conventions, taking agreement to 88.0%.
+
+- **And converting to espeak's spelling made the audio WORSE, which is the most
+  useful thing this pair of runs produced.** The reasoning was that zonos was
+  phonemised with espeak, so handing it espeak's symbols should help. It did
+  raise phoneme-ID agreement on every sentence (0.773/0.759/0.627 →
+  0.818/0.852/0.847) — and took the ASR roundtrip from 0.293 to **0.000** on
+  every sentence, in both the with-espeak and espeak-removed runs. Six arms,
+  six zeros; the only arm of the three that never produced a recognisable
+  transcript, read back by the ASR as Polish and Dutch.
+
+  So **agreement with the tool a model was trained on is not a proxy for the
+  quality of its audio.** A mechanism story with a measured 30-point number
+  attached is exactly the shape of thing that ships without a roundtrip. The
+  switch is kept, gated and off, the same way `CRISPASR_G2P_DE_UNSTRESS` is.
+
+- **Spanish has no trustworthy baseline.** The espeak arm scores 0.57, so the
+  comparison says as much about the model's Spanish as about the G2P. The
+  built-in was higher on every sentence, but that is "no evidence of harm", not
+  a proof of parity. The two G2Ps also spell the trill differently — espeak
+  writes `ɾɾ`, the built-in writes `r` — and both are in the inventory, so the
+  drop counter cannot see this; only the roundtrip can.
+- **French nasal vowels lose their tilde on both paths.** U+0303 is genuinely
+  absent from zonos's 185 symbols, so this is upstream behaviour, not a
+  CrispASR defect.
 
 ## Kokoro — multilingual, smallest
 
@@ -955,14 +1170,23 @@ languages are the distilled 6-layer releases.
   --voice samples/jfk.wav --i-have-rights --tts-output pocket-es.wav
 ```
 
-Voice cloning takes a reference WAV via `--voice`. Three forms are accepted:
+`--voice` accepts either reference audio or Kyutai's prepared voice states:
 
 - **Absolute/relative path** — `--voice /path/to/ref.wav` (requires `--i-have-rights`).
+- **Official embedding** — `--voice alba.safetensors`. Files from Kyutai's
+  `embeddings_v3` directory are prefilled transformer K/V states, so they work
+  even with a GGUF that omits the Mimi voice-cloning encoder. Match the
+  embedding to the model language/layer count.
 - **Bare name + `--voice-dir`** — `--voice alice --voice-dir voices/` resolves to
-  `voices/alice.wav`. This is what `--server` / `{"voice": "<name>"}` requests use,
-  so a single server can serve multiple voices from one directory (issue #255).
+  `voices/alice.safetensors` when present, then `voices/alice.wav`. This is what
+  `--server` / `{"voice": "<name>"}` requests use, so a single server can serve
+  multiple voices from one directory (issues #255 and #411).
 - **Unset** — auto-loads `samples/jfk.wav` as a default; without any voice the
   output is near-silent.
+
+Prepared embeddings are preset identities, not a claim that the voice is safe
+to impersonate. CrispASR retains its disclosure/marking warning; follow the
+embedding publisher's license and personality-rights terms.
 
 | Variable | Default | Effect when set |
 |---|---|---|
@@ -2020,3 +2244,38 @@ negligible for longer text and for repeated server requests). Pass
 `--no-spoken-disclaimer` / `"spoken_disclaimer": false` to skip it when you
 provide AI-disclosure another way — the watermark and C2PA provenance are
 still embedded.
+
+
+## Supertonic-3 — fast multilingual on-device TTS
+
+[Supertone/supertonic-3](https://huggingface.co/Supertone/supertonic-3) — a
+~99 M-param non-autoregressive flow-matching TTS built for on-device speed.
+The upstream distribution is ONNX-only; CrispASR runs a native ggml port of
+all four graphs (duration predictor, text encoder, vector estimator, vocoder),
+converted into ONE GGUF that embeds the unicode indexer, the NFKD text tables
+and all ten preset voice styles. 44.1 kHz output, 31 languages.
+
+Weights are **OpenRAIL-M**: commercial use allowed, but the license carries
+use restrictions and an attribution requirement (printed on first download).
+The open release has FIXED preset voices only — `--voice` selects a preset
+name (`F1`..`F5`, `M1`..`M5`), not a reference WAV; there is no voice cloning.
+
+```bash
+# English, default voice M1
+crispasr --backend supertonic -m auto --tts "Hello from Supertonic." -o out.wav
+
+# German, female preset, a little faster, fewer flow steps
+crispasr --backend supertonic -m auto --tts "Guten Tag, wie geht es dir?" \
+    -l de --voice F2 --tts-speed 1.1 --tts-steps 8 -o out_de.wav
+```
+
+- `-l LANG` — one of: en ko ja ar bg cs da de el es et fi fr hi hr hu id it
+  lt lv nl pl pt ro ru sk sl sv tr uk vi (language is conditioned via
+  `<lang>` tags in the character stream; there is no phonemizer).
+- `--tts-steps N` — flow-matching Euler steps (default 8). Each step runs two
+  vector-field passes (classifier-free guidance is part of the model's
+  update rule: `v = 4·v_cond − 3·v_uncond`).
+- `--tts-speed X` — multiplies the upstream default rate 1.05.
+- Long text is chunked at sentence boundaries (300 chars; 120 for ko/ja) and
+  joined with 0.3 s silences, matching the upstream SDK.
+- Env: `SUPERTONIC_BENCH=1` prints per-stage timings.

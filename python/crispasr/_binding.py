@@ -507,6 +507,8 @@ class DiarizeMethod:
     XCORR = 1       # stereo only
     VAD_TURNS = 2   # mono-friendly, timing-based
     PYANNOTE = 3    # mono-friendly, GGUF pyannote seg model
+    FOXNOSE = 4     # mono-friendly, WeSpeaker + spectral clustering
+    SORTFORMER = 5  # mono-friendly, NVIDIA Nemotron-3-Diarization (model path in pyannote_model_path)
 
 
 @dataclass
@@ -520,6 +522,52 @@ class DiarizeSegment:
     t0: float
     t1: float
     speaker: int = -1
+
+
+@dataclass
+class DiarizeTurn:
+    """One audio-derived speaker turn returned by FoxNose.
+
+    Times are seconds on the same absolute timeline as
+    :class:`DiarizeSegment`. Other diarization methods return no turns.
+    """
+    t0: float
+    t1: float
+    speaker: int
+
+
+class _DiarizeSegAbi(ctypes.Structure):
+    _fields_ = [
+        ("t0_cs", ctypes.c_int64),
+        ("t1_cs", ctypes.c_int64),
+        ("speaker", ctypes.c_int32),
+        ("_pad", ctypes.c_int32),
+    ]
+
+
+class _DiarizeOptsAbi(ctypes.Structure):
+    # APPEND-ONLY mirror of crispasr_diarize_opts_abi. Keep the explicit
+    # padding field: native code reads all 48 bytes on 64-bit platforms.
+    _fields_ = [
+        ("method", ctypes.c_int32),
+        ("n_threads", ctypes.c_int32),
+        ("slice_t0_cs", ctypes.c_int64),
+        ("pyannote_model_path", ctypes.c_char_p),
+        ("foxnose_embedder_path", ctypes.c_char_p),
+        ("min_speakers", ctypes.c_int32),
+        ("max_speakers", ctypes.c_int32),
+        ("num_speakers", ctypes.c_int32),
+        ("_pad2", ctypes.c_int32),
+    ]
+
+
+class _DiarizeTurnAbi(ctypes.Structure):
+    _fields_ = [
+        ("t0_cs", ctypes.c_int64),
+        ("t1_cs", ctypes.c_int64),
+        ("speaker", ctypes.c_int32),
+        ("_pad", ctypes.c_int32),
+    ]
 
 
 # =========================================================================
@@ -1109,17 +1157,79 @@ def diarize_segments(
     pyannote_model_path: Optional[str] = None,
     n_threads: int = 4,
     slice_t0: float = 0.0,
+    foxnose_embedder_path: Optional[str] = None,
+    min_speakers: int = 0,
+    max_speakers: int = 0,
+    num_speakers: int = 0,
     lib_path: Optional[str] = None,
 ) -> bool:
     """Assign a speaker index to each of ``segs``, mutating in place.
 
-    Four methods — see :class:`DiarizeMethod`. ``left`` is mono PCM for
+    Five methods — see :class:`DiarizeMethod`. ``left`` is mono PCM for
     mono-only methods, otherwise the left channel of a stereo pair.
     All PCM is 16 kHz float32. Returns ``True`` on success; only
-    ``PYANNOTE`` can fail (model load failure).
+    Model-backed methods can fail when their model cannot be loaded.
     """
+    ok, _ = _diarize_segments_impl(
+        segs, left, right=right, is_stereo=is_stereo, method=method,
+        pyannote_model_path=pyannote_model_path, n_threads=n_threads,
+        slice_t0=slice_t0, foxnose_embedder_path=foxnose_embedder_path,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+        num_speakers=num_speakers, lib_path=lib_path, want_turns=False,
+    )
+    return ok
+
+
+def diarize_segments_with_turns(
+    segs: List[DiarizeSegment],
+    left: np.ndarray,
+    *,
+    right: Optional[np.ndarray] = None,
+    is_stereo: bool = False,
+    method: int = DiarizeMethod.VAD_TURNS,
+    pyannote_model_path: Optional[str] = None,
+    n_threads: int = 4,
+    slice_t0: float = 0.0,
+    foxnose_embedder_path: Optional[str] = None,
+    min_speakers: int = 0,
+    max_speakers: int = 0,
+    num_speakers: int = 0,
+    lib_path: Optional[str] = None,
+) -> Tuple[bool, List[DiarizeTurn]]:
+    """Label ``segs`` and return audio-derived FoxNose/Sortformer speaker turns.
+
+    The returned timestamps are seconds on the same absolute timeline as the
+    input segments. Methods other than FoxNose and Sortformer return an empty
+    turn list.
+    """
+    return _diarize_segments_impl(
+        segs, left, right=right, is_stereo=is_stereo, method=method,
+        pyannote_model_path=pyannote_model_path, n_threads=n_threads,
+        slice_t0=slice_t0, foxnose_embedder_path=foxnose_embedder_path,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+        num_speakers=num_speakers, lib_path=lib_path, want_turns=True,
+    )
+
+
+def _diarize_segments_impl(
+    segs: List[DiarizeSegment],
+    left: np.ndarray,
+    *,
+    right: Optional[np.ndarray],
+    is_stereo: bool,
+    method: int,
+    pyannote_model_path: Optional[str],
+    n_threads: int,
+    slice_t0: float,
+    foxnose_embedder_path: Optional[str],
+    min_speakers: int,
+    max_speakers: int,
+    num_speakers: int,
+    lib_path: Optional[str],
+    want_turns: bool,
+) -> Tuple[bool, List[DiarizeTurn]]:
     if not segs or left is None or len(left) == 0:
-        return True
+        return True, []
 
     lib = ctypes.CDLL(lib_path or _find_lib())
     if not hasattr(lib, "crispasr_diarize_segments_abi"):
@@ -1142,46 +1252,73 @@ def diarize_segments(
     else:
         right_ptr = left_ptr
 
-    # ABI structs must match crispasr_c_api.cpp.
-    class _SegAbi(ctypes.Structure):
-        _fields_ = [
-            ("t0_cs", ctypes.c_int64),
-            ("t1_cs", ctypes.c_int64),
-            ("speaker", ctypes.c_int32),
-            ("_pad", ctypes.c_int32),
-        ]
-
-    class _OptsAbi(ctypes.Structure):
-        _fields_ = [
-            ("method", ctypes.c_int32),
-            ("n_threads", ctypes.c_int32),
-            ("slice_t0_cs", ctypes.c_int64),
-            ("pyannote_model_path", ctypes.c_char_p),
-        ]
-
-    seg_array = (_SegAbi * len(segs))()
+    seg_array = (_DiarizeSegAbi * len(segs))()
     for i, s in enumerate(segs):
         seg_array[i].t0_cs = int(round(s.t0 * 100))
         seg_array[i].t1_cs = int(round(s.t1 * 100))
         seg_array[i].speaker = s.speaker
         seg_array[i]._pad = 0
 
-    opts = _OptsAbi(
+    opts = _DiarizeOptsAbi(
         method=int(method),
         n_threads=int(n_threads),
         slice_t0_cs=int(round(slice_t0 * 100)),
         pyannote_model_path=(pyannote_model_path.encode("utf-8")
                              if pyannote_model_path else None),
+        foxnose_embedder_path=(foxnose_embedder_path.encode("utf-8")
+                               if foxnose_embedder_path else None),
+        min_speakers=int(min_speakers),
+        max_speakers=int(max_speakers),
+        num_speakers=int(num_speakers),
+        _pad2=0,
     )
 
-    rc = lib.crispasr_diarize_segments_abi(
-        left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
-        ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
-    )
+    turns: List[DiarizeTurn] = []
+    if want_turns:
+        if not hasattr(lib, "crispasr_diarize_segments_turns_abi"):
+            raise RuntimeError(
+                "crispasr_diarize_segments_turns_abi not in loaded library — "
+                "rebuild CrispASR 0.8.30+ to receive FoxNose turns."
+            )
+        fn = lib.crispasr_diarize_segments_turns_abi
+        fn.argtypes = [
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int32),
+        ]
+        fn.restype = ctypes.c_int
+        turn_cap = max(1, (len(left_np) + 7999) // 8000 + len(segs) + 16)
+        for attempt in range(2):
+            turn_array = (_DiarizeTurnAbi * turn_cap)()
+            n_turns = ctypes.c_int32()
+            rc = fn(
+                left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
+                ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
+                ctypes.byref(turn_array), turn_cap, ctypes.byref(n_turns),
+            )
+            if rc == 2 and attempt == 0 and n_turns.value > turn_cap:
+                turn_cap = n_turns.value
+                continue
+            if rc == 0:
+                turns = [
+                    DiarizeTurn(
+                        t0=turn_array[i].t0_cs / 100.0,
+                        t1=turn_array[i].t1_cs / 100.0,
+                        speaker=int(turn_array[i].speaker),
+                    )
+                    for i in range(min(n_turns.value, turn_cap))
+                ]
+            break
+    else:
+        rc = lib.crispasr_diarize_segments_abi(
+            left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
+            ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
+        )
     if rc == 0:
         for i, s in enumerate(segs):
             s.speaker = int(seg_array[i].speaker)
-    return rc == 0
+    return rc == 0, turns
 
 
 class Session:
@@ -1814,7 +1951,7 @@ class Session:
         return vocab
 
     # ---------------------------------------------------------------------
-    # TTS synthesis (vibevoice, qwen3-tts, miotts, moss-tts, moss-tts-local, confucius4-tts, omnivoice, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts)
+    # TTS synthesis (vibevoice, qwen3-tts, miotts, moss-tts, moss-tts-local, confucius4-tts, omnivoice, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts, fireredtts3)
     # ---------------------------------------------------------------------
 
     def set_codec_path(self, path: str) -> None:
@@ -2195,7 +2332,7 @@ class Session:
 
     def set_tts_steps(self, steps: int) -> None:
         """Set the diffusion / CFM / masked-iterative step count for step-based
-        TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori, omnivoice).
+        TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori, omnivoice, supertonic).
 
         Higher = better fidelity, slower. Soft no-op (rc=-2) when the active
         backend has no step-based stage.
@@ -2388,6 +2525,58 @@ class Session:
             raise ValueError("set_grammar_text: invalid GBNF or root rule not found")
         if rc != 0:
             raise RuntimeError(f"set_grammar_text failed (rc={rc})")
+
+    def set_grammar_strict(self, strict: bool = True) -> None:
+        """Forbid end-of-text until the grammar is complete (whisper; off by default)."""
+        if not hasattr(self._lib, "crispasr_session_set_grammar_strict"):
+            raise RuntimeError("crispasr_session_set_grammar_strict not present in this libcrispasr build")
+        self._lib.crispasr_session_set_grammar_strict.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_grammar_strict.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_grammar_strict(self._handle, 1 if strict else 0)
+        if rc != 0:
+            raise RuntimeError(f"set_grammar_strict failed (rc={rc})")
+
+    def score_texts(
+        self, pcm, texts: List[str], language: Optional[str] = None, prompt: Optional[str] = None
+    ) -> List[Tuple[float, int]]:
+        """log P(text | audio) for each candidate, teacher-forced (whisper only).
+
+        Returns ``(logprob, n_tokens)`` per text; n_tokens counts the text's
+        tokens plus end-of-text, so ``logprob / n_tokens`` compares texts of
+        different length. ``prompt`` is optional previous text that primes the
+        vocabulary. A text that does not fit the context scores ``-inf``.
+        """
+        if not hasattr(self._lib, "crispasr_session_score_texts"):
+            raise RuntimeError("crispasr_session_score_texts not present in this libcrispasr build")
+        import numpy as np
+        pcm_arr = np.ascontiguousarray(pcm, dtype=np.float32)
+        n = len(texts)
+        c_texts = (ctypes.c_char_p * n)(*[t.encode() for t in texts])
+        out_lp = (ctypes.c_float * n)()
+        out_nt = (ctypes.c_int * n)()
+        fn = self._lib.crispasr_session_score_texts
+        fn.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_char_p), ctypes.c_int, ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        fn.restype = ctypes.c_int
+        rc = fn(
+            self._handle,
+            pcm_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            int(pcm_arr.size),
+            language.encode() if language else None,
+            prompt.encode() if prompt else None,
+            c_texts,
+            n,
+            out_lp,
+            out_nt,
+        )
+        if rc == -10:
+            raise RuntimeError("score_texts: only the whisper backend can score texts")
+        if rc != 0:
+            raise RuntimeError(f"score_texts failed (rc={rc})")
+        return [(out_lp[i], out_nt[i]) for i in range(n)]
 
     def set_fallback_thresholds(
         self,
@@ -2729,8 +2918,8 @@ class Session:
         ``kokoro``, ``orpheus``, ``chatterbox``, ``indextts``, ``voxcpm2-tts``,
         ``csm``, ``dia``, ``fastpitch``, ``bananamind-tts``, ``speecht5``,
         ``melotts``, ``piper``, ``parler-tts``, ``outetts``, ``cosyvoice3-tts``,
-        ``pocket-tts``, ``f5-tts``, ``irodori-tts``, ``bark``, ``kugelaudio``, ``tada``,
-        ``lfm2-audio``, ``voxtral-tts``, ``dots-tts``, ``omnivoice``.
+        ``pocket-tts``, ``f5-tts``, ``irodori-tts``, ``supertonic``, ``bark``, ``kugelaudio``, ``tada``,
+        ``lfm2-audio``, ``voxtral-tts``, ``dots-tts``, ``fireredtts3``, ``omnivoice``.
         For qwen3-tts call :meth:`set_codec_path` and one of:
 
         * :meth:`set_voice` — Base variants (WAV + ref_text, or voice-pack GGUF)
@@ -3006,6 +3195,10 @@ class PuncModel:
     Particularly useful for CTC-based backends (wav2vec2, omniasr,
     fastconformer-ctc, firered-asr) that output lowercase text without
     punctuation.
+
+    ``model_path`` takes a ``--punc-model`` value: an alias (``auto``,
+    ``firered``, ``fullstop``, ``punctuate-all``, ``pcs``; downloaded on
+    first use) or a .gguf path of the FireRedPunc family or PCS.
 
     Usage::
 
@@ -3563,6 +3756,37 @@ def detect_backend_from_gguf(
     if rc < 0:
         raise RuntimeError(f"detect_backend_from_gguf failed (rc={rc})")
     return out.value.decode("utf-8")
+
+
+def detect_backends_from_gguf(
+    gguf_path: str,
+    *,
+    lib_path: Optional[str] = None,
+) -> list:
+    """Every backend that can open this GGUF, primary first (#433).
+
+    ``detect_backend_from_gguf`` is 1:1 — one architecture string, one backend —
+    and that is not always the whole truth. A voxcpm2 GGUF opens both as
+    ``voxcpm2-tts`` (the full TTS pipeline) and as ``voxcpm2-vae`` (the
+    standalone causal VAE upscaler): the VAE entry point calls the same loader
+    with ``vae_only``, and there is no separate VAE model to download.
+
+    Returns ``[]`` when the architecture maps to no backend, matching
+    ``detect_backend_from_gguf`` returning ``""``.
+    """
+    lib = ctypes.CDLL(lib_path or _find_lib())
+    fn = lib.crispasr_detect_backends_from_gguf
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    fn.restype = ctypes.c_int
+
+    cap = 512
+    out = ctypes.create_string_buffer(cap)
+    rc = fn(gguf_path.encode("utf-8"), out, cap)
+    # rc == -5 is "buffer too small", never a truncated list — the ABI refuses
+    # rather than naming fewer backends than exist.
+    if rc < 0:
+        raise RuntimeError(f"detect_backends_from_gguf failed (rc={rc})")
+    return [l for l in out.value.decode("utf-8").splitlines() if l]
 
 
 # =========================================================================

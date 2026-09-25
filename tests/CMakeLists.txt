@@ -35,6 +35,22 @@ if (EMSCRIPTEN)
     return()
 endif()
 
+# ─── basic-pitch-conv-ab — hermetic conv A/B (no GGUF, no audio) ──────────────
+# Unlike the other *-ab harnesses this one needs no models, so CI can run it.
+# That matters: the VPS this was developed on gives a single-threaded process
+# 36-54%% of one core, so the threaded arm is unmeasurable there.
+# See docs/music-transcription/BASIC_PITCH_CONV_PERF.md.
+add_executable(basic-pitch-conv-ab basic-pitch-conv-ab.cpp)
+target_include_directories(basic-pitch-conv-ab PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(basic-pitch-conv-ab PRIVATE Threads::Threads)
+
+# ─── test-basic-pitch-conv — SIMD/threaded conv must match the scalar loop
+# byte for byte (hermetic: no GGUF, no audio).
+add_executable(test-basic-pitch-conv test-basic-pitch-conv.cpp)
+target_include_directories(test-basic-pitch-conv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-basic-pitch-conv PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-basic-pitch-conv PROPERTIES LABELS "unit;basic-pitch")
+
 add_executable(test-chatterbox-f0-simd test-chatterbox-f0-simd.cpp)
 target_include_directories(test-chatterbox-f0-simd PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-chatterbox-f0-simd PRIVATE Catch2::Catch2WithMain Threads::Threads)
@@ -42,12 +58,41 @@ catch_discover_tests(test-chatterbox-f0-simd
     TEST_SPEC "[unit][tts][chatterbox][simd]"
     PROPERTIES LABELS "unit;tts;chatterbox")
 
+# #421: these two suites memcmp three arms (hand reference, scalar kernel,
+# SIMD kernel) for BIT-exactness. On aarch64 GCC defaults to
+# -ffp-contract=fast and contracts the reference loop and the kernel loop
+# DIFFERENTLY (different mul/fmadd pairings), so the memcmp fails by
+# 2-6e-6 — a too-strict test, not a kernel bug (proven by cross-compiled
+# repro: 6/6 fail at default, 0/6 with contraction off; x86 agrees only
+# by accident because baseline x86-64 has no FMA). Pinning contraction
+# off for the TEST TUs keeps bit-exactness meaningful — all compared arms
+# live in this one TU — while shipped kernels keep fmadd (faster and more
+# accurate). MSVC does not contract by default, hence the guard.
+if (NOT MSVC)
+    set_source_files_properties(test-chatterbox-hift-simdconv.cpp test-cosyvoice3-hift-simdconv.cpp
+                                PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
 add_executable(test-chatterbox-hift-simdconv test-chatterbox-hift-simdconv.cpp)
 target_include_directories(test-chatterbox-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-chatterbox-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
 catch_discover_tests(test-chatterbox-hift-simdconv
     TEST_SPEC "[unit][tts][chatterbox][hift][simdconv]"
     PROPERTIES LABELS "unit;tts;chatterbox")
+
+add_executable(test-campplus-segpool test-campplus-segpool.cpp)
+target_include_directories(test-campplus-segpool PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-campplus-segpool PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-campplus-segpool
+    TEST_SPEC "[unit][tts][campplus][segpool]"
+    PROPERTIES LABELS "unit;tts;campplus")
+
+add_executable(test-step-graph-cache test-step-graph-cache.cpp)
+target_include_directories(test-step-graph-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-step-graph-cache PRIVATE Catch2::Catch2WithMain ggml ggml-base)
+catch_discover_tests(test-step-graph-cache
+    TEST_SPEC "[unit][core][stepcache]"
+    PROPERTIES LABELS "unit;core;stepcache")
 
 add_executable(test-cosyvoice3-hift-simdconv test-cosyvoice3-hift-simdconv.cpp)
 target_include_directories(test-cosyvoice3-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -1621,6 +1666,24 @@ catch_discover_tests(test-cosyvoice3-params
     PROPERTIES LABELS "unit;cosyvoice3"
 )
 
+# ─── test-fireredtts3-params — Catch2 unit tests for fireredtts3 params defaults
+# and null-guards (#377). No model required.
+add_executable(test-fireredtts3-params
+    test-fireredtts3-params.cpp
+)
+target_include_directories(test-fireredtts3-params PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(test-fireredtts3-params PRIVATE
+    Catch2::Catch2WithMain
+    fireredtts3
+    chatterbox
+)
+catch_discover_tests(test-fireredtts3-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;fireredtts3"
+)
+
 # ─── test-dots-tts-params — Catch2 unit tests for dots_tts_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 if (TARGET dots-tts)
@@ -1638,6 +1701,43 @@ target_link_libraries(test-dots-tts-params PRIVATE
 catch_discover_tests(test-dots-tts-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;dots-tts"
+)
+endif()
+
+# ─── test-supertonic-params — Catch2 unit tests for supertonic_context_params
+# defaults and null-guard coverage. No GGUF required. ──────────────────────────
+if (TARGET supertonic-tts)
+add_executable(test-supertonic-params
+    test-supertonic-params.cpp
+)
+target_include_directories(test-supertonic-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-supertonic-params PRIVATE
+    Catch2::Catch2WithMain
+    supertonic-tts
+)
+catch_discover_tests(test-supertonic-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;supertonic"
+)
+endif()
+
+# ─── test-supertonic-live — live integration tests for Supertonic-3 TTS
+if (TARGET supertonic-tts)
+add_executable(test-supertonic-live
+    test_supertonic_live.cpp
+)
+target_include_directories(test-supertonic-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-supertonic-live PRIVATE
+    Catch2::Catch2WithMain
+    supertonic-tts
+)
+catch_discover_tests(test-supertonic-live
+    TEST_SPEC "[live]"
+    PROPERTIES LABELS "live;supertonic"
 )
 endif()
 
@@ -1860,13 +1960,12 @@ target_link_libraries(test-kokoro-params PRIVATE
     Catch2::Catch2WithMain
     kokoro
 )
-# #316: kokoro now compiles phonemizer.cpp with CRISPASR_BUILD, which enables the
-# G2P dictionary auto-download (previously dead code — the macro was defined
-# nowhere). That pulls in crispasr_cache::ensure_cached_file, which lives in
-# crispasr-lib. crispasr-lib links kokoro, so kokoro cannot link it back; every
-# real binary resolves the symbol because it links crispasr-lib. This test links
-# kokoro ALONE, so it compiles the one translation unit it needs directly.
-target_sources(test-kokoro-params PRIVATE ${PROJECT_SOURCE_DIR}/src/crispasr_cache.cpp)
+# #316/#435: phonemizer.cpp and crispasr_cache.cpp both live in crispasr-core
+# now, which kokoro links PUBLIC — so linking kokoro ALONE (as this test does)
+# resolves the G2P auto-download path from that one archive. The explicit
+# `target_sources(... crispasr_cache.cpp)` this line used to carry is no longer
+# needed; it existed only because the caller and the callee sat in two different
+# libraries with an unfavourable link order.
 catch_discover_tests(test-kokoro-params
     TEST_SPEC "[unit]"
     PROPERTIES LABELS "unit;kokoro"
@@ -3231,6 +3330,21 @@ catch_discover_tests(test-session-setter-parity
     PROPERTIES LABELS "unit;setter-parity"
 )
 
+# ─── test-session-output-rate-parity — every synthesize arm in the session ABI
+# must have a crispasr_session_output_sample_rate arm (bt2-tts shipped without
+# one and reported 0 Hz). Structural: reads src/crispasr_c_api.cpp, no weights.
+add_executable(test-session-output-rate-parity
+    test-session-output-rate-parity.cpp
+)
+target_compile_definitions(test-session-output-rate-parity PRIVATE
+    CRISPASR_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
+target_link_libraries(test-session-output-rate-parity PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-session-output-rate-parity
+    TEST_SPEC "[output-rate-parity]"
+    PROPERTIES LABELS "unit;output-rate-parity"
+)
+
 # ─── test-segment-hygiene — §W2 length cap, §W5 repeat merge, §W6 filters.
 # All three live downstream of the logits, where crispasr-diff reads
 # cos 1.000000 whether they work or not. This is the only check they get.
@@ -3286,6 +3400,76 @@ target_link_libraries(test-loopfix-wiring PRIVATE
 catch_discover_tests(test-loopfix-wiring
     TEST_SPEC "[loopfix-wiring]"
     PROPERTIES LABELS "unit;ngram-loop"
+)
+
+# ─── test-htdemucs-gates — unit tests for the #413/#414 path-selection
+# table (AUTO fused-GPU on real-GPU hosts, BLAS otherwise, env overrides).
+add_executable(test-htdemucs-gates
+    test-htdemucs-gates.cpp
+)
+target_include_directories(test-htdemucs-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-htdemucs-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-htdemucs-gates
+    TEST_SPEC "[htdemucs]"
+    PROPERTIES LABELS "unit;htdemucs"
+)
+
+# ─── test-sidon-rpe-gates — unit tests for the #416 follow-up length-aware
+# relative-position-bias selection (AUTO expand on GPU while its extra
+# transient footprint fits the budget, bucket-direct otherwise; an explicit
+# CRISPASR_SIDON_RPE is never auto-overridden).
+add_executable(test-sidon-rpe-gates
+    test-sidon-rpe-gates.cpp
+)
+target_include_directories(test-sidon-rpe-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-sidon-rpe-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-sidon-rpe-gates
+    TEST_SPEC "[sidon]"
+    PROPERTIES LABELS "unit;sidon"
+)
+
+# ─── test-mel-band-gates — unit tests for the Change-176 path-selection
+# table (mirrors test-htdemucs-gates; AUTO fused-graph-GPU on real-GPU hosts,
+# CPU path otherwise, env overrides, #414 review semantics).
+add_executable(test-mel-band-gates
+    test-mel-band-gates.cpp
+)
+target_include_directories(test-mel-band-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-mel-band-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-mel-band-gates
+    TEST_SPEC "[mel-band]"
+    PROPERTIES LABELS "unit;mel-band"
+)
+
+# ─── test-mel-blas-parity — guards core_mel's cblas_sgemm projection against a
+# BLAS that returns the wrong answer (found on a host where find_package(BLAS)
+# picked threaded MKL alongside libgomp). Links crispasr-core so it exercises
+# whatever BLAS this build actually chose.
+add_executable(test-mel-blas-parity
+    test-mel-blas-parity.cpp
+)
+target_include_directories(test-mel-blas-parity PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-mel-blas-parity PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-core
+)
+catch_discover_tests(test-mel-blas-parity
+    TEST_SPEC "[mel]"
+    PROPERTIES LABELS "unit;mel"
 )
 
 # ─── test-uroman — Catch2 unit tests for core/uroman.h romanization.
@@ -4182,6 +4366,19 @@ catch_discover_tests(test-core-cqt
     PROPERTIES LABELS "unit;core"
 )
 
+# ─── test-core-midi-writer — core/midi_writer.h Standard MIDI File output ─────
+# Parses the produced bytes back with an independent reader rather than
+# diffing a golden blob: the failures that matter (stuck notes, a note-off
+# ordered after the next note-on at the same tick, zero-length notes) are
+# structural. Header-only, so no backend link.
+add_executable(test-core-midi-writer test-core-midi-writer.cpp)
+target_include_directories(test-core-midi-writer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-core-midi-writer PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-midi-writer
+    TEST_PREFIX "core-midi-writer: "
+    PROPERTIES LABELS "unit;core"
+)
+
 # ─── test-core-istft — core/istft.h inverse-STFT overlap-add ──────────────────
 # Verifies the extracted iSTFT against an independent full-DFT reference
 # (fuzzed) + a forward-STFT→iSTFT sinusoid round-trip.
@@ -4603,6 +4800,10 @@ function(add_ggml_audio_ops_backend_test TEST_TARGET BACKEND_DEF BACKEND_TARGET)
         SKIP_RETURN_CODE 4)
 endfunction()
 
+add_ggml_audio_ops_backend_test(test_ggml_audio_ops_cpu
+    CRISPASR_TEST_BACKEND_CPU
+    crispasr_link_ggml_cpu)
+
 if(APPLE AND TARGET ggml-metal)
     add_ggml_audio_ops_backend_test(test_ggml_audio_ops_metal
         "CRISPASR_TEST_BACKEND_METAL;CRISPASR_TEST_COL2IM_F16"
@@ -4751,6 +4952,20 @@ catch_discover_tests(test-g2p-es
     PROPERTIES TIMEOUT 30
 )
 
+# ─── test-g2p-ru — Catch2 tests for Russian G2P + Russian number words ──────
+add_executable(test-g2p-ru test-g2p-ru.cpp)
+target_include_directories(test-g2p-ru PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-g2p-ru PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-g2p-ru
+    EXTRA_ARGS --colour-mode ansi
+    PROPERTIES LABELS "unit;g2p;russian"
+    PROPERTIES TIMEOUT 30
+)
+
 # ─── test-espeak-phonemize — Catch2 tests for espeak-ng phonemization ───────
 # Tests espeak availability, piper text/IPA synthesis, input validation.
 # Requires PIPER_TEST_MODEL env var or -DPIPER_TEST_MODEL=... for live tests.
@@ -4826,14 +5041,69 @@ set_tests_properties(test-progress-output PROPERTIES
     LABELS "live;progress"
     TIMEOUT 300)
 
+# ─── test-arg-validation — offline regression: argument validation must run
+# BEFORE backend dispatch. The --diarize/--tinydiarize conflict and the
+# --language check used to sit after every crispasr_run_backend() early
+# return, so any dispatched run (-m auto, any --backend, a non-whisper GGUF)
+# skipped them and accepted the bad argument with exit 0. Also guards the
+# opposite hazard: whisper's 100-entry language table must NOT be applied to
+# backends it does not govern. No models, no network.
+add_test(NAME test-arg-validation
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-arg-validation.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-arg-validation PROPERTIES
+    LABELS "unit;cli"
+    TIMEOUT 60)
+
+# ─── test-help-stdout — offline regression (#420): an explicitly requested
+# --help is program OUTPUT, so it must go to stdout with exit 0 and be
+# pipeable (`crispasr --help | less`). Usage printed for a usage ERROR must go
+# to stderr with a non-zero status instead. Parses args only — no models, no
+# network; SKIPs if the binary is absent.
+add_test(NAME test-help-stdout
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-help-stdout.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-help-stdout PROPERTIES
+    LABELS "unit;cli"
+    TIMEOUT 60)
+
+# ─── test-asr-env-parity — offline regression for the generic environment
+# parity harness. A fake CLI verifies mismatch/error classification, environment
+# scrubbing, aggregate variants, collision-free artifacts, and output-dir safety.
+add_test(NAME test-asr-env-parity
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-asr-env-parity.sh
+            ${PROJECT_SOURCE_DIR}/tools/asr-env-parity.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-asr-env-parity PROPERTIES
+    LABELS "unit;cli;parity"
+    TIMEOUT 60)
+
+# ─── test-input-exit-code — an undecodable input must reach the EXIT CODE.
+# cli.cpp's LEGACY whisper path (no --backend, a .bin model) printed to stderr
+# and `continue`d, so a run where every file failed still exited 0, against
+# docs/cli.md's published "rc 0 <=> every required stage succeeded". The unified
+# dispatcher already returned 20; only this path was affected. Labelled
+# unit;gh — NOT live — and pointed at the committed models/for-tests-ggml-tiny.bin
+# so it genuinely executes in CI (`ctest -L "gh|unit" -E live`) rather than
+# skipping, which is how the cli-labelled tests stayed dead (70112d10).
+add_test(NAME test-input-exit-code
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-input-exit-code.sh $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-input-exit-code PROPERTIES
+    LABELS "unit;gh;cli"
+    TIMEOUT 300)
+
 # ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
 # the same model a real `-m <alias>` would load (sub-variant keys, §166).
 # Needs only the built binary (no models / network); SKIPs if absent.
 add_test(NAME test-dry-run-resolve
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-dry-run-resolve.sh
+            $<TARGET_FILE:crispasr-cli>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-dry-run-resolve PROPERTIES
-    LABELS "cli"
+    LABELS "unit;cli"
     TIMEOUT 60)
 
 # ─── test-bundle-linux-runtime — the Linux packaging bundler. Registered as a
@@ -5014,6 +5284,35 @@ set_tests_properties(test-omnivoice-seed PROPERTIES
     LABELS "live;tts;omnivoice;determinism"
     TIMEOUT 600)
 
+# ─── test-htdemucs-separate-live — #413/#414 htdemucs live test: BLAS
+# default on CPU hosts, forced fused-graph arm, per-stem parity between
+# them. SKIPs cleanly without the model.
+add_test(NAME test-htdemucs-separate-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-htdemucs-separate-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-htdemucs-separate-live PROPERTIES
+    LABELS "live;htdemucs"
+    TIMEOUT 900)
+
+# ─── test-quds-fa-live — #387 Quds v4 Persian ASR: exact-transcript check
+# on the bundled CC0 Common Voice clip. SKIPs without the model.
+add_test(NAME test-quds-fa-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-quds-fa-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-quds-fa-live PROPERTIES
+    LABELS "live;quds"
+    TIMEOUT 300)
+
+# ─── test-f5-session-voice-rate-live — the session ABI must load an f5-tts
+# reference at the model's rate (Raon is 16 kHz): session and CLI output
+# lengths must agree. SKIPs without a Raon model (CRISPASR_RAON_MODEL).
+add_test(NAME test-f5-session-voice-rate-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-f5-session-voice-rate-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-f5-session-voice-rate-live PROPERTIES
+    LABELS "live;f5-tts"
+    TIMEOUT 900)
+
 # ─── test-separate-live — §248 source separation smoke test. SKIPs cleanly
 # without a mel-band-roformer model (CRISPASR_MBR_MODEL / CRISPASR_MODELS_DIR).
 add_test(NAME test-separate-live
@@ -5139,6 +5438,17 @@ catch_discover_tests(test-btc-vocab
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-hojo-asr-frames — #438 Hojo-ASR frame schedule (hermetic, unit)
+add_executable(test-hojo-asr-frames test-hojo-asr-frames.cpp)
+target_include_directories(test-hojo-asr-frames PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-hojo-asr-frames PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-hojo-asr-frames
+    TEST_SPEC "[hojo]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test-htdemucs-binbcast — issue #398 CUDA binbcast F16-src1 guard (hermetic, unit)
 add_executable(test-htdemucs-binbcast test-htdemucs-binbcast.cpp)
 target_include_directories(test-htdemucs-binbcast PRIVATE
@@ -5173,6 +5483,42 @@ target_include_directories(test-gguf-null-backend PRIVATE
 target_link_libraries(test-gguf-null-backend PRIVATE Catch2::Catch2WithMain crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
 catch_discover_tests(test-gguf-null-backend
     TEST_SPEC "[null-backend]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-vibevoice-enc-policy — issue #418 encoder-backend decision table (hermetic, unit)
+add_executable(test-vibevoice-enc-policy test-vibevoice-enc-policy.cpp)
+target_include_directories(test-vibevoice-enc-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-vibevoice-enc-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-vibevoice-enc-policy
+    TEST_SPEC "[enc-policy]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-silero-lid-quant-refusal — #409 tail: quantized silero weights refused (hermetic, unit)
+add_executable(test-silero-lid-quant-refusal test-silero-lid-quant-refusal.cpp)
+target_include_directories(test-silero-lid-quant-refusal PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-silero-lid-quant-refusal PRIVATE Catch2::Catch2WithMain silero-lid)
+catch_discover_tests(test-silero-lid-quant-refusal
+    TEST_SPEC "[silero-quant]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-script-mismatch — issue #419 wrong-script warning decision table (hermetic, unit)
+add_executable(test-script-mismatch test-script-mismatch.cpp)
+target_include_directories(test-script-mismatch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-script-mismatch PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-script-mismatch
+    TEST_SPEC "[script-mismatch]"
     PROPERTIES
         LABELS unit
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
@@ -5348,6 +5694,100 @@ catch_discover_tests(test-piano-transcription
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - onsets-and-frames — live integration tests
+add_executable(test-onsets-and-frames
+    test_onsets_and_frames_live.cpp
+)
+target_include_directories(test-onsets-and-frames PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-onsets-and-frames PRIVATE
+    Catch2::Catch2WithMain
+    onsets-and-frames
+)
+catch_discover_tests(test-onsets-and-frames
+    TEST_SPEC "[onsets-and-frames]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── oaf-parity-dump — the C++ half of tools/oaf_parity.py.
+# Not registered with CTest: it needs a model, a WAV and onnxruntime on the
+# other side of it. Built so the parity script cannot drift from the runtime.
+add_executable(oaf-parity-dump oaf_parity_dump.cpp)
+target_include_directories(oaf-parity-dump PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(oaf-parity-dump PRIVATE onsets-and-frames)
+
+# ─── test - hft-transformer — live integration tests
+add_executable(test-hft-transformer
+    test_hft_transformer_live.cpp
+)
+target_include_directories(test-hft-transformer PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-hft-transformer PRIVATE
+    Catch2::Catch2WithMain
+    hft-transformer
+)
+catch_discover_tests(test-hft-transformer
+    TEST_SPEC "[hft-transformer]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── hft-parity-dump — the C++ half of tools/hft_parity.py.
+# Not registered with CTest, for the same reason oaf-parity-dump is not: it
+# needs a model, a WAV and onnxruntime on the other side of it.
+add_executable(hft-parity-dump hft_parity_dump.cpp)
+target_include_directories(hft-parity-dump PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(hft-parity-dump PRIVATE hft-transformer)
+
+# ─── test - mt3 — live integration tests (#250, multi-instrument)
+# Stage parity is the crispasr-diff mt3 harness's job; this covers the C ABI
+# contract, the decode-budget knob and the drum/instrument invariants.
+add_executable(test-mt3 test_mt3_live.cpp)
+target_include_directories(test-mt3 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-mt3 PRIVATE
+    Catch2::Catch2WithMain
+    mt3
+)
+catch_discover_tests(test-mt3
+    TEST_SPEC "[mt3]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test - basic-pitch — live integration tests (#250)
+add_executable(test-basic-pitch
+    test_basic_pitch_live.cpp
+)
+target_include_directories(test-basic-pitch PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-basic-pitch PRIVATE
+    Catch2::Catch2WithMain
+    basic-pitch
+)
+catch_discover_tests(test-basic-pitch
+    TEST_SPEC "[basic-pitch]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── C2PA native-JS signer — unit + live parity tests (node --test) ──────────
 # The signer (bindings/javascript/c2pa.mjs) re-implements C2PA signing in pure
 # WebCrypto so the wasm build needs no c2pa-rs. Unit tests are hermetic (CBOR
@@ -5377,3 +5817,91 @@ foreach(_stub fastconformer-ctc wav2vec2 bananamind-tts)
     target_link_libraries(${_tgt} PRIVATE Catch2::Catch2WithMain)
     catch_discover_tests(${_tgt} TEST_SPEC "[unit]" PROPERTIES LABELS "unit")
 endforeach()
+
+# ─── test-subprocess — core/subprocess.h must hand argv to the child verbatim,
+# never through a shell (server uploads and TTS request fields reach it).
+add_executable(test-subprocess
+    test-subprocess.cpp
+)
+target_include_directories(test-subprocess PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-subprocess PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-subprocess
+    TEST_SPEC "[subprocess]"
+    PROPERTIES LABELS "unit;subprocess"
+)
+
+# ─── test-crispasr-diff-compare — Ref::compare must fail a candidate buffer
+# the runtime never wrote (all-zero rows), not score it cos=1 PASS (#445).
+# crispasr-diff-lib is defined later (examples/cli); link names resolve at
+# generate time, so guard on the option that creates it rather than TARGET.
+if (CRISPASR_BUILD_EXAMPLES)
+    add_executable(test-crispasr-diff-compare
+        test-crispasr-diff-compare.cpp
+    )
+    target_link_libraries(test-crispasr-diff-compare PRIVATE
+        Catch2::Catch2WithMain
+        crispasr-diff-lib
+    )
+    catch_discover_tests(test-crispasr-diff-compare
+        TEST_SPEC "[diff]"
+        PROPERTIES LABELS "unit;diff"
+    )
+endif()
+
+# ─── test-qwen3-stream — core/qwen3_stream.h (Qwen3-ASR / Confucius4-R2T2
+# prefix-rollback streaming, #445) against outputs of the upstream Python
+# helpers (tests/fixtures/qwen3_stream_cases.json).
+add_executable(test-qwen3-stream
+    test-qwen3-stream.cpp
+)
+target_include_directories(test-qwen3-stream PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_compile_definitions(test-qwen3-stream PRIVATE
+    CRISPASR_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+)
+target_link_libraries(test-qwen3-stream PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-qwen3-stream
+    TEST_SPEC "[qwen3-stream]"
+    PROPERTIES LABELS "unit;qwen3-stream"
+)
+
+# ─── test-kaldi-fbank — core_kaldi::compute_fbank vs kaldi-native-fbank ────
+# snip_edges=false + mel-domain triangles (X-ASR / sherpa-onnx, #436) pinned to
+# golden knf frames; frame-count rules; the per-thread filter cache key.
+add_executable(test-kaldi-fbank
+    test-kaldi-fbank.cpp
+    ${PROJECT_SOURCE_DIR}/src/core/kaldi_fbank.cpp
+)
+target_include_directories(test-kaldi-fbank PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-kaldi-fbank PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-kaldi-fbank
+    TEST_SPEC "[kaldi_fbank]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-torchaudio-resample — header-only torchaudio sinc resampler (#455) ───
+add_executable(test-torchaudio-resample
+    test-torchaudio-resample.cpp
+)
+target_include_directories(test-torchaudio-resample PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-torchaudio-resample PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-torchaudio-resample
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;resample"
+)

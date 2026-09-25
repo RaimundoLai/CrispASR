@@ -200,6 +200,7 @@ regression test against `samples/jfk.wav`:
 | chatterbox | T3 (Llama / GPT-2) + S3Gen (Conformer + UNet1D CFM + HiFTGen) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu, fft |
 | zonos-tts | 26L GQA transformer + 9-codebook DAC @ 44.1 kHz; CFG; voice cloning from WAV | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, dac_decoder (its GatedMLP is local, not `core_ffn`) |
 | dots-tts | Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (CFG Euler) + BigVGAN @ 48 kHz; continuous-latent AR; CAM++ voice cloning; incremental streaming PatchEncoder | ✔ | mixed (DiT must stay F16; LLM+penc Q8) | ✔ | Metal | gguf_loader, kv_self_attn, swiglu, lstm, snake_beta (`core/activation.h`), adaln, conv, cpu_ops, audio_resample |
+| fireredtts3 | Qwen3-1.7B LLM (QK-norm, NEOX RoPE 1e6) + 8L CLS PatchEncoder + 11L AdaLN DiT flow head (+Conv1d branch, 10-step cosine Euler, CFG 2.0, sigmoid stop head) over continuous 64-d 25 Hz RedAE latents; RedAE = 18L sliding-window-64 Qwen3 encoder + CLS 2x downsample + 18L Qwen3 decoder + Vocos ISTFT head (n_fft 1920/hop 480, shipped window) @ 24 kHz; CAM++ 512-d ICL voice cloning (`--voice ref.wav --ref-text`), default English prompt baked into the core GGUF | ✔ | mixed (DiT+penc+RedAE stay F16; LLM Q4_K/Q8) | ✔ | — | gguf_loader, bpe (qwen_pretokenize), istft, torch_rng, kaldi_fbank via chatterbox_campplus, audio_resample |
 | m2m100 | facebook/m2m100 12L+12L transformer (text-to-text translation; WMT21 4.7B variant via `--backend m2m100-wmt21`) | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, sentencepiece, beam_decode |
 | madlad / t5 | T5 encoder-decoder (MADLAD-400 12L+12L, gated-GELU, RMSNorm, bucketed rel-pos bias). Tokens match Python SP bit-by-bit; translation outputs match the HF reference. | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, beam_decode, repeat_break |
 
@@ -284,8 +285,9 @@ everything below follows it.
   `crispasr_chords_cli.{h,cpp}`.
 - **Beats / downbeats** (`beat-this`) — `CAP_BEATS` (bit 26), `--beats`,
   `crispasr_beats_cli.{h,cpp}`.
-- **Piano transcription** (`piano-transcription`) — `CAP_PIANO` (bit 27),
-  `--piano`, `crispasr_piano_cli.{h,cpp}`.
+- **Piano transcription** (`piano-transcription`, `basic-pitch`, `mt3`,
+  `onsets-and-frames`, `hft-transformer`) — `CAP_PIANO` (bit 27), `--piano`,
+  `crispasr_piano_cli.{h,cpp}`.
 - **Guitar tablature** (`tabcnn`) — `CAP_TAB` (bit 28), `--tab`,
   `crispasr_tab_cli.{h,cpp}`. See [tabcnn](#tabcnn) below.
 
@@ -513,6 +515,14 @@ tok_emb shape (vocab_size + 3). Supports arbitrarily long audio input.
 σ-VAE ConvNeXt encoders + Qwen2.5-7B decoder. Dual-mode: ASR (with
 timestamps, diarization, hotwords) and TTS (DPM-Solver++ flow matching).
 
+The `vibevoice-streaming` checkpoint uses the same encoder family with a
+Qwen2.5-1.5B decoder and a different protocol. The prompt is prefixed once,
+then each 2.93-second audio chunk is encoded with 0.53 seconds of right
+lookahead. Speech features, generated text tokens, and a chunk-end token all
+advance one persistent decoder KV cache. `vibevoice_stream_feed()` retains the
+lookahead between calls and only pads the final partial chunk, so CLI and C ABI
+streaming do not re-run a growing audio window.
+
 **The ASR answer is JSON, and the adapter parses it.** The system prompt says
 "transcribes audio input into text output in JSON format" and the user turn asks
 for the keys `Start time, End time, Speaker ID, Content`, so the model replies
@@ -644,6 +654,114 @@ are injected as residual adds at LM blocks 0, 1, and 2, preserving
 multi-resolution audio features (low-level prosody/transients alongside
 high-level semantics) through the LM's early layers.
 
+### hojo-asr
+
+Multilingual conversational ASR (HojoAI/Hojo-ASR-Multi-V1, Apache-2.0,
+~5.2B params) in the classic **Encoder → Adapter → LLM** layout. Every
+weight — encoder, adapter and decoder — lives in the single
+`merged_full_model.safetensors` (11.96 GB); the bare
+`Qwen3-Omni-30B-A3B-Instruct/config.json` that ships beside it supplies
+audio hyper-parameters only and **no 30B checkpoint is ever fetched**.
+
+**Front end.** `WhisperFeatureExtractor(feature_size=128, n_fft=400,
+hop=160)` called with `padding=False`, so the 128-bin log-mel is the
+audio's natural length at 100 fps. The `chunk_length=40` in the reference
+only moves the unused `padding="max_length"` cap — nothing is ever padded
+to 30 s or 40 s, unlike most Whisper-derived front ends.
+
+**Encoder.** The *stock* Qwen3-Omni "AuT" audio tower — the same one
+[`moss-transcribe`](#moss-transcribe) runs — with `n_window=1500` and
+`n_window_infer=3000` patched in at construction: 3×Conv2d(3×3, stride 2,
+pad 1, 480 ch, GELU) → `conv_out` Linear(480·16=7680 → 1280, no bias) →
+per-chunk sinusoidal positions → 32 pre-LN layers (1280d, 20 heads, FFN
+5120, GELU) → `ln_post` → `proj1` → GELU → `proj2` (→2048). Mel is cut
+into 3000-frame (30 s) chunks with **block-diagonal attention** over them,
+so every chunk is mathematically independent; positions restart at 0 in
+each. 8× time downsample → 12.5 encoder frames per second.
+
+The conv stem is where the model card's "multi-frame acoustic fusion"
+actually lives: `conv_out` flattens (channel, freq) with **freq fastest**,
+fusing 8 mel frames × 128 mel bins into one 1280-d frame. That is the
+only frame-stacking in the model, and getting its order wrong yields
+fluent, confident, wrong transcripts.
+
+**Adapter.** A **WeNet `ConformerEncoder`** — `(2048 → 2560,
+linear_units=640, num_blocks=2, input_layer="linear")` with every other
+argument at WeNet's defaults: 4 heads, `rel_pos`, macaron (ff_scale 0.5),
+SiLU, cnn kernel 15, non-causal, BatchNorm, pre-LN, eps 1e-5. It is **1:1
+in time** — `linear_units: 640` is the conformer FFN's inner width, not a
+2:1 stack, and its input dim 2048 is simply the encoder's `output_dim`.
+
+Two details are invisible in the tensor shapes and wrong by default:
+`LinearNoSubsampling` feeds `RelPositionalEncoding`, whose forward applies
+**`x = x * sqrt(2560)`** (a 50.6× scale on the residual stream) and returns
+the position table *separately* — it is never added to `x`; and WeNet
+**deletes `rel_shift`**, so the positional term is
+`(q + pos_bias_v)·(W_pos·pe[0:T])ᵀ` with no shift, i.e. an absolute-position
+bias rather than Transformer-XL relative. The per-block conv module's
+`norm` is an eval-mode `BatchNorm1d`, folded to a per-channel (scale, shift)
+by the converter. A final `ln_speech` LayerNorm(2560) follows the
+bottleneck.
+
+**Decoder.** Qwen3-4B-Instruct-2507 (36L, 2560d, 32Q/8KV, head_dim 128,
+SwiGLU 9728, QK-norm, RoPE θ=5e6, RMS eps 1e-6), embeddings resized to
+151670 (Qwen3's 151669 + an added `[PAD]`), tied `lm_head`.
+
+**Conditioning.** `inputs_embeds = [embed(<|im_start|>)] ++ speech` —
+there is **no text prompt, no chat template and no audio placeholder
+token**. That is the entire conditioning, so `--ask` and `-l` have nowhere
+to go and are explicitly reported as ignored. Decode follows the
+checkpoint's `config.yaml` `generate:` block: beam 4, `do_sample=False`,
+`repetition_penalty=2.0`, `length_penalty=1.0`, and
+`max_new_tokens = max(10, min(200, T_enc·2 + 10))`. The repetition penalty
+is applied per beam over that beam's own generated suffix, matching
+transformers' `RepetitionPenaltyLogitsProcessor` — generating from
+`inputs_embeds` means the speech frames and the BOS are not tokens and are
+never penalised.
+
+**Runtime notes.** Attention runs per chunk rather than over one flat
+sequence with a block-diagonal mask (identical result; avoids a 112 MB mask
+for ten minutes of audio), and the conv stem is tiled along time with an
+8-frame halo (exact, since output frame `o` reads inputs `[8o-7, 8o+7]`;
+`CRISPASR_HOJO_ASR_CONV_TILE=0` restores the untiled path for A/B).
+Languages: de, fr, it, pt, es tagged; the card also claims ja, ar, ko, ru.
+
+### raon-speech
+
+Speech-to-text subset of KRAFTON/Raon-Speech-9B (CC-BY-NC-4.0, #455). The
+full model is a speech-in/speech-out duplex model. Only the transcription path
+is converted: the talker, code predictor, Mimi codec, output adaptor and
+speaker encoder serve speech output only. It runs on the **qwen3-asr runtime**
+as GGUF variant `qwen3asr.variant = raon-speech`.
+
+**Front end** (mirrors `RaonPipeline.stt`, `modeling_raon.py`). The processor
+resamples input to **24 kHz** and cuts it into **8 s chunks** (192000 samples),
+right-padded to the longest chunk. Each chunk is then resampled 24k → 16k.
+Both resamples use torchaudio's `sinc_interp_hann`, which
+`src/core/torchaudio_resample.h` ports exactly (1 ULP vs torchaudio). The
+16 kHz chunk is masked to its valid length (at least `n_fft`) and turned into
+a Whisper log-mel whose max-clip is taken **per chunk**. The STFT
+reflect-pads, like `torch.stft`; zero-padding here is what put a 0.32
+log-mel error on the first frame of every chunk that starts mid-speech.
+
+**Encoder.** The Qwen3-Omni audio tower (24 layers, d = 1024, `proj2` →
+2048), run on each chunk separately via `crisp_audio`. Positions restart per
+100-mel-frame conv chunk. The 13 Hz output is **truncated**, not resampled,
+to `ceil(padded_24k / 1920)` frames (12.5 Hz). The frames covering at least
+one valid 24 kHz sample are kept, and that count equals the number of
+`<|audio_input_placeholder|>` (id 151676) tokens in the prompt.
+
+**Adaptor.** `Linear(2048 → 4096) → GELU(erf) → Linear(4096 → 4096) →
+RMSNorm(eps 1e-6)`, applied frame-wise (`adaptor.*` tensors).
+
+**LLM.** Qwen3, 36 layers, hidden 4096, GQA 32/8, RoPE θ = 5e6, untied
+`lm_head`, vocab 153723. The prompt has no system turn:
+`<|im_start|>user\n<|audio_start|>…<|audio_end|>Transcribe the audio into
+text<|im_end|>\n<|im_start|>assistant\n`. `--ask` replaces the instruction.
+As in `generate()`, `<|audio_output_pad|>` is masked every step and
+`<|im_end|>` on the first step. The model has no language control; `-l` and
+`--translate` are ignored with a warning.
+
 ### moss-transcribe
 
 Dedicated ASR sibling of moss-audio (same author). Uses the **stock
@@ -748,6 +866,85 @@ transcription producing MIDI note events (88 keys, 100fps).
 - **Post-processing:** regression binarization (monotonicity check) → note detection (onset/offset/frame thresholds) → MIDI events
 - F16 GGUF: 77 MB, F32: 154 MB
 - `--backend piano-transcription -m piano-transcription-f16.gguf -f piano.wav`
+
+### onsets-and-frames
+
+`Onsets and Frames` (Hawthorne et al., ISMIR 2018; MIT reimplementation) —
+piano transcription, 26.49 M parameters, converted from the ONNX export (which
+has already folded BatchNorm into the convolutions).
+
+- **Input:** 16 kHz mono → STFT(2048, hop=512, **periodic** Hann, reflect pad)
+  → **magnitude** (power 1.0, not power 2.0) → mel(229 bins, 30–8000 Hz, **HTK**
+  scale, **slaney** filter norm) → `log(clamp(·, 1e-5))`. All four of those
+  emphasised settings are non-default somewhere; the filterbank and the window
+  are computed by the converter and **stored in the GGUF** so the question
+  cannot be got wrong at runtime.
+- **4× ConvStack** (onset / offset / frame / velocity, all reading the same mel):
+  Conv2d(1→48,3×3)+ReLU, Conv2d(48→48,3×3)+ReLU, MaxPool(1,2),
+  Conv2d(48→96,3×3)+ReLU, MaxPool(1,2), flatten to 96·57 = 5472 → Linear(5472→768)
+- **onset / offset:** ConvStack → BiLSTM(768→384) → Linear(768→88)
+- **frame_stack:** ConvStack → Linear(768→88) — this is the *activation*, not the
+  frame head
+- **combined_stack:** cat(onset, offset, activation) [264] → BiLSTM(264→384) →
+  Linear(768→88) — **this** is the frame head
+- Every head emits **logits**; the runtime applies the sigmoid, so
+  `onset_threshold` / `frame_threshold` are probabilities.
+- The ConvStacks and the linear layers run in a ggml graph (time-chunked with a
+  3-frame halo, which is bit-identical and bounds the im2col working set); the
+  BiLSTM is computed by hand outside it, as `piano_transcription.cpp` does for
+  Kong's BiGRU. **ONNX LSTM gate order is `iofc`, not PyTorch's `ifgo`** — the
+  GGUF records the order and the loader refuses a file that disagrees.
+- ⚠ **The ONNX export's output names are shifted by one** (four `output_names`
+  for a five-output forward), so the tensor called `frame` is the activation and
+  the one called `velocity` is the frame head. The converter establishes the
+  mapping structurally, by finding the Concat of three graph outputs and
+  following it; it does not trust the names.
+- F32 GGUF 107 MB, Q8_0 32 MB, Q4_0 20 MB
+- `--piano -m onsets-and-frames-q4_0.gguf -f piano.wav`
+
+### hft-transformer
+
+`hFT-Transformer` (Toyama et al., ISMIR 2023; `sony/hFT-Transformer`, MIT) —
+piano transcription, 5.48 M parameters, converted from the **pruned** ONNX
+export. The most accurate solo-piano model here and much the smallest; also
+much the most expensive to run. See
+[docs/music-transcription/HFT_TRANSFORMER.md](music-transcription/HFT_TRANSFORMER.md).
+
+- **Input:** 16 kHz mono → STFT(2048, hop=256, **periodic** Hann, **constant**
+  (zero) pad) → **power 2.0** → mel(256 bins, 0–8000 Hz, **HTK** scale,
+  **slaney** filter norm) → `log(mel + 1e-8)` — an *add*, not a clamp. The
+  filterbank and the window are computed by the converter and **stored in the
+  GGUF**. Unlike Onsets & Frames, hFT does **not** drop a sample before the
+  STFT, so `T = n/hop + 1`.
+- **Windowing:** the model answers 128 frames at a time from a 192-frame
+  window — 32 margin frames of `log(1e-8)` each side, tail padded to a multiple
+  of 128.
+- **Encoder** (batch 128 frames × 256 frequency tokens): per (frame, bin) the
+  65-frame window → Conv2d(1→4, (1,5)) → flatten 4·61 = 244 → Linear(244→256),
+  × √256, + `pos_embedding_freq`; 3 × post-LN transformer layer.
+- **Frequency decoder** (88 pitch queries cross-attending to those 256 tokens):
+  `layer_zero` is cross-attention only; 2 further layers are self + cross + FF.
+- **Time decoder** (batch 88 pitches × 128 time tokens): 3 layers, then
+  `Linear(256→1)` for onset / offset / mpe and `Linear(256→128)` for velocity.
+- Attention is 4 heads × 64, scale 1/8 everywhere. Every head emits **logits**;
+  the runtime applies the sigmoid, and the velocity head is decoded by argmax
+  over its 128 bins.
+- ⚠ **Each layer has ONE LayerNorm applied two or three times** — the
+  checkpoint has a single set of gains per layer, not one per application.
+- The converter **fuses** the (1,5) convolution into `tok_embedding_freq` into
+  one `Linear(65→256)`. Both are linear in the 65-tap window with nothing
+  between them, so the collapse is exact (`--verify-fusion`: 7.1e-07 relative);
+  the GGUF records `hft.front_end` and the loader refuses a file that declares
+  a different one.
+- ⚠ **The decoder's `mode_velocity='ignore_zero'` gate is the model's only
+  working filter** — it drops any note whose velocity head reads zero at the
+  onset frame, and it filters better than the onset threshold, which is flat
+  across 0.2–0.7.
+- The whole model runs in ggml graphs (no hand-rolled recurrence), with the
+  encoder and frequency decoder evaluated in frame chunks that are
+  bit-identical to the unchunked result.
+- F32 GGUF 21.8 MiB, Q8_0 7.0 MiB, Q4_0 4.5 MiB
+- `--piano -m hft-transformer-q8_0.gguf -f piano.wav`
 
 ### miotts
 
@@ -1104,6 +1301,89 @@ Env gates: `CRISPASR_DIARIZE_BIC_WINDOW=1` (restrict silhouette to a window
 around the BIC anchor instead of the full speaker range, which is the default),
 `CRISPASR_WESPEAKER_BENCH=1`, `CRISPASR_WESPEAKER_DEBUG=1`.
 
+### nemotron3-diar (sortformer)
+
+Speaker diarization via `--diarize-method sortformer` (#466): NVIDIA
+[Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization),
+a ~100M-parameter streaming Sortformer v3. Unlike foxnose and pyannote there is
+no embedder and no clustering: one network maps audio straight to a probability
+per speaker per 10 ms, up to 8 speakers numbered in order of first appearance,
+overlapping speech included. Weights are OpenMDW-1.1 (commercial use allowed).
+
+```
+16 kHz PCM
+  -> NeMo log-mel: preemph 0.97, n_fft 512, Hann(400) centred, 128 slaney mels,
+     ln(x + 2^-24), no normalisation; frames >= floor(L/160) zeroed
+  -> 8x frame stacking (80 ms) -> Linear 1024 -> 512
+  -> offline chunk loop (340 frames + 40 right context), each chunk prefixed by
+     the Arrival-Order Speaker Cache (264) + FIFO (40) of earlier frames:
+       LayerNorm -> 31 pre-LN layers (fused qkv, NEOX RoPE, 8 heads x 64,
+       GELU MLP 2048) -> LayerNorm -> Linear 512 -> 192
+       -> sub-pixel Conv1d 192 -> 1536, reshaped to 8 x 10 ms frames
+       -> relu -> dense -> relu -> Linear -> 8 logits
+  -> speaker-cache update: per-speaker frame scores (log-prob ratio, boosts for
+     the latest / strong / weak frames), speaker-major top-k compression
+  -> sigmoid > 0.5 per speaker = turns; ASR segments take the speaker with the
+     most probability mass inside them
+```
+
+- Files: `src/nemotron3_diar.{h,cpp}` (runtime), `src/crispasr_diarize.cpp`
+  (`apply_sortformer`), `models/convert-nemotron3-diar-to-gguf.py`.
+- GGUF layout: the `sortformer` layout NVIDIA's NeMo-Speech.cpp reads, so
+  NVIDIA's own `Nemotron-3-Diarization.q8_0.gguf` (what `--diarize-model auto`
+  downloads) loads unchanged; the converter writes F32/F16 in the same layout.
+- The chunk loop and cache follow transformers'
+  `Nemotron3DiarizationForAudioFrameClassification` offline mode (chunk 340,
+  right context 40, FIFO 40, update period 300, cache 264). Chunk sizes come
+  from `nemotron3diar.offline.*` metadata, defaulting to those values.
+- The probability matrix has `floor(L/160) + 1` rows; the last is padding under
+  transformers' attention mask, so turns stop at
+  `nemotron3_diar_n_valid_frames()`.
+- Parity (`crispasr-diff nemotron3-diar`, reference
+  `tools/reference_backends/nemotron3_diar.py`, Kaggle CPU): F32 and F16 give
+  cos 1.000000 on mel, embeddings, logits and probabilities, and 100 % of the
+  p > 0.5 decisions and the segment list match transformers on
+  `samples/multispeaker.wav` and NeMo-Speech.cpp's 60 s AMI clip. NVIDIA's q8_0
+  agrees on 99.91-99.99 % of decisions. Frame DER on the AMI clip (10 ms, no
+  collar, overlap scored) is 29.5 % for both C++ and transformers; most of it is
+  missed speech (28.3 %).
+- Bench: `CRISPASR_NEMOTRON3_DIAR_BENCH=1` prints mel and per-chunk encoder
+  times.
+- Streaming: `nemotron3_diar_stream_{begin,push,end,free}` is a live session
+  in transformers' streaming mode — the first chunk uses centred windows, later
+  ones the uncentred audio span the processor cuts
+  (`chunk_start = frame * hop - n_fft / 2`), the last is scored whole, and the
+  cache takes `streaming_config`'s sizes (FIFO 264, update period 222; NVIDIA's
+  GGUF records a NeMo-side schedule instead, so those keys are ignored). Presets
+  (chunk, look-ahead) in 80 ms frames: `low_latency` (9, 4), `very_low_latency`
+  (6, 2), `ultra_low_latency` (3, 1). `--sortformer-mode` /
+  `CRISPASR_SORTFORMER_MODE` run a whole file through one session.
+- Streaming parity (Kaggle CPU, both clips, all three presets, F32 and F16):
+  mel / embeddings / logits / probabilities cos 1.000000, 100 % of decisions
+  and identical segment lists vs the model card's streaming driver, and 100 ms
+  pushes through the live API reproduce the one-shot rows. Frame DER on the AMI
+  clip, C++ = transformers in every mode: offline 29.5 %, `low_latency` 33.5 %,
+  `very_low_latency` 32.7 %, `ultra_low_latency` 33.0 %.
+- Streaming cost: every chunk re-encodes the whole speaker cache + FIFO
+  (264 + 264 frames) to score 9 / 6 / 3 new ones, so compute per second of audio
+  grows as the chunk shrinks. On a 4-vCPU Kaggle CPU (F32) the 60 s AMI clip
+  takes 8 s offline but 138 s / 202 s / 406 s in the three presets (transformers
+  fp32 / MKL on the same box: ~57 s for `low_latency`), i.e. slower than real
+  time: live streaming wants a GPU or a much larger CPU. NVIDIA's q8_0 on the
+  CPU: 6.6 s offline, 105 s `low_latency` (decisions 99.9 % vs transformers).
+- Measured optimisations (Kaggle A/B, AMI clip, `low_latency`): flash attention
+  is the CPU default (exact, 162 -> 137 s); the mel FFT caches its twiddles
+  (bit-identical; it was 1.2 s of the T4's 4.2 s — 14 ms per chunk); contiguous
+  Q/K and an OpenBLAS/ACCEL device gave nothing and were dropped. For a live
+  session that cannot keep up, `nemotron3_diar_stream_set_catchup()` /
+  `CRISPASR_SORTFORMER_CATCHUP` merges the chunks that backed up into one
+  forward (~one chunk's compute; +1 DER point at 8 chunks per forward).
+- GPU (Tesla T4, CUDA): the 60 s AMI clip takes 0.27 s offline and 3.8 s in
+  `low_latency` (F32; 46 ms per chunk, ~16x faster than real time), with the same
+  parity as on the CPU. The converter keeps `encoder.pre_encode.proj` in F32:
+  in streaming it projects only 13 rows per chunk, and CUDA's small-batch F16
+  path otherwise flips a few borderline decisions.
+
 ### gigaam
 
 ai-sage/GigaAM-v3 — Russian ASR. A 16-layer **rotary** Conformer encoder
@@ -1337,6 +1617,46 @@ Converts text + reference audio to mel spectrograms via ODE-based diffusion
 (typically 32 Euler steps), then vocodes with a shared vocoder. Zero-shot
 voice cloning.
 
+### fireredtts3
+
+FireRedTTS3 (FireRedTeam/FireRedTTS3, Apache-2.0): zero-shot in-context voice
+cloning over CONTINUOUS speech representations rather than discrete codec
+tokens. A Qwen3-1.7B backbone (28L, d=2048) runs over 64-d 25 Hz latents
+produced by RedAE, with an 8-layer PatchEncoder on the prompt side and an
+11-layer DiT flow head that denoises the next latent window. RedAE is a Qwen3
+autoencoder (18L encoder + 4L CLS downsample, 18L decoder, d=896, sliding
+window 64) whose Vocos-style ISTFT head reconstructs 24 kHz mono. Speaker
+identity comes from a CAM++ 512-d x-vector projected separately into the LLM
+(`spk_proj_llm`) and the DiT (`spk_proj_dit`).
+
+Cloning is `--voice ref.wav --ref-text "<transcript>"`; the transcript is
+auto-transcribed when `--ref-text` is absent. Without `--voice` a default
+English prompt baked into the core GGUF is used.
+
+**The DiT flow head must stay F16** — `crispasr-quantize` quantizes only the LLM
+backbone, the same constraint dots-tts has.
+
+Parity against the reference (kernel `chr1s4/crispasr-fireredtts3-validate`):
+`penc_prompt`, `prefill_embeds`, `llm_prefill_out`, `stop_scores`,
+`latents_gen` and `dec_hidden` all at cos 1.000000, `gen_audio` 0.999999,
+`spk_llm` 1.000000, `spk_dit` 0.999991, `spk_emb` 0.999452.
+
+Two notes worth keeping, because both cost time:
+
+- **The CAM++ speaker path was the last thing to converge, and the bug was not
+  in this backend.** `spk_emb` sat at cos 0.268 with magnitude 1.67x until a
+  shared `seg_pooling` defect was fixed (`src/core/campplus_segpool.h`): the
+  partial tail window of `avg_pool1d(k=100, ceil_mode=True)` was divided by the
+  kernel size instead of by its own width. Feeding the stage the REFERENCE
+  fbank is what localised it — bad output from known-good input indicts the
+  network, not its input.
+- **`campp_fbank` sits at cos 0.997589 by design, gated at 0.995.** That
+  residual is the resampler, not a fbank convention error: we reach 16 kHz with
+  `core_audio::resample_polyphase`, the reference uses
+  `torchaudio.functional.resample`, and one clip through both into the
+  IDENTICAL kaldi fbank gives cos 0.998250. int16 scaling was tested and ruled
+  out (it costs cos 0.952). The cost downstream is 0.0005 of embedding cosine.
+
 ### lfm2-audio
 
 LiquidAI LFM2.5-Audio (LFM Open v1.0, 1.5B): end-to-end multimodal
@@ -1514,6 +1834,49 @@ restores bandwidth while preserving speaker identity.
   the padding (A/B, and for reproducing pre-padding reference dumps). The
   lookahead consumes ~75 frames of the input-duration cap.
 
+- **Length behaviour (measured 2026-09-13, #431).** Parity with upstream is FLAT
+  in input length — our predictor handoff scores 0.994 / 0.997 / 0.997 / 0.997
+  against the reference at 11 / 30 / 50 / 62 s. But the model's own restoration
+  quality is NOT flat: an ASR roundtrip over the 62 s output is markedly worse
+  than over the 11 s one, on the faithful path. Since we match the reference at
+  0.997 throughout, that degradation is SIDON'S behaviour, not a port defect —
+  do not chase it as one.
+
+  Corollary worth knowing before optimising: windowing the predictor makes ASR
+  transcripts of long audio look better while moving AWAY from the reference
+  (0.991 / 0.987 / 0.974 at 30 / 50 / 62 s, worsening with each added window).
+  It was tried and removed. Unlike the DAC's chunking — exact because the
+  decoder is fully convolutional with cores sized by `dac_receptive_frames()` —
+  attention has no receptive field, so no amount of context makes a windowed
+  core exact.
+
+  The input cap is therefore a MEMORY bound only. It derives from
+  `CRISPASR_SIDON_MEM_BUDGET_MB` (default 4096) via the measured anchor above,
+  giving ~4000 frames (~78 s). Attention grows as O(T^2), so a 54-minute
+  recording needs ~1.5 TiB for the relative index alone — splitting very long
+  audio is inherent, not a limitation of this implementation.
+
+- **Parity against upstream (measured 2026-09-12).** The predictor handoff
+  matches the upstream TorchScript reference at **cos 0.994072** on
+  `samples/jfk.wav`, at frame offset **1** (exactly the documented `lead_frames`
+  lead-in) with magnitude ratio **1.0003**. Reproduce with
+  `CRISPASR_SIDON_DUMP_HANDOFF=<path>` against `predictor_feats` in
+  `sidon-ref.gguf` (built by `tools/reference_backends/sidon_ref_dump.py`);
+  ours carries 625 frames to the reference's 549, the 76-frame difference being
+  the lead + 1.5 s lookahead pad, so ALIGN BEFORE COMPARING or an offset reads
+  as a divergence.
+
+  Two cautions that cost time when they were not written down:
+  - **Do not judge this port by waveform cosine.** The same run scores only
+    **0.63** against `sidon-ref-48k.wav` at near-zero lag while the RMS ratio is
+    0.979 — a 0.994 → 0.63 drop across a neural decoder is a phase difference,
+    not an error. The reference dumper's own docstring reaches for "ASR
+    round-trip / corr" for exactly this reason.
+  - **No parity figure existed before this line.** The reference dumper and the
+    reference GGUF were committed months earlier, but nothing recorded what the
+    port scores against them, so there was no baseline a regression could fail
+    against. If you change the predictor, re-measure and update this number.
+
 - **Working memory:** two independent bounds, each measured at `T≈2825`
   (~55 s) with `sidon-v0.1-q8_0` on Metal. Use `CRISPASR_SIDON_DEBUG=1` to
   print the per-stage scheduler workspace; process RSS is *not* a usable proxy
@@ -1595,6 +1958,25 @@ Key architectural points:
   package on gTTS Japanese test audio (verified on Kaggle, 2026-06-28).
 
 Models at `cstr/reazonspeech-nemo-v2-GGUF`: F16 (1240 MB), Q8_0 (704 MB), Q4_K (455 MB).
+
+### parakeet-ultra / parakeet-redux
+
+moondream's `parakeet-ultra` and `parakeet-redux` (CC-BY-4.0, #454) are the
+stock parakeet-tdt-0.6b-v3 architecture, published in transformers'
+`ParakeetForTDT` format instead of as a `.nemo`. They run on the unmodified
+`parakeet` backend. All the work is in `models/convert-parakeet-to-gguf.py
+--hf`:
+- it maps HF tensor names onto the NeMo-derived GGUF layout;
+- it synthesises NeMo's featurizer (librosa Slaney filterbank (1, 128, 257),
+  symmetric Hann 400);
+- it takes the vocabulary from `tokenizer.json`.
+
+**redux** stores its encoder linears as base-3 packed ternary codes: five
+codes per byte, least-significant digit first, with `w = scale · (code − 1)`
+per group. The converter unpacks them exactly, so the GGUF holds ordinary
+F16/Q8_0/Q4_K weights. The reference is transformers' `ParakeetForTDT`
+(`tools/reference_backends/parakeet_hf.py`), with moondream's Photon runtime
+as an independent transcript check.
 
 ### parakeet-ctc-1.1b-ja
 

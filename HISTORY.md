@@ -6,6 +6,78 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## Session ABI TTS sample-rate bugs (from CrisperWeaver), fixed 2026-09-23
+
+Three session-ABI defects, all invisible to the CLI, found by a downstream
+Flutter app driving the bindings:
+(1) `crispasr_session_set_voice` loaded an f5-tts reference at a hard-coded
+24 kHz. Raon-OpenTTS (#387) runs the f5-tts runtime with a 16 kHz mel
+front-end, so every binding fed it a reference read at the wrong rate: the
+reference mel came out 747 frames against the CLI's 680, cos 0.94. It now
+loads at `f5_tts_sample_rate()`, as the CLI adapter already did; `f5_tts.h`'s
+`pcm_24k` parameter, which invited the constant, is now `pcm` and documented
+as model-rate. F5-TTS proper (24 kHz) is unchanged by construction.
+(2) `crispasr_session_output_sample_rate` had no `bt2_ctx` arm, so
+Breeze-TTS-2 reported 0 Hz; it returns the codec's 24 kHz like the CLI.
+(3) The session's f5-tts open arm rejected `raon` / `raon-1b`, names the CLI
+factory accepts, so an explicit open from a binding returned null.
+Guards, each observed failing first: `test-session-output-rate-parity` (unit,
+structural — every synthesize arm must have a rate arm; it named `bt2_ctx`
+and nothing else), and `test-f5-session-voice-rate-live.sh`, which compares
+the reference mel the session and the CLI build via `CRISPASR_F5_DUMP_REFMEL`
+without synthesising (4 s; a first output-length version took 1 h 50 min
+and was confounded by the CLI's spoken disclosure).
+
+## PR #427 generic ASR environment-parity harness, fixed 2026-09-06
+
+Merged the contributed backend-agnostic harness for comparing baseline,
+individual environment gates, and their combined output across audio samples.
+The follow-up replaced display-derived artifact paths with numbered internal
+keys: an accepted `-e baseline` previously overwrote `baseline.stdout`, compared
+the file with itself, and falsely exited 0 for a changed transcript. Sample
+paths are numbered too, preserving diagnostics for filenames that sanitize to
+the same value. Existing nonempty output directories are rejected so stale
+diffs cannot be mistaken for current results, commands resolve through `PATH`,
+and GNU `sort -z` plus Bash-4 associative arrays were removed for macOS's system
+Bash. A model-free fake-CLI test covers mismatch and command-error accounting,
+environment scrubbing, aggregate gates, both collision classes, PATH lookup,
+and output-directory safety through CI's `unit` label.
+
+## #411 Pocket-TTS official prepared voices, fixed 2026-09-01
+
+Added native loading of Kyutai `embeddings_v3/*.safetensors` prepared
+transformer K/V voice states to the Pocket runtime, CLI/server adapter, and C
+session ABI. Bare `--voice` names prefer `<voice-dir>/<name>.safetensors`
+before WAV; malformed or model-incompatible cache shapes fail closed. Local
+real-asset synthesis was non-silent and roundtripped exactly as `Hola mundo.`;
+hosted run
+[33486783999](https://github.com/CrispStrobe/CrispASR/actions/runs/33486783999)
+passed 4,789 assertions and all five multilingual ASR roundtrips, including
+the Alba Spanish prepared voice (four decoded content stems).
+
+## #397 Piper community voices on Windows — exact lookup, clean-install G2P, and live proof, fixed 2026-08-31
+
+Fixed the reporter's `piper-en_GB-cori-medium-f16.gguf` command end to end.
+An explicit bare filename is now searched unchanged in the normal model/cache
+directories before registry fallback, so a community voice in
+`CRISPASR_MODELS_DIR` is selected and Piper is inferred from its filename;
+it is never silently replaced by the registry's Lessac default. The shared C
+resolver has the same behavior. Piper's pre-generated IPA and CMU dictionaries
+are again downloadable because their cache dependency now lives in and is
+linked from `crispasr-core`. The audit also repaired native Windows downloads:
+WinHTTP now follows Hugging Face's root-relative redirects without corrupting
+UTF conversions, while curl/wget fallback headers are quoted for cmd.exe.
+The Piper docs include copyable PowerShell server and JSON request examples.
+
+Hosted Windows Server 2022 run 33444762281 is the release-independent proof:
+a clean portable CPU build found the exact Cori GGUF, inferred `piper`,
+downloaded and loaded 126,051 IPA entries, synthesized a 2.54-second 22.05 kHz
+WAV, and Whisper recovered “The quick brown fox…”; the server arm recovered
+“You did a great job today” and passed nonempty chunked `audio/pcm`. Local
+proof additionally covered the registry (4,789 assertions), five resolution
+cases, standalone cache/Piper linkage, real CLI/server synthesis, and HTTP WAV
+and streaming roundtrips.
+
 ## #411 Pocket-TTS multilingual registry — five languages model-proven, fixed 2026-08-31
 
 Added Kyutai's German, Spanish, Italian, Portuguese, and French Pocket-TTS
@@ -48,6 +120,69 @@ compares the direct view with the former materialized path (71 assertions).
 Hosted live run 33333867440 used public Nano Q4_K plus Turbo S3Gen Q4_K: both
 paths emitted the same 40-token trajectory and byte-identical decoded PCM.
 `CRISPASR_CHATTERBOX_KV_CONT=1` retains the old path as a diagnostic A/B.
+
+## #419 canary Russian-as-translit — root mechanism found, diagnostics shipped, 2026-09-02 (issue open pending reporter data)
+
+The reported symptom (Russian recognized correctly but emitted in Latin
+translit) could NOT be reproduced with the registry canary-1b-v2-q4_k under
+any constructible condition: CPU, CUDA (P100 kernel
+`chr1s4/crispasr-issue419-canary-ru-gpu`), Vulkan/llvmpipe, single-pass,
+streamed 56 s, 0.8-3 s VAD-sized slices, 44.1 kHz stereo input, and the
+reporter's exact flags — all proper Cyrillic. The vocab carries 2175
+Cyrillic pieces + `<|ru|>`, and the prompt builder hard-fails on unknown
+tokens. The one arm that reproduces the symptom exactly is `-l en` on
+Russian audio: wrong-language conditioning makes the model render the words
+it heard in Latin, fluently and silently. (The reverse is robust: `-l ru`
+on English audio TRANSLATES into Cyrillic Russian.)
+
+Shipped so the failure diagnoses itself from any log: a one-line
+`canary: languages src=.. tgt=..` effective-conditioning print, and a
+wrong-script warning (`core/script_mismatch.h`, hermetic decision table in
+tests/test-script-mismatch.cpp — ru/uk/bg/el vs a UTF-8 letter-script
+census, 20-letter evidence bar, code-switch tolerant) that names the likely
+causes when a Cyrillic/Greek target produces Latin-dominated text. The
+issue stays open until the reporter can share the resolved-model line and
+a sample; the leading hypothesis is that their frontend's -l/--source-lang
+never reached the process.
+
+## #418 VibeVoice-ASR aborted on Intel Arc Vulkan — encoder CPU fallback + BitNet TQ guard, fixed 2026-09-01
+
+An Arc B580 user transcribing a 1-hour file hit `ggml-vulkan
+GGML_ASSERT(wg0 <= maxComputeWorkGroupCount…)` on every VAD slice, for both
+the q4_k and bitnet ASR models — and correctly guessed the cause: the σ-VAE
+DECODER got a CPU fallback for exactly this device class in issue #52, but
+the ENCODERS (the ASR direction) missed it. The acoustic/semantic tokenizer
+encoders dispatch convs over the raw 24 kHz waveform; on drivers whose
+`maxComputeWorkGroupCount` is 65535 per dimension (Intel ANV, llvmpipe —
+NVIDIA reports 2^31) even an 11 s slice overflows.
+
+Fix 1: `vibevoice_backend_policy.h` — a pure, unit-tested decision table
+(`CRISPASR_VIBEVOICE_ENC_BACKEND={auto|cpu|gpu}`); auto pins the encoder
+graphs to the CPU backend on Vulkan+Intel/llvmpipe via
+`ggml_backend_sched_set_tensor_backend`, the same mechanism as the #52
+decoder fallback. Metal is deliberately NOT diverted. Along the way the #52
+decoder matcher turned out to be silently dead: it matched
+`ggml_backend_dev_name()`, which for Vulkan is the registry label
+("Vulkan0") — the marketing string with "Intel"/"llvmpipe" lives in
+`ggml_backend_dev_description()`. Both policies now check both strings.
+
+Fix 2 (second finding while proving the first): BitNet TQ1_0/TQ2_0 weights
+have no Vulkan kernels at all — post-encoder the load aborted with
+"pre-allocated tensor (lm.tok_emb.weight) in a buffer (Vulkan0) that cannot
+run the operation" (ggml-backend.cpp:940). The loader now scans tensor types
+and routes a TQ model entirely to CPU under Vulkan with a clear message
+(`CRISPASR_VIBEVOICE_TQ_VULKAN=1` keeps Vulkan for when kernels land).
+
+Proof, all on this VPS with mesa lavapipe (llvmpipe reports the same 65535
+limit as Intel; ggml hides CPU-class Vulkan devices unless
+`GGML_VK_VISIBLE_DEVICES=0`): the pre-fix behaviour
+(`CRISPASR_VIBEVOICE_ENC_BACKEND=gpu`) reproduces the reporter's abort
+bit-for-bit (rc=134, same assert, right after the encoder banner, on 33 s
+AND 11 s clips); the fixed defaults run the same 33 s clip end-to-end to the
+correct JFK transcript (encoder-diversion log line + TQ-guard log line both
+firing). Local Vulkan builds on this 8 GB box need the generated SPIR-V
+blob TUs compiled -O0 (a ~120 MB initializer file OOMs cc1plus at -O3) —
+kept as an uncommitted ggml-submodule note, not shipped.
 
 ## #405 CUDA package on a pre-AVX2 CPU had NO cpu backend — variant CPU modules + graceful no-CPU failure, fixed 2026-08-30
 

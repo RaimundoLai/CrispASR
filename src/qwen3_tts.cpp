@@ -682,6 +682,10 @@ struct qwen3_tts_context {
     ggml_backend_buffer_t cp_cpu_buf = nullptr;
     ggml_tensor* talker_embd_cpu = nullptr;
     bool cp_cpu_pinned = false;
+    // Native ROCm 0.6B-F16: F32 copies of the FFN down weights. HIP's F16
+    // matmul converts its F32 input to half, which can overflow after SwiGLU.
+    ggml_context* cp_hip_down_ctx = nullptr;
+    ggml_backend_buffer_t cp_hip_down_buf = nullptr;
 
     // Preferred 1.7B path: fold small_to_mtp INTO the code_pred graph as its
     // first op so the projection runs on the same backend/kernel as the decoder
@@ -745,6 +749,10 @@ struct qwen3_tts_context {
 
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
+    // Weights the GPU backend cannot bind (load_weights_fit), e.g. the 622 MB
+    // text embedding past a Vulkan device's maxStorageBufferRange. Null when
+    // everything fits.
+    ggml_backend_buffer_t buf_w_cpu = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
     std::vector<uint8_t> compute_meta;
 
@@ -910,26 +918,29 @@ static bool qwen3_tts_codec_decode_uses_cuda(const qwen3_tts_context* c) {
            crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_GPU") != nullptr || qwen3_tts_codec_use_gpu_by_default(c);
 }
 
-// #304: the qwen3-tts talker LM (and code_predictor) miscompute on the Vulkan
-// backend — on a Tesla P100 the AR decode runs away into a ~324 s clip of
-// clipping noise (peak 1.0) with empty ASR, vs a correct ~7 s render on CPU.
-// The codec is already CPU-pinned (see qwen3_tts_codec_use_gpu_by_default); this
-// routes the talker to CPU too when the GPU backend is Vulkan — the same
-// ggml-vulkan graph-corruption class already gated to CPU in cosyvoice3 (#304),
-// tada-codec (#192), moss (#215). SubtitleEdit ships the Vulkan Windows build to
-// every Windows user. Metal + CUDA keep the native GPU talker. Override with
-// CRISPASR_QWEN3_TTS_VULKAN_NATIVE=1.
+// #337 (Vulkan): the qwen3-tts talker ran away on Vulkan (P100: a ~324 s
+// clip of noise vs ~7 s on CPU), so the talker was pinned to CPU on every
+// Vulkan device. Both root causes are now fixed:
+//   - the FA shaders read the causal mask with stride KV instead of the
+//     mask's own stride (ggml fork, proven on lavapipe: mask_pad cases fail
+//     before / pass after), and
+//   - the 0.6B-F16 code predictor's F16 down projection overflowed on every
+//     backend whose F16 GEMM narrows activations (promote_cp_down_to_f32).
+// The native path was then verified on real hardware (RX 7900 XT / RADV,
+// 0.6B F16 direct + scheduler, 1.7B Q8_0: all stop cleanly, ASR correct) and
+// on lavapipe in CI (.github/workflows/qwen3-tts-vulkan-lavapipe.yml). So the
+// talker now runs natively on Vulkan by default;
+// CRISPASR_QWEN3_TTS_VULKAN_CPU=1 restores the CPU pin as an escape hatch.
 static void qwen3_tts_route_off_vulkan(qwen3_tts_context* c, int verbosity) {
     if (c->backend == c->backend_cpu || !std::strstr(ggml_backend_name(c->backend), "Vulkan")) {
         return;
     }
-    const char* keep = crispasr_env::get("CRISPASR_QWEN3_TTS_VULKAN_NATIVE");
-    if (keep && keep[0] == '1') {
+    if (!qwen3_tts_hip_policy::vulkan_talker_on_cpu(crispasr_env::get("CRISPASR_QWEN3_TTS_VULKAN_CPU"),
+                                                    crispasr_env::get("CRISPASR_QWEN3_TTS_VULKAN_NATIVE"))) {
         return;
     }
     if (verbosity >= 1) {
-        fprintf(stderr, "qwen3_tts: Vulkan backend detected — running talker on CPU (#304 Vulkan "
-                        "miscompute; set CRISPASR_QWEN3_TTS_VULKAN_NATIVE=1 to override)\n");
+        fprintf(stderr, "qwen3_tts: CRISPASR_QWEN3_TTS_VULKAN_CPU=1 - running the talker on CPU\n");
     }
     ggml_backend_free(c->backend);
     c->backend = c->backend_cpu;
@@ -1212,7 +1223,19 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
     // o15_force >= 0 pins the topology choice (CP_DIRECT builds O15-shaped
     // graphs regardless of the env); < 0 keeps the env-driven behaviour.
     const bool o15 = o15_force >= 0 ? o15_force != 0 : env_bool_default("CRISPASR_QWEN3_TTS_O15", false);
-    const int Lk = o15 ? c->cp_kv_max_ctx : (n_past + T);
+    // #337: the causal mask's width MUST equal the KV length the attention
+    // helper below actually reads, because the Vulkan flash-attention shader
+    // derives the mask row stride from KV, not from mask->ne[0] (see
+    // flash_attn_base.glsl: `m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16)
+    // : KV`). Pinning fixed_kv only at T==1 built the T=2 step-0 graph with a
+    // cp_kv_max_ctx-wide mask while kv_self_attn still read Lk = n_past + T = 2
+    // rows, so Vulkan read the mask with stride 2 over a stride-16 buffer and
+    // masked the wrong keys. That is the frame-0 code-predictor miscompute
+    // behind the Vulkan/gfx1100 #337 runaway. Pin fixed_kv for every O15 graph
+    // (the documented intent: "pin Lk = cp_kv_max_ctx for all code_pred
+    // graphs"); the mask fill already uses cp_kv_max_ctx for every O15 shape.
+    const int fixed_kv = o15 ? c->cp_kv_max_ctx : 0;
+    const int Lk = fixed_kv > 0 ? fixed_kv : (n_past + T);
 
     ggml_context* ctx0 = arena_ctx;
     if (!ctx0) {
@@ -1268,7 +1291,6 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
         // Lk = n_past + T. Also pass `positions` as kv_indices so the K/V
         // cache write becomes a runtime-indexed scatter — required for the
         // cached-graph reuse path (skip_plan) to be correct across n_past.
-        const int fixed_kv = (o15 && T == 1) ? c->cp_kv_max_ctx : 0;
         ggml_tensor* eff_mask = (T == 1 && !o15) ? nullptr : causal_mask;
         ggml_tensor* eff_kv_indices = o15 ? positions : nullptr;
         ggml_tensor* attn =
@@ -3015,6 +3037,56 @@ static enum ggml_type code_pred_cpu_copy_type_from_env(const char* cp_be) {
         return GGML_TYPE_F16;
     }
     return GGML_TYPE_COUNT; // "cpu" = keep original tensor types
+}
+
+// Keep the down projections on the GPU, but use F32 weights so HIP's matmul
+// does not narrow the F32 SwiGLU output to half. The 0.6B-F16 checkpoint can
+// produce activations above 65504 here (layer 2 reaches ~156000), turning
+// every output of that projection into NaN/Inf when narrowed. Bake once at
+// load, rather than casting five weight matrices at each of 15 AR steps.
+static bool promote_cp_hip_down_weights(qwen3_tts_context* c) {
+    std::vector<ggml_tensor**> weights;
+    for (auto& block : c->code_pred.blocks) {
+        if (block.ffn_down_w && block.ffn_down_w->type == GGML_TYPE_F16) {
+            weights.push_back(&block.ffn_down_w);
+        }
+    }
+    if (weights.empty())
+        return true;
+
+    ggml_init_params ip = {ggml_tensor_overhead() * (weights.size() + 1) + 256, nullptr, true};
+    c->cp_hip_down_ctx = ggml_init(ip);
+    if (!c->cp_hip_down_ctx)
+        return false;
+
+    std::vector<ggml_tensor*> copies;
+    for (ggml_tensor** src : weights) {
+        ggml_tensor* dst = ggml_new_tensor(c->cp_hip_down_ctx, GGML_TYPE_F32, GGML_MAX_DIMS, (*src)->ne);
+        ggml_format_name(dst, "%s.f32", (*src)->name);
+        copies.push_back(dst);
+    }
+    c->cp_hip_down_buf = ggml_backend_alloc_ctx_tensors(c->cp_hip_down_ctx, c->backend);
+    if (!c->cp_hip_down_buf)
+        return false;
+
+    std::vector<ggml_fp16_t> half;
+    std::vector<float> full;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        const size_t n = (size_t)ggml_nelements(*weights[i]);
+        half.resize(n);
+        full.resize(n);
+        ggml_backend_tensor_get(*weights[i], half.data(), 0, n * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(half.data(), full.data(), (int64_t)n);
+        ggml_backend_tensor_set(copies[i], full.data(), 0, n * sizeof(float));
+    }
+    for (size_t i = 0; i < weights.size(); ++i)
+        *weights[i] = copies[i];
+    if (c->params.verbosity >= 1) {
+        fprintf(stderr, "qwen3_tts: code_pred (%s): promoted %zu F16 FFN down weights to F32 (%zu MB)\n",
+                ggml_backend_name(c->backend), weights.size(),
+                ggml_backend_buffer_get_size(c->cp_hip_down_buf) / (1024 * 1024));
+    }
+    return true;
 }
 
 // Copy code_pred transformer weights (lm_head + blocks + output_norm) and a
@@ -5427,11 +5499,13 @@ static bool run_cenc(qwen3_tts_context* c, const float* audio, int n_samples, st
         return false;
     }
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pcm_input"), audio, 0, (size_t)n_samples * sizeof(float));
-    // Set causal mask. T_enc = T_audio/960 (4*5*6*8 SEANet stride product)
+    // SEANet rounds partial audio frames up; floor(n_samples / 960) leaves the
+    // final mask row(s) uninitialized and can produce NaNs in attention.
     {
-        const int T_enc = n_samples / 960;
         ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "cenc_mask");
-        if (mask_t && T_enc > 1) {
+        if (mask_t) {
+            const int T_enc = (int)mask_t->ne[0];
+            GGML_ASSERT(mask_t->ne[1] == T_enc);
             auto mask = build_cenc_mask(T_enc);
             ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
@@ -6088,13 +6162,14 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
     qwen3_tts_route_off_vulkan(c, params.verbosity);
 
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path_model, c->backend, "qwen3_tts", wl)) {
+    if (!core_gguf::load_weights_fit(path_model, c->backend, c->backend_cpu, "qwen3_tts", wl)) {
         fprintf(stderr, "qwen3_tts: failed to load weights from '%s'\n", path_model);
         delete c;
         return nullptr;
     }
     c->ctx_w = wl.ctx;
     c->buf_w = wl.buf;
+    c->buf_w_cpu = wl.buf_cpu;
     c->tensors = std::move(wl.tensors);
 
     if (!load_talker(c)) {
@@ -6194,13 +6269,30 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
         c->code_pred.lm_head[0] && qwen3_tts_hip_policy::code_predictor_must_use_cpu(
                                        ggml_backend_name(c->backend), hip_cp_native, (int)c->hp.cp_n_layers,
                                        (int)c->hp.cp_d_model, cp_transformer_is_f16);
+    // F16 down projections overflow wherever the backend's F16 GEMM narrows
+    // the F32 SwiGLU activation (CUDA / ROCm / Vulkan / SYCL) — not only on HIP.
+    // Bake F32 copies once whenever the predictor stays on such a backend.
+    // CRISPASR_QWEN3_TTS_CP_F32_DOWN=0|1 overrides the policy for A/B tests.
+    const char* f32_down_env = crispasr_env::get("CRISPASR_QWEN3_TTS_CP_F32_DOWN");
+    const int f32_down_override = f32_down_env ? (std::atoi(f32_down_env) != 0 ? 1 : 0) : -1;
+    const bool cp_stays_on_backend = !(explicit_cp_cpu || hip_f16_cp_fallback);
+    if (cp_stays_on_backend &&
+        qwen3_tts_hip_policy::promote_cp_down_to_f32(ggml_backend_name(c->backend), cp_transformer_is_f16,
+                                                     f32_down_override) &&
+        !promote_cp_hip_down_weights(c)) {
+        fprintf(stderr, "qwen3_tts: code_pred F32 down-weight allocation failed\n");
+        qwen3_tts_free(c);
+        return nullptr;
+    }
     if (explicit_cp_cpu || hip_f16_cp_fallback) {
-        const enum ggml_type copy_type = explicit_cp_cpu ? code_pred_cpu_copy_type_from_env(cp_be) : GGML_TYPE_F16;
+        // The CPU graph mixes F32 activations with these weights; copying them
+        // as F16 makes ggml-cpu reject F32 + F16 binary ops on this path.
+        const enum ggml_type copy_type = explicit_cp_cpu ? code_pred_cpu_copy_type_from_env(cp_be) : GGML_TYPE_F32;
         if (!copy_cp_weights_to_cpu(c, copy_type)) {
             fprintf(stderr, "qwen3_tts: code_pred CPU pin requested but copy failed; using main backend\n");
         } else if (hip_f16_cp_fallback && c->params.verbosity >= 1) {
-            fprintf(stderr, "qwen3_tts: ROCm 0.6B-F16 code predictor routed to CPU (#337 NaN guard; set "
-                            "CRISPASR_QWEN3_TTS_HIP_CP_NATIVE=1 to override)\n");
+            fprintf(stderr, "qwen3_tts: ROCm 0.6B-F16 code predictor routed to CPU (#337 conservative default; set "
+                            "CRISPASR_QWEN3_TTS_HIP_CP_NATIVE=1 to use native F32 down projections)\n");
         }
     }
 
@@ -6431,6 +6523,39 @@ extern "C" int qwen3_tts_set_voice_prompt(struct qwen3_tts_context* ctx, const c
     return 0;
 }
 
+extern "C" int qwen3_tts_encode_pcm_to_codes(struct qwen3_tts_context* ctx, const float* pcm, int n_samples,
+                                             int32_t** out_codes, int* out_n_frames) {
+    if (out_codes) {
+        *out_codes = nullptr;
+    }
+    if (out_n_frames) {
+        *out_n_frames = 0;
+    }
+    if (!ctx || !pcm || n_samples <= 0 || !out_codes) {
+        return -1;
+    }
+    if (!ctx->cenc.loaded) {
+        fprintf(stderr, "qwen3_tts: encode_pcm_to_codes: codec encoder not loaded\n");
+        return -1;
+    }
+    std::vector<int32_t> codes;
+    int T_frames = 0;
+    if (!run_cenc(ctx, pcm, n_samples, codes, T_frames) || codes.empty()) {
+        fprintf(stderr, "qwen3_tts: encode_pcm_to_codes: codec encode failed\n");
+        return -1;
+    }
+    auto* out = (int32_t*)std::malloc(codes.size() * sizeof(int32_t));
+    if (!out) {
+        return -1;
+    }
+    std::memcpy(out, codes.data(), codes.size() * sizeof(int32_t));
+    *out_codes = out;
+    if (out_n_frames) {
+        *out_n_frames = T_frames;
+    }
+    return 0;
+}
+
 extern "C" int qwen3_tts_set_voice_prompt_with_text(struct qwen3_tts_context* ctx, const char* wav_path,
                                                     const char* ref_text) {
     if (!ctx) {
@@ -6539,9 +6664,10 @@ extern "C" float* qwen3_tts_cenc_extract_stage(struct qwen3_tts_context* ctx, co
     }
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pcm_input"), audio, 0, (size_t)n_samples * sizeof(float));
     {
-        const int T_enc = n_samples / 960;
         ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "cenc_mask");
-        if (mask_t && T_enc > 1) {
+        if (mask_t) {
+            const int T_enc = (int)mask_t->ne[0];
+            GGML_ASSERT(mask_t->ne[1] == T_enc);
             auto mask = build_cenc_mask(T_enc);
             ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
@@ -7998,6 +8124,12 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
     if (ctx->cp_cpu_ctx) {
         ggml_free(ctx->cp_cpu_ctx);
     }
+    if (ctx->cp_hip_down_buf) {
+        ggml_backend_buffer_free(ctx->cp_hip_down_buf);
+    }
+    if (ctx->cp_hip_down_ctx) {
+        ggml_free(ctx->cp_hip_down_ctx);
+    }
     if (ctx->codec.buf_w) {
         core_gguf::release_weight_buffer(ctx->codec.buf_w);
     }
@@ -8024,6 +8156,9 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
     }
     if (ctx->buf_w) {
         core_gguf::release_weight_buffer(ctx->buf_w);
+    }
+    if (ctx->buf_w_cpu) {
+        core_gguf::release_weight_buffer(ctx->buf_w_cpu);
     }
     if (ctx->ctx_w) {
         ggml_free(ctx->ctx_w);
