@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <climits> // INT_MIN (parakeet att_context_* sentinels) — issue #257
 #include <cstddef> // offsetof (diarize ABI layout static_asserts) — issue #332
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -5229,6 +5230,47 @@ static std::string ca_iso_to_english_lang(const std::string& code) {
     return core_lang::iso_to_english(code);
 }
 
+// Build the Qwen3-ASR system-turn hotword context from a comma-separated
+// list. Mirrors qwen3-asr-cpp's build_input_tokens(): strip chat-template
+// characters and control bytes, cap at 32 words / 512 bytes.
+static std::string ca_qwen3_hotword_system_prompt(const std::string& hotwords) {
+    if (hotwords.empty())
+        return {};
+    std::string prompt = "Use these hotwords when they are clearly spoken in the audio: ";
+    size_t included = 0;
+    std::istringstream iss(hotwords);
+    std::string token;
+    while (included < 32 && std::getline(iss, token, ',')) {
+        std::string cleaned;
+        cleaned.reserve(token.size());
+        for (unsigned char ch : token) {
+            if (ch == '<' || ch == '>' || ch == '|')
+                continue;
+            if (ch <= 0x20) {
+                if (std::isspace(ch) && !cleaned.empty() && cleaned.back() != ' ')
+                    cleaned.push_back(' ');
+                continue;
+            }
+            cleaned.push_back(static_cast<char>(ch));
+        }
+        while (!cleaned.empty() && cleaned.back() == ' ')
+            cleaned.pop_back();
+        if (cleaned.empty() || cleaned.size() > 128)
+            continue;
+        const size_t extra = cleaned.size() + (included > 0 ? 2 : 0);
+        if (prompt.size() + extra + 1 > 512)
+            break;
+        if (included > 0)
+            prompt += ", ";
+        prompt += cleaned;
+        ++included;
+    }
+    if (included == 0)
+        return {};
+    prompt.push_back('.');
+    return prompt;
+}
+
 // Internal single-pass transcribe (used by best-of-N wrapper below).
 static crispasr_session_result* transcribe_single(crispasr_session* s, const float* pcm, int n_samples,
                                                   const char* language);
@@ -5786,8 +5828,17 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     // up through the existing ask-prompt injection. Parakeet CTC/TDT
     // hotwords are applied directly via parakeet_set_hotwords() in
     // crispasr_session_set_hotwords() — no ask-prompt injection needed.
+    // Qwen3-ASR (and mega-asr) take hotwords in the system turn instead —
+    // the same slot as the official `context` — so the user turn stays a
+    // plain transcription request and the language prefill is kept. Raon
+    // has no system turn and keeps the ask-prompt injection.
+    bool hotwords_in_system = false;
+#ifdef CA_HAVE_QWEN3
+    hotwords_in_system = s->qwen3_ctx && !qwen3_asr_is_raon_speech(s->qwen3_ctx);
+#endif
+    const bool inject_hotwords_into_ask = !s->hotwords.empty() && !hotwords_in_system;
     std::string saved_ask;
-    if (!s->hotwords.empty()) {
+    if (inject_hotwords_into_ask) {
         saved_ask = s->ask;
         const std::string hw_hint = "The following words may appear in the audio: " + s->hotwords + ". ";
         s->ask = s->ask.empty() ? hw_hint : hw_hint + s->ask;
@@ -5801,7 +5852,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             if (active)
                 s->ask = std::move(*saved);
         }
-    } ask_guard{s, &saved_ask, !s->hotwords.empty()};
+    } ask_guard{s, &saved_ask, inject_hotwords_into_ask};
 
     auto* r = new crispasr_session_result();
     r->backend = s->backend;
@@ -6648,14 +6699,15 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         // none" (issue #218 empty-output escape). Mirrors the CLI
         // adapter (crispasr_backend_qwen3.cpp); the legacy system-turn
         // instruction stays behind CRISPASR_QWEN3_SYSPROMPT_LANG=1.
-        std::string sys_instruction;
+        std::string sys_instruction = ca_qwen3_hotword_system_prompt(s->hotwords);
         std::string assistant_prefill;
         if (s->ask.empty()) {
             const std::string eff_lang = lang_set ? lang : s->source_language;
             if (!eff_lang.empty() && eff_lang != "auto") {
                 const char* legacy_env = getenv("CRISPASR_QWEN3_SYSPROMPT_LANG");
                 if (legacy_env && atoi(legacy_env) != 0)
-                    sys_instruction = "Transcribe the speech in " + ca_iso_to_english_lang(eff_lang) + ".";
+                    sys_instruction += (sys_instruction.empty() ? "" : " ") + std::string("Transcribe the speech in ") +
+                                       ca_iso_to_english_lang(eff_lang) + ".";
                 else
                     assistant_prefill = "language " + ca_iso_to_english_lang(eff_lang) + "<asr_text>";
             }
@@ -9392,6 +9444,10 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         // VoxCPM2 zero-shot voice cloning: stash a 16 kHz mono reference
         // clip (exactly what voxcpm2_synthesize_clone wants, so no
         // resample) for the next synthesize. ref_text is unused.
+        if (path[0] == '\0') {
+            s->voxcpm2_ref_pcm.clear();
+            return 0;
+        }
         if (!ends_with_wav(path))
             return -2;
         float* pcm = nullptr;
