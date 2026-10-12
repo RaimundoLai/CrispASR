@@ -341,7 +341,14 @@ struct htdemucs_context {
     // outside htdemucs_diff().
     bool capture_stages = false;
     std::map<std::string, std::vector<float>> captures;
+
+    htdemucs_abort_callback abort_callback = nullptr;
+    void* abort_user_data = nullptr;
 };
+
+static bool htdemucs_abort_requested(const htdemucs_context* ctx) {
+    return ctx && ctx->abort_callback && ctx->abort_callback(ctx->abort_user_data) != 0;
+}
 
 // Record a stage intermediate under `name`. All captures are stored in the
 // PyTorch reference layout so the diff is a straight elementwise compare —
@@ -1642,7 +1649,7 @@ static ggml_tensor* apply_dconv(ggml_context* g, ggml_tensor* x, const htdemucs_
 // 2 s 1.13 GB / 10 s 1.44 GB / 30 s 3.39 GB / 60 s 7.62 GB, and 30 s -> 60 s
 // took 51.9 s -> 197 s for 2x the audio.
 static htdemucs_result* htdemucs_separate_full(htdemucs_context* ctx, const float* pcm_stereo, int n_samples) {
-    if (!ctx || !pcm_stereo || n_samples <= 0)
+    if (!ctx || !pcm_stereo || n_samples <= 0 || htdemucs_abort_requested(ctx))
         return nullptr;
 
     auto& hp = ctx->model.hparams;
@@ -1706,6 +1713,8 @@ static htdemucs_result* htdemucs_separate_full(htdemucs_context* ctx, const floa
         HTD_PROF(prof, "stft");
         spec = compute_stft(pre_padded.data(), 2, pre_padded_len, nfft, hop, ctx->hann_window.data());
     }
+    if (htdemucs_abort_requested(ctx))
+        return nullptr;
 
     // z[..., :-1, :] — drop the last frequency bin (2049 → 2048)
     int Fq = nfft / 2; // 2048 (was nfft/2+1 = 2049)
@@ -1825,6 +1834,8 @@ static htdemucs_result* htdemucs_separate_full(htdemucs_context* ctx, const floa
     }
 
     for (int idx = 0; idx < hp.depth && encoder_ok; idx++) {
+        if (htdemucs_abort_requested(ctx))
+            return nullptr;
         auto& enc = m.encoder[idx];
         bool freq = (freqs_cur > 1);
         int stri = freq ? hp.stride : 2;
@@ -2431,9 +2442,13 @@ static htdemucs_result* htdemucs_separate_full(htdemucs_context* ctx, const floa
             ct_done = htdemucs_transformer_ggml(ctx, x_buf, x_seq, xt_buf, xt_seq, dim, n_heads, hp.t_layers,
                                                 hp.t_classic_parity);
         }
+        if (htdemucs_abort_requested(ctx))
+            return nullptr;
 
         // 5 transformer layers
         for (int li = 0; li < hp.t_layers && !ct_done; li++) {
+            if (htdemucs_abort_requested(ctx))
+                return nullptr;
             auto& layer_s = m.ct_layers[li];   // spec branch layer
             auto& layer_t = m.ct_layers_t[li]; // time branch layer
 
@@ -3037,6 +3052,8 @@ static htdemucs_result* htdemucs_separate_full(htdemucs_context* ctx, const floa
     // encoder index depth-1. The freq dims grow back: 8→32→128→512→2048.
     int dec_strides[] = {4, 4, 4, 4}; // same stride pattern as encoder (all freq layers)
     for (int idx = 0; idx < hp.depth && encoder_ok; idx++) {
+        if (htdemucs_abort_requested(ctx))
+            return nullptr;
         auto& dec = m.decoder[idx];
         if (!dec.conv_tr_w)
             break;
@@ -3552,6 +3569,9 @@ static htdemucs_result* htdemucs_separate_full(htdemucs_context* ctx, const floa
     // Reshape: (B, S, C*2//S, Fq, T) → for each source: (2, Fq, T) complex spec
     // Then iSTFT each source independently.
 
+    if (htdemucs_abort_requested(ctx))
+        return nullptr;
+
     int S = hp.n_sources;       // 4
     int ac = hp.audio_channels; // 2
     int ch_per_source = ac * 2; // 4 (2 audio channels × 2 for CaC real/imag)
@@ -3706,8 +3726,8 @@ static htdemucs_result* htdemucs_separate_full(htdemucs_context* ctx, const floa
 // output is bit-identical to before this change -- there is no regression
 // surface for the case that already worked. CRISPASR_HTDEMUCS_NO_SEGMENT=1
 // forces the old behaviour everywhere for A/B.
-htdemucs_result* htdemucs_separate(htdemucs_context* ctx, const float* pcm_stereo, int n_samples) {
-    if (!ctx || !pcm_stereo || n_samples <= 0)
+static htdemucs_result* htdemucs_separate_impl(htdemucs_context* ctx, const float* pcm_stereo, int n_samples) {
+    if (!ctx || !pcm_stereo || n_samples <= 0 || htdemucs_abort_requested(ctx))
         return nullptr;
 
     const auto& hp = ctx->model.hparams;
@@ -3746,6 +3766,8 @@ htdemucs_result* htdemucs_separate(htdemucs_context* ctx, const float* pcm_stere
     std::vector<float> chunk((size_t)seg_len * 2, 0.0f);
 
     for (int off = 0; off < n_samples; off += stride) {
+        if (htdemucs_abort_requested(ctx))
+            return nullptr;
         // Zero-pad the tail chunk to a full segment, as TensorChunk.padded does.
         const int valid = std::min(seg_len, n_samples - off);
         std::fill(chunk.begin(), chunk.end(), 0.0f);
@@ -3753,6 +3775,12 @@ htdemucs_result* htdemucs_separate(htdemucs_context* ctx, const float* pcm_stere
 
         htdemucs_result* part = htdemucs_separate_full(ctx, chunk.data(), seg_len);
         if (!part) {
+            for (auto& a : acc)
+                a.clear();
+            return nullptr;
+        }
+        if (htdemucs_abort_requested(ctx)) {
+            htdemucs_result_free(part);
             for (auto& a : acc)
                 a.clear();
             return nullptr;
@@ -3796,6 +3824,9 @@ htdemucs_result* htdemucs_separate(htdemucs_context* ctx, const float* pcm_stere
         }
     }
 
+    if (htdemucs_abort_requested(ctx))
+        return nullptr;
+
     auto* r = new htdemucs_result();
     r->n_sources = n_sources;
     r->n_channels = n_ch;
@@ -3812,6 +3843,35 @@ htdemucs_result* htdemucs_separate(htdemucs_context* ctx, const float* pcm_stere
     fprintf(stderr, "htdemucs: segmented %d samples into %d chunks of %d (stride %d)\n", n_samples,
             (n_samples + stride - 1) / stride, seg_len, stride);
     return r;
+}
+
+htdemucs_result* htdemucs_separate_with_abort(
+    htdemucs_context* ctx,
+    const float* pcm_stereo,
+    int n_samples,
+    htdemucs_abort_callback should_abort,
+    void* user_data
+) {
+    if (!ctx)
+        return nullptr;
+
+    struct AbortCallbackRestore {
+        htdemucs_context* ctx;
+        htdemucs_abort_callback callback;
+        void* user_data;
+        ~AbortCallbackRestore() {
+            ctx->abort_callback = callback;
+            ctx->abort_user_data = user_data;
+        }
+    } restore{ctx, ctx->abort_callback, ctx->abort_user_data};
+
+    ctx->abort_callback = should_abort;
+    ctx->abort_user_data = user_data;
+    return htdemucs_separate_impl(ctx, pcm_stereo, n_samples);
+}
+
+htdemucs_result* htdemucs_separate(htdemucs_context* ctx, const float* pcm_stereo, int n_samples) {
+    return htdemucs_separate_with_abort(ctx, pcm_stereo, n_samples, nullptr, nullptr);
 }
 
 void htdemucs_result_free(htdemucs_result* r) {

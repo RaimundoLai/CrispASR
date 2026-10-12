@@ -41,10 +41,19 @@ htdemucs_params htdemucs_default_params(void);
 htdemucs_context* htdemucs_init_from_file(const char* model_path, htdemucs_params params);
 void htdemucs_free(htdemucs_context* ctx);
 
+typedef int (*htdemucs_abort_callback)(void* user_data);
+
 // Separate a stereo audio signal at 44100 Hz.
 // pcm: interleaved stereo float32, n_samples per channel.
-// Returns null on failure. Caller must call htdemucs_result_free().
+// Returns null on failure or cancellation. Caller must call htdemucs_result_free().
 htdemucs_result* htdemucs_separate(htdemucs_context* ctx, const float* pcm_stereo, int n_samples);
+htdemucs_result* htdemucs_separate_with_abort(
+    htdemucs_context* ctx,
+    const float* pcm_stereo,
+    int n_samples,
+    htdemucs_abort_callback should_abort,
+    void* user_data
+);
 void htdemucs_result_free(htdemucs_result* r);
 
 // Get the model's expected sample rate (44100).
