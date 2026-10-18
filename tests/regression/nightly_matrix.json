@@ -6,6 +6,7 @@
   "moonshine-base",
   "moonshine-streaming-tiny",
   "parakeet-tdt-0.6b-en",
+  "phonon2",
   "canary-1b-v2",
   "firered-asr2-aed",
   "glm-asr-nano",
@@ -31,6 +32,7 @@
   "pocket-tts-en",
   "bark-small",
   "csm-1b",
-  "voxcpm2-tts-2b"
+  "voxcpm2-tts-2b",
+  "index-echo-2b"
  ]
 }

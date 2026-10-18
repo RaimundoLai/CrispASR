@@ -22,6 +22,35 @@ All return `0` on a NULL/invalid session. Exposed as `output_sample_rate` /
 `inputChannels()` / `outputChannels()` (Java, C# `OutputSampleRate()` etc.),
 and `sessionOutputSampleRate()` etc. in the WASM/JS binding.
 
+For MioTTS, the output getter reads the loaded codec metadata: public MioCodec-v2
+models return 44100 Hz; missing legacy metadata defaults to 24000 Hz. Use the
+returned rate when saving or playing synthesized PCM. Load a preset embedding
+GGUF with `set_voice` / `SetVoice` / `setVoice`; sampling temperature and seed
+are forwarded to the native runtime. The Python getter is
+`session.output_sample_rate()`, Go uses `OutputSampleRate()`, and Dart exposes
+`outputSampleRate`.
+
+## Streaming implementation query
+
+`crispasr_session_stream_kind(session)` returns 0 for unavailable streaming,
+1 for rolling windows, 2 for persistent model caches and 3 for text-prefix
+streaming (accumulated audio is re-encoded). It describes the loaded model;
+legacy Moonshine ONNX is batch-only even when the backend name is shared.
+
+| Wrapper | Query |
+|---|---|
+| Python / Rust | `session.stream_kind()` |
+| Go / C# | `session.StreamKind()` |
+| Java | `session.streamKind()` |
+| Dart | `session.streamingKind` |
+| Ruby | `CrispASR::Session.stream_kind(handle)` |
+| WASM/JS | `sessionStreamKind()` for the session opened with `ttsOpenExplicit` |
+
+The WebSocket streaming server includes `stream_kind` in its ready event.
+Python and Dart return 0 when an older library lacks the query. Other compiled
+wrappers require the matching native library. The model session must outlive
+its stream; allow only one active stream or inference call per model session.
+
 ## Session setter reference
 
 All generation-control setters are available in every binding. Each
@@ -57,7 +86,7 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_whisper_decode_extras(...)` | `set_whisper_decode_extras` / `set_whisper_decode_extras` / `SetWhisperDecodeExtras` / `setWhisperDecodeExtras` | suppress_nst, suppress_regex, carry_initial_prompt |
 | `set_ask(prompt)` | `set_ask` / `set_ask` / `SetAsk` / `setAsk` | Free-form prompt for instruct-tuned audio-LLM backends (granite, voxtral, qwen3-asr, raon-speech, glm-asr, gemma4-e2b, mimo-asr, higgs-stt, ark-asr, moss-audio, moss-diarize, mini-omni2, lfm2-audio). Empty string clears. |
 | `set_punc_model(alias\|path)` | `set_punc_model` / `set_punc_model` / `SetPuncModel` / `setPuncModel` | Load FireRedPunc/PCS punctuation restoration on the session (`auto`/`firered`/`fullstop`/`punctuate-all`/`pcs`/path; auto-downloads). Restores punctuation on backends that emit none (parakeet RNNT/CTC, …). `"none"`/`""` unloads. (Also Java/Ruby.) |
-| `set_hotwords(words, boost)` | `set_hotwords` / `set_hotwords` / `SetHotwords` / `setHotwords` | Comma-separated contextual-biasing hotwords, boosted per token match (parakeet CTC/TDT trie; LLM-backend prompt injection). Empty string clears. (All six wrappers.) |
+| `set_hotwords(words, boost)` | `set_hotwords` / `set_hotwords` / `SetHotwords` / `setHotwords` | Comma-separated contextual-biasing hotwords, boosted per token match (parakeet CTC/TDT trie; LLM-backend prompt injection; Qwen3 uses the system turn and preserves the language prefill). Empty string clears. (All six wrappers.) |
 | `set_tts_phonemes(ipa)` | `set_tts_phonemes` / `set_tts_phonemes` / `SetTTSPhonemes` / `setTtsPhonemes` | #316: synthesize the given phonemes verbatim, skipping the G2P — the seam between text processing and the acoustic model. Use it to reproduce another implementation's pronunciation, or to tell a G2P bug from a model bug. Empty clears; rc=-2 on a backend with no phonemes-in call (kokoro and piper have one). Server: `"phonemes"` on `/v1/audio/speech`. CLI: `--tts-phonemes`. (All wrappers.) |
 | `set_g2p_dict(source)` | `set_g2p_dict` / `set_g2p_dict` / `SetG2PDict` / `setG2pDict` | Select the G2P pronunciation dictionary for TTS phonemization (`olaph`/`open-dict`/path). (All six wrappers.) |
 
@@ -168,6 +197,24 @@ exposes them as struct/class members on its segment type.
 >    callbacks are idiomatic and safe: C/C++, Rust
 >    (`Session::transcribe_chunked_with_progress`), and Python
 >    (`transcribe_chunked(..., progress=fn)`). The other bindings use the poll.
+
+## Character alignment
+
+With a wav2vec2-family character vocabulary, `align_words` / `alignWords`
+returns measured CTC spans in each word's `characters` (`Characters` in Go/C#).
+Each character retains its original UTF-8 text; repeated letters have separate
+spans. Python, Rust, Dart and C# use seconds; Go, Java and Ruby use
+centiseconds. The alignment offset applies to both word and character times.
+Unsupported codepoints are omitted, and romanized words and other aligner
+families return an empty list. Frame boundaries are model-derived, not
+human-annotated phonetic boundaries. See [CLI semantics](cli.md#character-timestamps-with-wav2vec2-ctc-490).
+
+The C ABI exposes `crispasr_align_result_n_characters`, `character_text`,
+`character_t0` and `character_t1` on the existing opaque alignment result
+(the latter three also have the `crispasr_align_result_` prefix).
+Text pointers remain borrowed until `crispasr_align_result_free`; invalid
+indices return empty text or zero. Python also returns an empty list when
+loaded against an older native library without these symbols.
 
 ## Python
 

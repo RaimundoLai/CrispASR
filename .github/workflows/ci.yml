@@ -33,7 +33,7 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++
+        run: bash tools/ci-apt.sh update && bash tools/ci-apt.sh install -y cmake g++
 
       - name: Configure (GGML_BACKEND_DL, as the CUDA packages are built)
         run: |
@@ -47,6 +47,13 @@ jobs:
       - name: Smoke test - the CPU backend still loads as a module
         run: ./build-dl/bin/crispasr --list-backends
 
+      - name: Packaged C ABI discovers adjacent plugins outside the package directory
+        run: |
+          stage="$RUNNER_TEMP/crispasr-plugin-package-é-模型"
+          mkdir -p "$stage"
+          find build-dl \( -type f -o -type l \) -name '*.so*' -exec cp -L {} "$stage/" \;
+          python3 tests/test_packaged_backend_discovery.py --library "$stage/libcrispasr.so"
+
   # ===========================================================================
   # Linux x86_64 (CPU)
   # ===========================================================================
@@ -58,7 +65,7 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+        run: bash tools/ci-apt.sh update && bash tools/ci-apt.sh install -y cmake g++ libopenblas-dev
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_OPENBLAS=ON -DCRISPASR_BUILD_TESTS=OFF -DGGML_NATIVE=OFF
@@ -123,7 +130,13 @@ jobs:
       # indistinguishable from a pass in the summary — which is how the release
       # packaging went unobserved in the first place.
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++ libopenblas-dev patchelf
+        run: bash tools/ci-apt.sh update && bash tools/ci-apt.sh install -y cmake ninja-build g++ libopenblas-dev patchelf
+
+      - name: Install pinned capability-table formatter
+        run: |
+          python3 -m pip install clang-format==18.1.8
+          ln -s "$(command -v clang-format)" "$RUNNER_TEMP/clang-format-18"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       # Examples/server stay at their defaults: some tests link `common`, which
       # lives under examples/, so switching them off would break configure.
@@ -138,10 +151,25 @@ jobs:
       - name: Build
         run: cmake --build build -j $(nproc)
 
+      # Compare real compiled artifacts; missing CLI/shared library is a failure.
+      - name: Check generated capability table and C ABI
+        run: |
+          python3 tools/gen-backend-caps-table.py --check --crispasr build/bin/crispasr
+          python3 tests/test_backend_caps_abi.py --cli build/bin/crispasr --build-dir build
+
       # -E live: model-dependent tests need weights this job has no business
       # downloading. --timeout: a hung unit test must not eat the runner.
       - name: Run the unit tier
         run: ctest --test-dir build -L unit -E live --output-on-failure --timeout 300
+
+      - name: UTF-8 loop cleanup under platform ctype classification
+        run: python3 tests/test_ngram_locale.py -v
+
+      - name: Breeze session sampler controls
+        run: python3 tests/test_breeze_session_controls.py -v
+
+      - name: Session result UTF-8 contract (native functions and strict Python decode)
+        run: python3 tests/test_session_utf8.py -v
 
   # ===========================================================================
   # The -DCRISPASR_AMR_FETCH=ON path compiles opencore-amr from source (for
@@ -178,7 +206,7 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ clang libopenblas-dev
+        run: bash tools/ci-apt.sh update && bash tools/ci-apt.sh install -y cmake g++ clang libopenblas-dev
 
       - name: Configure (AMR FetchContent static) + assert gate enabled
         run: |
@@ -217,7 +245,7 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+        run: bash tools/ci-apt.sh update && bash tools/ci-apt.sh install -y cmake g++ libopenblas-dev
 
       - name: Configure (Opus FetchContent static) + assert gate enabled
         run: |
@@ -255,7 +283,7 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev libopusfile-dev
+        run: bash tools/ci-apt.sh update && bash tools/ci-apt.sh install -y cmake g++ libopenblas-dev libopusfile-dev
 
       - name: Configure (ASan + UBSan)
         run: >
@@ -291,7 +319,7 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libopenblas-dev libopusfile-dev
+        run: bash tools/ci-apt.sh update && bash tools/ci-apt.sh install -y cmake clang libopenblas-dev libopusfile-dev
 
       - name: Configure (fuzzer + ASan/UBSan, clang)
         env:
@@ -374,10 +402,10 @@ jobs:
           # ubuntu-latest (24.04) ships libvulkan-dev but not glslc;
           # the glslc binary is in the `glslc` or `shaderc` package
           # depending on the distro version.
-          sudo apt-get update
-          sudo apt-get install -y cmake g++ libvulkan-dev spirv-headers glslc || \
-          sudo apt-get install -y cmake g++ libvulkan-dev spirv-headers glslang-tools || \
-          sudo apt-get install -y cmake g++ libvulkan-dev spirv-headers shaderc
+          bash tools/ci-apt.sh update
+          bash tools/ci-apt.sh install -y cmake g++ libvulkan-dev spirv-headers glslc || \
+          bash tools/ci-apt.sh install -y cmake g++ libvulkan-dev spirv-headers glslang-tools || \
+          bash tools/ci-apt.sh install -y cmake g++ libvulkan-dev spirv-headers shaderc
 
       - name: Configure with Vulkan
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DCRISPASR_BUILD_TESTS=OFF
@@ -416,6 +444,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+
+      - name: Vulkan SDK download retry checks
+        run: python tools/test_vulkan_sdk_download.py
 
       # CRISPASR_BUILD_TESTS stays ON here (unlike the other smoke-only
       # platform jobs) so the speaker-db unit tests below actually run.

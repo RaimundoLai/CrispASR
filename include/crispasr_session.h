@@ -337,6 +337,13 @@ CRISPASR_SESSION_API int crispasr_align_result_n_words(crispasr_align_result* r)
 CRISPASR_SESSION_API const char* crispasr_align_result_word_text(crispasr_align_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_align_result_word_t0(crispasr_align_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_align_result_word_t1(crispasr_align_result* r, int i);
+// Measured original-codepoint spans for wav2vec2-family CTC alignment.
+// Count is zero for unsupported/romanized words and other aligner families.
+// Times are absolute centiseconds; invalid indices return empty text / zero.
+CRISPASR_SESSION_API int crispasr_align_result_n_characters(crispasr_align_result* r, int word);
+CRISPASR_SESSION_API const char* crispasr_align_result_character_text(crispasr_align_result* r, int word, int i);
+CRISPASR_SESSION_API int64_t crispasr_align_result_character_t0(crispasr_align_result* r, int word, int i);
+CRISPASR_SESSION_API int64_t crispasr_align_result_character_t1(crispasr_align_result* r, int word, int i);
 CRISPASR_SESSION_API void crispasr_align_result_free(crispasr_align_result* r);
 CRISPASR_SESSION_API int crispasr_cache_ensure_file_abi(const char* filename, const char* url, int32_t quiet,
                                                         const char* cache_dir_override, char* out_buf, int32_t out_cap);
@@ -381,6 +388,8 @@ CRISPASR_SESSION_API int crispasr_registry_default_bundle_artifact_abi(const cha
                                                                        int32_t url_cap, char* out_size,
                                                                        int32_t size_cap);
 CRISPASR_SESSION_API int crispasr_session_result_n_segments(crispasr_session_result* r);
+// Result text is valid UTF-8. Malformed decoded bytes are replaced with U+FFFD
+// after token assembly; valid text, word counts, timings and confidence survive.
 CRISPASR_SESSION_API const char* crispasr_session_result_segment_text(crispasr_session_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_session_result_segment_t0(crispasr_session_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_session_result_segment_t1(crispasr_session_result* r, int i);
@@ -701,6 +710,10 @@ CRISPASR_SESSION_API const char* crispasr_session_last_synth_error(crispasr_sess
 CRISPASR_SESSION_API char* crispasr_session_translate_text(crispasr_session* s, const char* text, const char* src_lang,
                                                            const char* tgt_lang, int max_tokens);
 CRISPASR_SESSION_API void crispasr_session_translate_text_free(char* text);
+// Streaming implementation: 0 unavailable, 1 rolling windows, 2 persistent
+// model caches, 3 text-prefix streaming. Model session must outlive its stream;
+// only one active stream/inference call per model session is supported.
+CRISPASR_SESSION_API int crispasr_session_stream_kind(crispasr_session* s);
 CRISPASR_SESSION_API crispasr_stream* crispasr_session_stream_open(crispasr_session* s, int n_threads, int step_ms,
                                                                    int length_ms, int keep_ms, const char* language,
                                                                    int translate);

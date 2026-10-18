@@ -149,6 +149,10 @@ int          crispasr_align_result_n_words(crispasr_align_result* r);
 const char*  crispasr_align_result_word_text(crispasr_align_result* r, int i);
 long long    crispasr_align_result_word_t0(crispasr_align_result* r, int i);
 long long    crispasr_align_result_word_t1(crispasr_align_result* r, int i);
+int crispasr_align_result_n_characters(crispasr_align_result* r, int word);
+const char* crispasr_align_result_character_text(crispasr_align_result* r, int word, int i);
+long long crispasr_align_result_character_t0(crispasr_align_result* r, int word, int i);
+long long crispasr_align_result_character_t1(crispasr_align_result* r, int word, int i);
 void         crispasr_align_result_free(crispasr_align_result* r);
 
 // --- Watermark ---
@@ -232,6 +236,7 @@ int crispasr_cache_dir_abi(const char* cache_dir_override, char* out_buf, int ou
 
 // --- Streaming (PLAN #62) ---
 typedef struct CrispasrStream CrispasrStream;
+int crispasr_session_stream_kind(CrispasrSession* s);
 CrispasrStream* crispasr_session_stream_open(CrispasrSession* s, int n_threads, int step_ms,
                                              int length_ms, int keep_ms, const char* language, int translate);
 CrispasrStream* crispasr_stream_open(void* ctx, int n_threads, int step_ms,
@@ -387,7 +392,8 @@ type CrispasrSession struct {
 }
 
 // SessionOpen opens a backend session for the given model file.
-// Detects the backend automatically from the GGUF metadata.
+// Detects the backend automatically from the GGUF metadata. Phonon-2 uses
+// the Parakeet runtime (English-only); renamed GGUF files work unchanged.
 // Returns an error if the model can't be loaded.
 func SessionOpen(modelPath string, nThreads int) (*CrispasrSession, error) {
 	cpath := C.CString(modelPath)
@@ -436,7 +442,9 @@ func (s *CrispasrSession) SetSourceLanguage(lang string) error {
 
 // SetTargetLanguage sets the sticky target-language. When ≠ source on
 // canary/cohere, the backend emits a translation. For whisper, pair with
-// SetTranslate(true).
+// SetTranslate(true). Index-Echo takes en/ja/es and returns bilingual subtitle
+// segments. Open its tower GGUF with the matching decoder beside it; a sibling
+// Silero v6.2 companion enables the released full-file window recipe.
 func (s *CrispasrSession) SetTargetLanguage(lang string) error {
 	cl := C.CString(lang)
 	defer C.free(unsafe.Pointer(cl))
@@ -873,6 +881,12 @@ type StreamingUpdate struct {
 	Counter int64
 }
 
+// StreamKind returns 0 for unavailable streaming, 1 for rolling windows,
+// 2 for persistent model caches, or 3 for text-prefix streaming.
+func (s *CrispasrSession) StreamKind() int {
+	return int(C.crispasr_session_stream_kind(s.handle))
+}
+
 // StreamOpen opens a rolling-window streaming decoder for this session.
 // Currently whisper-only at the C-ABI level. stepMs (default 3000) is
 // how often to commit a partial transcript; lengthMs (default 10000) is
@@ -886,7 +900,7 @@ func (s *CrispasrSession) StreamOpen(stepMs, lengthMs, keepMs int, language stri
 	}
 	h := C.crispasr_session_stream_open(s.handle, C.int(4), C.int(stepMs), C.int(lengthMs), C.int(keepMs), clang, tr)
 	if h == nil {
-		return nil, errors.New("crispasr_session_stream_open failed (whisper-only today)")
+		return nil, errors.New("crispasr_session_stream_open failed")
 	}
 	return &Stream{handle: h}, nil
 }
@@ -974,6 +988,7 @@ func (s *CrispasrSession) SetCodecPath(path string) error {
 // `refText` is required for qwen3-tts when `path` is a WAV; pass an empty
 // string otherwise.
 //
+// For MioTTS pass a preset embedding GGUF; save PCM at OutputSampleRate().
 // For orpheus voice selection is BY NAME — use SetSpeakerName instead.
 func (s *CrispasrSession) SetVoice(path, refText string) error {
 	cpath := C.CString(path)
@@ -1106,7 +1121,7 @@ func (s *CrispasrSession) Speakers() []string {
 	return out
 }
 
-// Synthesize converts `text` to 24 kHz mono PCM. Requires a TTS-capable
+// Synthesize converts `text` to mono PCM at OutputSampleRate(). Requires a TTS-capable
 // backend (kokoro / vibevoice / qwen3-tts / orpheus / tada).
 func (s *CrispasrSession) Synthesize(text string) ([]float32, error) {
 	ctext := C.CString(text)
@@ -1167,7 +1182,7 @@ func (s *CrispasrSession) AcceptMarkingResponsibility(attestation string) error 
 	return nil
 }
 
-// SynthesizeRaw converts `text` to UNMARKED 24 kHz mono PCM (no watermark), for
+// SynthesizeRaw converts `text` to UNMARKED mono PCM at OutputSampleRate(), for
 // callers that must post-process (speed/mix/concat) before embedding the mark
 // themselves. It is hard-refused unless AcceptMarkingResponsibility was called
 // first. Most callers should use Synthesize, which watermarks by default.
@@ -1526,11 +1541,19 @@ func (s *CrispasrSession) CtcVocab() []string {
 // Forced alignment — word-level timestamps from transcript + audio
 // ---------------------------------------------------------------------------
 
+// AlignedCharacter holds a measured original codepoint; times are centiseconds.
+type AlignedCharacter struct {
+	Text string
+	T0   int64
+	T1   int64
+}
+
 // AlignedWord holds one word from forced alignment.
 type AlignedWord struct {
-	Text string
-	T0   int64 // centiseconds
-	T1   int64
+	Characters []AlignedCharacter
+	Text       string
+	T0         int64 // centiseconds
+	T1         int64
 }
 
 // AlignWords runs CTC forced alignment on a transcript + audio pair.
@@ -1556,6 +1579,15 @@ func AlignWords(alignerModel, transcript string, pcm []float32, tOffsetCs int64,
 			Text: C.GoString(C.crispasr_align_result_word_text(r, C.int(i))),
 			T0:   int64(C.crispasr_align_result_word_t0(r, C.int(i))),
 			T1:   int64(C.crispasr_align_result_word_t1(r, C.int(i))),
+		}
+		nc := int(C.crispasr_align_result_n_characters(r, C.int(i)))
+		words[i].Characters = make([]AlignedCharacter, nc)
+		for j := 0; j < nc; j++ {
+			words[i].Characters[j] = AlignedCharacter{
+				Text: C.GoString(C.crispasr_align_result_character_text(r, C.int(i), C.int(j))),
+				T0:   int64(C.crispasr_align_result_character_t0(r, C.int(i), C.int(j))),
+				T1:   int64(C.crispasr_align_result_character_t1(r, C.int(i), C.int(j))),
+			}
 		}
 	}
 	return words, nil

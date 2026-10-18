@@ -2,6 +2,79 @@
 
 ## Unreleased
 
+## 0.8.43
+
+* **Transcript correctness:** preserve UTF-8 continuation bytes during cleanup
+  and sanitize malformed result bytes before native callbacks/getters publish
+  them, retaining strict binding decoding.
+* **Session audio/control fixes:** VoxCPM2 synthesis reports its native 48 kHz
+  rate; Breeze sessions forward temperature, 64-bit seed and token limits,
+  including restoration of the model limit when cleared.
+* **Native discovery:** canonical capabilities include Hikari and German
+  Dattazigzag Moonshine; ggml plugins are found beside the loaded native library.
+* **Native inference:** Nemotron frontend padding/length masks match reference
+  behavior; HTDemucs Q8 attention avoids unsupported Metal contiguous copies.
+* **Distribution:** packages use immutable source pins and checked CUDA runtime
+  pairing. Experimental quantizations and pending Breeze instruction/voice-cache
+  features are excluded. The Dart API is unchanged.
+
+## 0.8.42
+
+* **Persistent streaming:** `streamKind` exposes unavailable, rolling-window,
+  persistent-cache and text-prefix implementations. Nemotron, Qwen3-ASR and
+  Voxtral use their native streaming paths through the session API.
+* **German Moonshine:** native and ONNX deployments, model detection and
+  streaming/session support.
+* **Live translation:** Marian translation models and direction selection;
+  Hikari simultaneous English ASR and speech translation to German, Japanese
+  and Russian.
+* **Native fixes:** Arabic word/character alignment, Qwen3 hotword prompt
+  forwarding, MiMo device/verbosity settings, and MioTTS output/voice handling.
+* **Distribution:** ggml Metal fixes, synchronized bindings/capabilities and
+  improved Windows CUDA diagnostics. Experimental PR #492 precision changes
+  remain excluded; production model/precision defaults are unchanged.
+
+## 0.8.41
+
+* **Native Index-Echo:** validated 9B F16 translation with a matching decoder,
+  metadata detection through the existing session API, and protected 2B Q8
+  regression checks. The accepted 9B pair requires approximately 17.9 GiB of
+  model storage; experimental 9B quantizations remain unpublished.
+* **Native inference:** CPU thread requests are honored by Nemotron, Paraformer
+  and Dia; Dia fixes enable complete dialogue synthesis without the hidden
+  CPU generation cap. Nemotron realtime CPU inference uses aligned windows.
+* **Windows distribution:** matching CUDA 12.6 CLI, library and runtime assets
+  alongside CUDA 12.8/13, with runtime hash checks and an explicit AVX2 library
+  CPU floor. Native A100/H100 target coverage is restored.
+* The Dart API is unchanged.
+
+## 0.8.40
+
+* **Native ASR:** Phonon-2 English recognition through the shared Parakeet
+  engine, with model metadata detection and registry selection. Q8_0 is the
+  recommended export; native CPU decoder optimizations retain fallback gates.
+* **AudioSeal:** graph and scheduler capacity scale with audio length, fixing
+  embedding/detection aborts on clips longer than approximately two seconds.
+* **VoxCPM2:** batched RALM prefill defaults on for native AVX2/F16C CPU F16/Q8
+  models. Q4 remains opt-in after failing strict state/speech parity checks.
+* **Native distribution:** the standard Intel macOS CLI restores AVX2/FMA/F16C
+  kernels with Accelerate; a separate CPU-legacy archive keeps the SSE2 floor.
+  Both Intel archive variants require and bundle the matching C2PA sidecar.
+
+## 0.8.39
+
+* **VoxCPM2 synthesis:** the bundled native library processes the TSLM prompt
+  once in a batched graph, honors the requested thread count in eager matmuls,
+  reduces VAE weight setup, and enables faster depthwise VAE convolutions on
+  Vulkan. Serial and legacy prefill fallbacks remain available.
+* **Native distribution:** separate Intel and Apple Silicon macOS CLI archives;
+  the Intel archive uses CPU/Accelerate. The existing macOS filename remains
+  an arm64 alias. Fixed the macOS quantizer's bundled C2PA search path.
+* **Quantizer:** tensor-type overrides preserve scalar/one-dimensional tensor
+  precision, avoiding F16 bias/norm crashes during CPU synthesis.
+* **Maintenance:** credential scanning, branch-scoped heavy verification, and
+  CPU reference/roundtrip workflows. The Dart API is unchanged.
+
 ## 0.8.38
 
 * **`DiarizeMethod.sortformer`** (C ABI method 5, #466) with a

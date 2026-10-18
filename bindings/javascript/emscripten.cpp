@@ -12,6 +12,9 @@
 #include <emscripten.h>
 #include <emscripten/bind.h>
 
+#include <atomic>
+#include <functional>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -28,7 +31,7 @@
 #include <pthread.h>
 static emscripten::ProxyingQueue g_proxy_queue;
 static pthread_t g_compute_thread; // pthread-0 under PROXY_TO_PTHREAD
-static bool g_compute_thread_set = false;
+static std::atomic<bool> g_compute_thread_set{false};
 #endif
 
 // The unified Session C-ABI is declared in crispasr.h (included above)
@@ -92,6 +95,10 @@ const char* crispasr_session_token_text(CrispasrSession* s, int id);
 int crispasr_session_pitch(CrispasrSession* s, const float* pcm_16k, int n_samples, float hop_ms);
 const float* crispasr_session_pitch_frames(CrispasrSession* s, int* out_n_frames);
 int crispasr_session_pitch_sample_rate(CrispasrSession* s);
+int crispasr_session_piano(CrispasrSession* s, const float* pcm_16k, int n_samples);
+const float* crispasr_session_piano_notes(CrispasrSession* s, int* out_n_notes);
+const int* crispasr_session_piano_note_programs(CrispasrSession* s, int* out_n_notes);
+int crispasr_session_piano_sample_rate(CrispasrSession* s);
 
 // Chord recognition — BTC. `chords` runs the timeline and returns the span
 // count; `chords_spans` hands back a session-owned flat array of 4 floats per
@@ -184,6 +191,7 @@ char* crispasr_session_translate_text(CrispasrSession* s, const char* text, cons
 void crispasr_session_translate_text_free(char* text);
 
 // Streaming
+int crispasr_session_stream_kind(CrispasrSession* s);
 struct CrispasrStream;
 struct CrispasrStream* crispasr_session_stream_open(CrispasrSession* s, int n_threads, int step_ms, int length_ms,
                                                     int keep_ms, const char* language, int translate);
@@ -335,7 +343,113 @@ int main() {
 }
 #endif
 
+#ifdef __EMSCRIPTEN_PTHREADS__
+// JS values stay on their creating servicer thread. Only native inputs/results
+// cross the compute queue, leaving the servicer available for pthread startup.
+template <typename T>
+static void browser_dispatch(std::function<T()> work, std::function<emscripten::val(T&)> encode,
+                             emscripten::val callback) {
+    if (!g_compute_thread_set.load() || g_compute_thread == pthread_self()) {
+        emscripten::val error = emscripten::val::object();
+        error.set("error", std::string("Proxied compute thread is not ready"));
+        callback(error);
+        return;
+    }
+    auto* cb = new emscripten::val(callback);
+    const pthread_t servicer = pthread_self();
+    if (!g_proxy_queue.proxyAsync(g_compute_thread, [work, encode, cb, servicer]() {
+            auto* result = new T(work());
+            g_proxy_queue.proxyAsync(servicer, [result, encode, cb]() {
+                emscripten::val output = encode(*result);
+                delete result;
+                (*cb)(output);
+                delete cb;
+            });
+        })) {
+        emscripten::val error = emscripten::val::object();
+        error.set("error", std::string("Could not dispatch browser compute"));
+        (*cb)(error);
+        delete cb;
+    }
+}
+struct browser_asr_segment {
+    double t0, t1;
+    std::string text;
+};
+#endif
+
 EMSCRIPTEN_BINDINGS(whisper) {
+#ifdef __EMSCRIPTEN_PTHREADS__
+    emscripten::function("browserComputeReady", emscripten::optional_override([]() {
+                             return g_compute_thread_set.load() && g_compute_thread != pthread_self();
+                         }));
+    emscripten::function(
+        "asrOpenAsync", emscripten::optional_override([](const std::string& path, const std::string& backend,
+                                                         int threads, emscripten::val cb) {
+            browser_dispatch<bool>(
+                [path, backend, threads]() {
+                    if (g_asr_session)
+                        crispasr_session_close(g_asr_session);
+                    g_asr_session = backend.empty()
+                                        ? crispasr_session_open(path.c_str(), threads)
+                                        : crispasr_session_open_explicit(path.c_str(), backend.c_str(), threads);
+                    return g_asr_session != nullptr;
+                },
+                [](bool& value) { return emscripten::val(value); }, cb);
+        }));
+    emscripten::function(
+        "ttsOpenExplicitAsync", emscripten::optional_override([](const std::string& path, const std::string& backend,
+                                                                 int threads, emscripten::val cb) {
+            browser_dispatch<bool>(
+                [path, backend, threads]() {
+                    if (g_tts_session)
+                        crispasr_session_close(g_tts_session);
+                    g_tts_session = crispasr_session_open_explicit(path.c_str(), backend.c_str(), threads);
+                    return g_tts_session != nullptr;
+                },
+                [](bool& value) { return emscripten::val(value); }, cb);
+        }));
+    emscripten::function(
+        "asrTranscribeAsync",
+        emscripten::optional_override([](const emscripten::val& audio, const std::string& lang, emscripten::val cb) {
+            const int n = audio["length"].as<int>();
+            auto pcm = std::make_shared<std::vector<float>>(n);
+            emscripten::val heap = emscripten::val::module_property("HEAPU8");
+            emscripten::val view = emscripten::val::global("Float32Array")
+                                       .new_(heap["buffer"], reinterpret_cast<uintptr_t>(pcm->data()), n);
+            view.call<void>("set", audio);
+            browser_dispatch<std::vector<browser_asr_segment>>(
+                [pcm, lang]() {
+                    std::vector<browser_asr_segment> segments;
+                    crispasr_session_result* result =
+                        g_asr_session ? crispasr_session_transcribe_lang(g_asr_session, pcm->data(), (int)pcm->size(),
+                                                                         lang.empty() ? nullptr : lang.c_str())
+                                      : nullptr;
+                    if (result) {
+                        for (int i = 0; i < crispasr_session_result_n_segments(result); ++i) {
+                            const char* text = crispasr_session_result_segment_text(result, i);
+                            segments.push_back({(double)crispasr_session_result_segment_t0(result, i),
+                                                (double)crispasr_session_result_segment_t1(result, i),
+                                                text ? text : ""});
+                        }
+                        crispasr_session_result_free(result);
+                    }
+                    return segments;
+                },
+                [](std::vector<browser_asr_segment>& segments) {
+                    emscripten::val out = emscripten::val::array();
+                    for (const auto& segment : segments) {
+                        emscripten::val value = emscripten::val::object();
+                        value.set("t0", segment.t0);
+                        value.set("t1", segment.t1);
+                        value.set("text", segment.text);
+                        out.call<void>("push", value);
+                    }
+                    return out;
+                },
+                cb);
+        }));
+#endif
     emscripten::function("init", emscripten::optional_override([](const std::string& path_model) {
                              if (g_context == nullptr) {
                                  g_context = whisper_init_from_file_with_params(path_model.c_str(),
@@ -686,20 +800,10 @@ EMSCRIPTEN_BINDINGS(whisper) {
         "ttsSynthesizeAsync", emscripten::optional_override([](const std::string& text, emscripten::val cb) {
             auto* text_copy = new std::string(text);
             auto* cbp = new emscripten::val(cb);
-            if (!g_compute_thread_set) {
-                // No proxied runtime thread (shouldn't happen once
-                // the factory has resolved) — run inline as fallback.
-                int n = 0;
-                float* pcm =
-                    g_tts_session ? crispasr_session_synthesize(g_tts_session, text_copy->c_str(), &n) : nullptr;
-                emscripten::val out = emscripten::val::array();
-                if (pcm && n > 0) {
-                    out = emscripten::val::global("Float32Array").new_(n);
-                    out.call<void>("set", emscripten::val(emscripten::typed_memory_view(n, pcm)));
-                }
-                if (pcm)
-                    crispasr_pcm_free(pcm);
-                (*cbp)(out);
+            if (!g_compute_thread_set.load() || g_compute_thread == pthread_self()) {
+                emscripten::val error = emscripten::val::object();
+                error.set("error", "Threaded browser compute is not ready; use PROXY_TO_PTHREAD");
+                (*cbp)(error);
                 delete text_copy;
                 delete cbp;
                 return;
@@ -1200,10 +1304,65 @@ EMSCRIPTEN_BINDINGS(whisper) {
             return out;
         }));
 
+    // Streaming mode of the active backend session (0 when none is loaded).
+    emscripten::function("sessionStreamKind", emscripten::optional_override([]() {
+                             return g_tts_session ? crispasr_session_stream_kind(g_tts_session) : 0;
+                         }));
+
     // Native input rate the loaded pitch model expects (16000 for CREPE), or
     // 0 when the session has no pitch arm — doubles as a capability probe.
     emscripten::function("sessionPitchSampleRate", emscripten::optional_override([]() {
                              return g_tts_session ? crispasr_session_pitch_sample_rate(g_tts_session) : 0;
+                         }));
+
+    // --- Note transcription — basic-pitch, piano-transcription, mt3,
+    // onsets-and-frames, hft-transformer ---
+    // Open the model with ttsOpenExplicit(path, "<backend>", nThreads), the
+    // same way sessionPitch does.
+    //
+    // `audio` is a mono Float32Array at sessionPianoSampleRate() — 22050 for
+    // basic-pitch, 16000 for the other four; ask rather than assume. Returns
+    // [{onMs, offMs, midi, velocity, program}, ...], the fields of the Dart
+    // `PianoNote` record, or [] on failure. `program` is the General MIDI
+    // program MT3 identified, or -1 when the model names no instrument.
+    emscripten::function(
+        "sessionPianoNotes", emscripten::optional_override([](const emscripten::val& audio) -> emscripten::val {
+            emscripten::val out = emscripten::val::array();
+            if (!g_tts_session)
+                return out;
+            const int n = audio["length"].as<int>();
+            if (n <= 0)
+                return out;
+            std::vector<float> pcmf32(n);
+            emscripten::val heap = emscripten::val::module_property("HEAPU8");
+            emscripten::val memory = heap["buffer"];
+            emscripten::val view = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcmf32.data()), n);
+            view.call<void>("set", audio);
+
+            if (crispasr_session_piano(g_tts_session, pcmf32.data(), n) < 0)
+                return out;
+            int n_notes = 0;
+            const float* notes = crispasr_session_piano_notes(g_tts_session, &n_notes);
+            if (!notes || n_notes <= 0)
+                return out;
+            int n_programs = 0;
+            const int* programs = crispasr_session_piano_note_programs(g_tts_session, &n_programs);
+            for (int i = 0; i < n_notes; i++) {
+                emscripten::val e = emscripten::val::object();
+                e.set("onMs", (double)notes[i * 4 + 0]);
+                e.set("offMs", (double)notes[i * 4 + 1]);
+                e.set("midi", (int)notes[i * 4 + 2]);
+                e.set("velocity", (int)notes[i * 4 + 3]);
+                e.set("program", (programs && i < n_programs) ? programs[i] : -1);
+                out.call<void>("push", e);
+            }
+            return out;
+        }));
+
+    // Native input rate of the loaded note model, or 0 when the session has
+    // no note arm — a capability probe, mirroring sessionPitchSampleRate.
+    emscripten::function("sessionPianoSampleRate", emscripten::optional_override([]() {
+                             return g_tts_session ? crispasr_session_piano_sample_rate(g_tts_session) : 0;
                          }));
 
     // --- Chord recognition (BTC) ---

@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -178,6 +180,38 @@ class ManifestSchemaTests(unittest.TestCase):
                     f"{entry['name']}: in-repo sample {sample} not "
                     f"present; either drop the field or check the WAV in",
                 )
+
+
+class MandatoryDiffGateTests(unittest.TestCase):
+    def test_index_echo_rejects_scale_failure_despite_perfect_cosine(self):
+        # Cosine divides magnitude out: a uniformly wrong scale can emit only
+        # PASS rows while the separate relative-L2 check makes the process fail.
+        proc = SimpleNamespace(returncode=1, stderr='', stdout=
+            '[PASS] mel_spectrogram shape=[128,100] cos_min=1.000000 cos_mean=1.000000\n'
+            '       relative_l2=151.00000000\n')
+        paths = [Path('unused')] * 4
+        with mock.patch.object(run_one.subprocess, 'run', return_value=proc):
+            with self.assertRaises(SystemExit):
+                run_one.run_diff(paths[0], 'index-echo', *paths[1:])
+            # Other backends keep their manifest-controlled cosine policy.
+            self.assertEqual(run_one.run_diff(paths[0], 'parakeet', *paths[1:]),
+                             {'mel_spectrogram': 1.0})
+
+
+class BilingualTranscriptTests(unittest.TestCase):
+    def test_srt_checks_all_cues_and_both_languages(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            model = Path(temp) / "model.gguf"
+            def emit(command, **kwargs):
+                prefix = Path(command[command.index("-of") + 1])
+                prefix.with_suffix(".srt").write_text(
+                    "1\n00:00:00,430 --> 00:00:04,570\n原文一。\nTranslation one.\n\n"
+                    "2\n00:00:05,230 --> 00:00:07,470\n原文二。\nTranslation two.\n")
+                return SimpleNamespace(stdout="Translation two.", stderr="", returncode=0)
+            with mock.patch.object(run_one.subprocess, "run", side_effect=emit):
+                text = run_one.run_transcript(Path("cli"), model, Path("audio"), srt=True)
+            self.assertEqual(text, "原文一。 Translation one. 原文二。 Translation two.")
 
 
 class DiffParserTests(unittest.TestCase):

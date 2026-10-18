@@ -370,7 +370,7 @@ namespace CrispASR
         // ----------------------------------------------------------------
 
         /// <summary>
-        /// Synthesize text to 24 kHz mono float32 PCM.
+        /// Synthesize text to mono float32 PCM at OutputSampleRate().
         /// Requires a TTS-capable backend (kokoro, vibevoice, qwen3-tts, orpheus, chatterbox).
         /// </summary>
         public float[] Synthesize(string text)
@@ -755,15 +755,19 @@ namespace CrispASR
         // ----------------------------------------------------------------
 
         /// <summary>
-        /// Open a rolling-window streaming decoder. Whisper-only at the C-ABI level today.
+        /// Streaming mode: 0 unavailable, 1 rolling windows, 2 persistent
+        /// model caches, 3 text-prefix streaming.
         /// </summary>
+        public int StreamKind() => NativeMethods.crispasr_session_stream_kind(Handle);
+
+        /// <summary>Open a streaming decoder for this session's backend.</summary>
         public StreamDecoder StreamOpen(int stepMs = 3000, int lengthMs = 10000, int keepMs = 200,
                                         string? language = null, bool translate = false, int nThreads = 4)
         {
             var p = NativeMethods.crispasr_session_stream_open(
                 Handle, nThreads, stepMs, lengthMs, keepMs, language ?? "", translate ? 1 : 0);
             if (p == IntPtr.Zero)
-                throw new InvalidOperationException("stream_open failed (whisper-only today)");
+                throw new InvalidOperationException("stream_open failed");
             return new StreamDecoder(p);
         }
 
@@ -784,10 +788,17 @@ namespace CrispASR
                 var words = new AlignedWord[n];
                 for (int i = 0; i < n; i++)
                 {
+                    int nc = NativeMethods.crispasr_align_result_n_characters(r, i);
+                    var characters = new AlignedCharacter[nc];
+                    for (int j = 0; j < nc; j++)
+                        characters[j] = new AlignedCharacter(
+                            NativeMethods.PtrToUtf8(NativeMethods.crispasr_align_result_character_text(r, i, j)) ?? "",
+                            Seconds(NativeMethods.crispasr_align_result_character_t0(r, i, j)),
+                            Seconds(NativeMethods.crispasr_align_result_character_t1(r, i, j)));
                     words[i] = new AlignedWord(
                         NativeMethods.PtrToUtf8(NativeMethods.crispasr_align_result_word_text(r, i)) ?? "",
                         Seconds(NativeMethods.crispasr_align_result_word_t0(r, i)),
-                        Seconds(NativeMethods.crispasr_align_result_word_t1(r, i)));
+                        Seconds(NativeMethods.crispasr_align_result_word_t1(r, i)), characters);
                 }
                 return words;
             }
@@ -991,6 +1002,15 @@ namespace CrispASR
         }
     }
 
+    /// <summary>A measured original codepoint; times are seconds.</summary>
+    public readonly struct AlignedCharacter
+    {
+        public string Text { get; }
+        public double T0 { get; }
+        public double T1 { get; }
+        public AlignedCharacter(string text, double t0, double t1) { Text = text; T0 = t0; T1 = t1; }
+    }
+
     /// <summary>One aligned word from forced alignment.</summary>
     public readonly struct AlignedWord
     {
@@ -1000,7 +1020,9 @@ namespace CrispASR
         /// <summary>Word end, in SECONDS.</summary>
         public double T1 { get; }
 
-        public AlignedWord(string text, double t0, double t1) { Text = text; T0 = t0; T1 = t1; }
+        public AlignedCharacter[] Characters { get; }
+        public AlignedWord(string text, double t0, double t1, AlignedCharacter[]? characters = null)
+        { Text = text; T0 = t0; T1 = t1; Characters = characters ?? Array.Empty<AlignedCharacter>(); }
     }
 
     /// <summary>One speech span from VAD (seconds).</summary>

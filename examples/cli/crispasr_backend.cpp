@@ -2,6 +2,9 @@
 
 #include "crispasr_backend.h"
 #include "whisper_params.h"
+#ifdef CRISPASR_HAS_ONNX
+#include "moonshine_onnx.h"
+#endif
 #include "core/arch_backend_map.h" // #335: general.architecture → backend table, SHARED with the C ABI
 
 // Forward declarations of per-backend constructors. Each is implemented in
@@ -13,8 +16,10 @@ std::unique_ptr<CrispasrBackend> crispasr_make_gigaam_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dolphin_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_xasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parakeet_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_phonon2_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_canary_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_canary_qwen_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_index_echo_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_lfm2_audio_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mini_omni2_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_cohere_backend();
@@ -39,6 +44,8 @@ std::unique_ptr<CrispasrBackend> crispasr_make_chatterbox_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_tada_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_indextts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_m2m100_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_hikari_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_marian_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_t5_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_kokoro_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_glm_asr_backend();
@@ -47,6 +54,9 @@ std::unique_ptr<CrispasrBackend> crispasr_make_firered_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend_lang(const char* sole_lang);
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
+#ifdef CRISPASR_HAS_ONNX
+std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_onnx_backend();
+#endif
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
@@ -132,10 +142,14 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
         return crispasr_make_nemotron_backend();
+    if (name == "phonon2")
+        return crispasr_make_phonon2_backend();
     if (name == "parakeet" || name == "reazonspeech" || name == "quds" || name == "quds-fa")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
+    if (name == "index-echo")
+        return crispasr_make_index_echo_backend();
     if (name == "canary-qwen" || name == "canary_qwen" || name == "canary-qwen-2.5b")
         return crispasr_make_canary_qwen_backend();
     if (name == "lfm2-audio")
@@ -263,6 +277,10 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "m2m100" || name == "m2m-100" || name == "translate" || name == "m2m100-wmt21" || name == "wmt21" ||
         name == "m2m100-1.2b")
         return crispasr_make_m2m100_backend();
+    if (name == "hikari" || name == "hikari-medium")
+        return crispasr_make_hikari_backend();
+    if (name == "marian" || name == "marianmt" || name == "marian-mt" || name == "opus-mt" || name == "opusmt")
+        return crispasr_make_marian_backend();
     if (name == "madlad" || name == "madlad400" || name == "madlad-400" || name == "t5" || name == "t5-translate")
         return crispasr_make_t5_backend();
     if (name == "glm-asr" || name == "glmasr" || name == "glm" || name == "glm_asr")
@@ -286,6 +304,10 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_kyutai_stt_backend();
     if (name == "firered-asr" || name == "firered")
         return crispasr_make_firered_asr_backend();
+#ifdef CRISPASR_HAS_ONNX
+    if (name == "moonshine-onnx" || (name.find("moonshine-") == 0 && name.find("-onnx") != std::string::npos))
+        return crispasr_make_moonshine_onnx_backend();
+#endif
     if (name == "moonshine-streaming")
         return crispasr_make_moonshine_streaming_backend();
     if (name == "gemma4-e2b" || name == "gemma4e2b" || name == "gemma4")
@@ -293,7 +315,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     // The de fine-tunes share the runtime but are NOT en-only — the variant's
     // language must ride along or the sole-language guard rejects `-l de` and
     // the #227 auto shortcut mislabels output (found 2026-09-02).
-    if (name == "moonshine-de" || name == "moonshine-tiny-de")
+    if (name == "moonshine-de" || name == "moonshine-tiny-de" || name == "moonshine-tiny-de-dattazigzag")
         return crispasr_make_moonshine_backend_lang("de");
     if (name == "moonshine")
         return crispasr_make_moonshine_backend();
@@ -355,10 +377,12 @@ std::vector<std::string> crispasr_list_backends() {
         "dolphin",
         "xasr",
         "parakeet",
+        "phonon2",
         "reazonspeech",
         "quds-fa",
         "canary",
         "canary-qwen",
+        "index-echo",
         "lfm2-audio",
         "mini-omni2",
         "cohere",
@@ -431,12 +455,21 @@ std::vector<std::string> crispasr_list_backends() {
         "cosyvoice3-tts-rl",
         "m2m100",
         "m2m100-wmt21",
+        "hikari",
+        "marian",
         "madlad",
         "glm-asr",
         "kyutai-stt",
         "firered-asr",
         "moonshine",
         "moonshine-streaming",
+#ifdef CRISPASR_HAS_ONNX
+        "moonshine-onnx",
+        "moonshine-streaming-small-de-onnx",
+        "moonshine-streaming-tiny-de-onnx",
+        "moonshine-tiny-de-phreak87-onnx",
+#endif
+        "moonshine-tiny-de-dattazigzag",
         "gemma4-e2b",
         "omniasr",
         "omniasr-300m",
@@ -653,6 +686,13 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     if (model_path.empty())
         return "";
 
+#ifdef CRISPASR_HAS_ONNX
+    // Exported ONNX filenames are generic. Inspect their companion config,
+    // using the same detector as the session C ABI before GGUF fallback.
+    if (moonshine_onnx_is_model(model_path.c_str()))
+        return "moonshine-onnx";
+#endif
+
     // ---- Pass 1: filename heuristics ----
     //
     // Try filename matching first. This avoids two problems:
@@ -703,8 +743,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     // though its filename also contains "ctc".
     if (contains_ci("parakeet") && contains_ci("ctc") && !contains_ci("tdt"))
         return "fastconformer-ctc";
-    if (contains_ci("parakeet"))
-        return "parakeet";
+    if (contains_ci("parakeet") || contains_ci("orukeet"))
+        return "parakeet"; // Orukeet is a Parakeet fine-tune; also routes its registry short name (#491).
+    if (contains_ci("phonon2") || contains_ci("phonon-2"))
+        return "phonon2"; // #481: model-specific caps, shared Parakeet TDT graph
     if (contains_ci("reazonspeech"))
         return "parakeet";
     if (contains_ci("quds"))
@@ -738,6 +780,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "fastconformer-ctc";
     if (contains_ci("canary") && contains_ci("qwen"))
         return "canary-qwen";
+    if (contains_ci("index-echo") && !contains_ci("decoder"))
+        return "index-echo";
     if (contains_ci("canary"))
         return "canary";
     if (contains_ci("lfm2-audio") || contains_ci("lfm2_audio"))
@@ -778,6 +822,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "tada";
     if (contains_ci("m2m100") || (contains_ci("m2m") && contains_ci("100")) || contains_ci("wmt21"))
         return "m2m100";
+    if (contains_ci("hikari"))
+        return "hikari";
+    if (contains_ci("opus-mt") || contains_ci("opus_mt") || contains_ci("marian"))
+        return "marian";
     if (contains_ci("madlad"))
         return "madlad";
     if (contains_ci("kokoro"))
@@ -804,6 +852,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "firered-asr";
     if (contains_ci("gemma") && (contains_ci("e2b") || contains_ci("4-e2b")))
         return "gemma4-e2b";
+    if (contains_ci("moonshine") && contains_ci("onnx"))
+        return "moonshine-onnx";
     if (contains_ci("moonshine") && contains_ci("streaming"))
         return "moonshine-streaming";
     // The de fine-tune must resolve to its variant name so the factory hands

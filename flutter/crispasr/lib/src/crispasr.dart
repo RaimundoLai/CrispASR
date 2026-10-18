@@ -770,21 +770,36 @@ String? cacheDir({String? override, DynamicLibrary? lib}) {
   return dir;
 }
 
-/// One word + centisecond timings returned by [alignWords].
+/// Measured original codepoint; start/end are seconds.
+class AlignedCharacter {
+  final String text;
+  final double start;
+  final double end;
+  const AlignedCharacter(
+      {required this.text, required this.start, required this.end});
+}
+
+/// One word and optional measured character spans returned by [alignWords].
 class AlignedWord {
+  final List<AlignedCharacter> characters;
   final String text;
   final double start; // seconds
   final double end;
   const AlignedWord(
-      {required this.text, required this.start, required this.end});
+      {required this.text,
+      required this.start,
+      required this.end,
+      this.characters = const []});
 }
 
 /// CTC / forced-alignment word timings for a transcript + audio pair.
 ///
 /// `alignerModel` picks the backend by filename convention: any path
 /// containing "forced-aligner" / "qwen3-fa" / "qwen3-forced" routes to
-/// the Qwen3-ForcedAligner path; everything else goes through
-/// canary-ctc-aligner.
+/// the Qwen3-ForcedAligner path. Wav2vec2/HuBERT/data2vec models use
+/// their own CTC vocabulary; remaining models use canary-ctc. Supported
+/// original codepoints have measured character spans. Romanized words
+/// and other aligner families return an empty character list.
 ///
 /// `tOffset` (seconds) is added to every word's start/end so the
 /// returned timings are absolute against the original audio.
@@ -835,12 +850,35 @@ List<AlignedWord> alignWords({
   final freeFn = lib.lookupFunction<Void Function(Pointer<Void>),
       void Function(Pointer<Void>)>('crispasr_align_result_free');
 
+  final ncFn = lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+      int Function(Pointer<Void>, int)>('crispasr_align_result_n_characters');
+  final cpFn = lib.lookupFunction<
+      Pointer<Utf8> Function(Pointer<Void>, Int32, Int32),
+      Pointer<Utf8> Function(
+          Pointer<Void>, int, int)>('crispasr_align_result_character_text');
+  final c0Fn = lib.lookupFunction<
+      Int64 Function(Pointer<Void>, Int32, Int32),
+      int Function(
+          Pointer<Void>, int, int)>('crispasr_align_result_character_t0');
+  final c1Fn = lib.lookupFunction<
+      Int64 Function(Pointer<Void>, Int32, Int32),
+      int Function(
+          Pointer<Void>, int, int)>('crispasr_align_result_character_t1');
   final n = nFn(res);
   final out = <AlignedWord>[];
   for (var i = 0; i < n; i++) {
     final tp = textFn(res, i);
     final t = tp == nullptr ? '' : tp.toDartString();
+    final characters = <AlignedCharacter>[];
+    for (var j = 0; j < ncFn(res, i); j++) {
+      final cp = cpFn(res, i, j);
+      characters.add(AlignedCharacter(
+          text: cp == nullptr ? '' : cp.toDartString(),
+          start: c0Fn(res, i, j) / 100.0,
+          end: c1Fn(res, i, j) / 100.0));
+    }
     out.add(AlignedWord(
+      characters: characters,
       text: t,
       start: t0Fn(res, i) / 100.0,
       end: t1Fn(res, i) / 100.0,
@@ -2169,10 +2207,9 @@ class CrispASR {
 
 /// A live streaming decode session, created via [CrispASR.openStream].
 ///
-/// Feed PCM chunks as they arrive; every chunk whose accumulation crosses
-/// the configured `stepMs` triggers a decode over the rolling window and
-/// returns a [StreamingUpdate]. Chunks that don't trigger a decode return
-/// `null` — the caller is still buffering.
+/// Feed new PCM chunks as they arrive. Persistent streams retain backend
+/// state; window-based streams decode at the configured `stepMs` threshold.
+/// Updates contain cumulative utterance text; null means no new output.
 ///
 /// Close the session explicitly with [close] to free the native state —
 /// there is no Dart finalizer hooking the native library.
@@ -2216,8 +2253,7 @@ class StreamingSession {
     try {
       final r = _feedFn(_handle, buf, pcm.length);
       if (r < 0) throw Exception('crispasr_stream_feed error $r');
-      if (r == 0) return null; // still buffering
-      return _readOutput();
+      return _readOutput(); // also polls asynchronous decoders
     } finally {
       calloc.free(buf);
     }
@@ -2232,21 +2268,32 @@ class StreamingSession {
     if (_closed) throw StateError('StreamingSession is closed');
     if (_flushFn == null) return _readOutput();
     final r = _flushFn!(_handle);
-    if (r <= 0) return null;
+    if (r < 0) throw Exception('crispasr_stream_flush error $r');
     return _readOutput();
   }
 
   StreamingUpdate? _readOutput() {
-    final outCap = 4096;
-    final outBuf = calloc<Uint8>(outCap);
-    final out = outBuf.cast<Utf8>();
+    var outCap = 4096;
+    var outBuf = calloc<Uint8>(outCap);
+    var out = outBuf.cast<Utf8>();
     final t0Ptr = calloc<Double>();
     final t1Ptr = calloc<Double>();
     final cntPtr = calloc<Int64>();
 
     try {
-      final n = _getTextFn(_handle, out, outCap, t0Ptr, t1Ptr, cntPtr);
-      if (n <= 0) return null;
+      var n = _getTextFn(_handle, out, outCap, t0Ptr, t1Ptr, cntPtr);
+      if (n < 0) throw Exception('crispasr_stream_get_text error $n');
+      // Common streams return the full byte length, even when truncated.
+      // Retry before decoding UTF-8: truncation may split a codepoint.
+      while (n >= outCap) {
+        outCap = n + 1;
+        calloc.free(outBuf);
+        outBuf = calloc<Uint8>(outCap);
+        out = outBuf.cast<Utf8>();
+        n = _getTextFn(_handle, out, outCap, t0Ptr, t1Ptr, cntPtr);
+        if (n < 0) throw Exception('crispasr_stream_get_text error $n');
+      }
+      if (n == 0) return null;
       final counter = cntPtr.value;
       if (counter == _lastCounter) return null; // same decode we already saw
       _lastCounter = counter;
@@ -2271,7 +2318,8 @@ class StreamingSession {
     if (_closed) throw StateError('StreamingSession is closed');
     if (_setLiveDecodeFn == null) {
       throw UnsupportedError(
-          'crispasr_stream_set_live_decode not available in this libcrispasr build');
+        'crispasr_stream_set_live_decode not available in this libcrispasr build',
+      );
     }
     _setLiveDecodeFn!(_handle, enabled ? 1 : 0);
   }
@@ -2375,6 +2423,11 @@ typedef PianoNoteWithProgram = ({
 /// call or by closing the session.
 typedef Stem = ({String name, Float32List pcm});
 
+/// Unified model session. Phonon-2 auto-detects as Parakeet from GGUF metadata,
+/// including renamed files; its trained language is English.
+/// Index-Echo opens the tower GGUF with a matching decoder beside it. Set the
+/// target language to en/ja/es for bilingual transcript/translation segments.
+/// A sibling Silero v6.2 model enables the released speech-window recipe.
 class CrispasrSession {
   CrispasrSession._(
     this._lib,
@@ -2612,7 +2665,7 @@ class CrispasrSession {
   /// Pass [language] as an ISO 639-1 code ("en", "de", "ja", …) to steer
   /// backends that accept a source-language hint (whisper / canary /
   /// cohere / voxtral / voxtral4b). Backends that auto-detect
-  /// (parakeet / qwen3) or that don't expose a language input
+  /// (parakeet) or that don't expose a language input
   /// (granite / wav2vec2 / fastconformer-ctc) ignore the hint silently.
   /// `null` or empty preserves each backend's historical default.
   List<SessionSegment> transcribe(Float32List pcm, {String? language}) {
@@ -3993,6 +4046,7 @@ class CrispasrSession {
   ///
   /// For qwen3-tts a WAV reference requires [refText] (the transcription of
   /// the reference audio). For vibevoice only GGUF voice packs are supported.
+  /// For MioTTS pass a preset embedding GGUF; save PCM at [outputSampleRate].
   /// For orpheus voice selection is BY NAME — use [setSpeakerName] instead.
   void setVoice(String path, {String? refText}) {
     if (_closed) throw StateError('CrispasrSession is closed');
@@ -5005,6 +5059,17 @@ class CrispasrSession {
     }
   }
 
+  /// 0: unavailable, 1: rolling windows, 2: persistent model caches,
+  /// 3: text-prefix streaming (accumulated audio is re-encoded).
+  /// Older libraries report 0 rather than claiming unsupported streaming.
+  int get streamingKind {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_stream_kind')) return 0;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_stream_kind');
+    return fn(_handle);
+  }
+
   /// Open a streaming decode session against this session's backend.
   ///
   /// Backed by `crispasr_session_stream_open` on the C side, which
@@ -5035,7 +5100,7 @@ class CrispasrSession {
             Pointer<Void>, Int32, Int32, Int32, Int32, Pointer<Utf8>, Int32),
         Pointer<Void> Function(Pointer<Void>, int, int, int, int, Pointer<Utf8>,
             int)>('crispasr_session_stream_open');
-    final langPtr = (language == null || language.isEmpty || language == 'auto')
+    final langPtr = (language == null || language.isEmpty)
         ? nullptr
         : language.toNativeUtf8();
     final handle = fn(_handle, nThreads, stepMs, lengthMs, keepMs,

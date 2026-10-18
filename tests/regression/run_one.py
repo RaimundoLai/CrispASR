@@ -190,13 +190,25 @@ def strip_ai_disclaimer(transcript: str) -> str:
     return transcript
 
 
-def run_transcript(crispasr_bin: Path, gguf: Path, sample: Path) -> str:
+def run_transcript(crispasr_bin: Path, gguf: Path, sample: Path, *, srt: bool = False) -> str:
     """Run `crispasr -m gguf -f sample`, return the transcript line.
 
     The CLI prints the transcript on its own line near the end, after
     the "transcribed N s audio in M s (Kx realtime)" status line.
     Grab the last non-empty non-status line.
     """
+    if srt:
+        # Bilingual backends emit several cues/lines. Checking the final stdout
+        # line would silently discard earlier cues and every source transcript.
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="regression-srt-", dir=gguf.parent) as temp:
+            prefix = Path(temp) / "decoded"
+            subprocess.run([str(crispasr_bin), "-m", str(gguf), "-f", str(sample),
+                            "-osrt", "-of", str(prefix)], capture_output=True,
+                           text=True, check=True, timeout=600)
+            cues = prefix.with_suffix(".srt").read_text()
+            return " ".join(line.strip() for line in cues.splitlines()
+                            if line.strip() and not line.strip().isdigit() and "-->" not in line)
     proc = subprocess.run(
         [str(crispasr_bin), "-m", str(gguf), "-f", str(sample)],
         capture_output=True,
@@ -304,6 +316,12 @@ def run_diff(diff_bin: Path, backend_id: str, gguf: Path, ref: Path, sample: Pat
     if proc.returncode < 0:
         die(f"crispasr-diff died from signal {-proc.returncode}\n"
             f"  stderr tail: {proc.stderr[-400:]}")
+    # Index-Echo's harness also gates magnitude, exact prompt IDs and cached
+    # greedy IDs. Those failures have no cosine row; ignoring its exit status
+    # would silently drop the port's required acceptance gates.
+    if backend_id == "index-echo" and proc.returncode != 0:
+        die(f"Index-Echo mandatory diff gate failed (rc={proc.returncode})\n"
+            f"  stdout tail: {proc.stdout[-1600:]}\n  stderr tail: {proc.stderr[-400:]}")
     # crispasr-diff prints summary lines on stdout. Parse the [PASS]/[FAIL]
     # lines; ignore the diff harness's own pass/fail verdict — we apply our
     # own per-stage thresholds from the manifest.
@@ -348,6 +366,49 @@ def transcript_gate(entry: dict, actual: str) -> tuple[bool, list[str]]:
     verdict = "\033[32m  PASS\033[0m" if ok else "\033[31m  FAIL\033[0m"
     suffix = " (within tolerance)" if ok else " (over tolerance)"
     return ok, [f"{verdict}  {gate}{suffix}", f"    expected: {expected!r}", f"    actual:   {actual!r}"]
+
+
+def verify_transcript_reference(entry: dict, reference: Path, sample: Path,
+                                work_dir: Path) -> str:
+    """Verify a transcript target against pinned, independent CTC logits.
+
+    This checks provenance before native inference. It cannot silently bless a
+    new native output by replacing the expected string. Human accuracy is
+    reported separately because upstream-model parity can include model errors.
+    """
+    import hashlib
+    from itertools import groupby
+    import gguf
+    import numpy as np
+
+    source = entry["transcript_reference"]
+    def check_hash(path: Path, expected: str):
+        with path.open("rb") as f:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+            actual = h.hexdigest()
+        if actual != expected:
+            raise ValueError(f"Transcript reference SHA256 mismatch: {path.name}")
+    check_hash(reference, source["sha256"])
+    check_hash(sample, source["sample_sha256"])
+    pin = source["vocab"]
+    vocab_path = hf_download(pin["repo"], pin["file"], pin["revision"], work_dir)
+    check_hash(vocab_path, pin["sha256"])
+    vocab = json.loads(vocab_path.read_text())
+    inv = {i: text for text, i in vocab.items()}
+    reader = gguf.GGUFReader(str(reference))
+    logits = next(t.data for t in reader.tensors if t.name == source["stage"])
+    if logits.ndim != 2 or logits.shape[1] != len(vocab) or not np.isfinite(logits).all():
+        raise ValueError("Invalid independent CTC logit grid")
+    blank = vocab[source["blank_token"]]
+    ids = np.argmax(logits, axis=1).tolist()
+    decoded = "".join(inv[i] for i, _ in groupby(ids) if i != blank)
+    decoded = decoded.replace(source["word_delimiter_token"], " ").strip()
+    if _normalize_for_wer(decoded) != _normalize_for_wer(entry["expected_transcript"]):
+        raise ValueError(f"Transcript target disagrees with independent Python reference: {decoded!r}")
+    print(f"[transcript-reference] SHA256 verified; independent Python decode: {decoded!r}")
+    return decoded
 
 
 def regression_for(name: str, manifest: dict, work_dir: Path,
@@ -407,16 +468,24 @@ def regression_for(name: str, manifest: dict, work_dir: Path,
 
     failures = 0
     skip_diff = entry.get("skip_diff", False)
+    if "transcript_reference" in entry:
+        if ref_local is None:
+            raise ValueError("Transcript provenance requires an independent reference dump")
+        verify_transcript_reference(entry, ref_local, sample, work_dir)
 
     # ----- 1. Transcript -----
     print(f"\n[transcript] {name}")
-    actual = run_transcript(crispasr_bin, gguf_local, sample)
+    actual = run_transcript(crispasr_bin, gguf_local, sample,
+                            srt=entry.get("transcript_format") == "srt")
     # WER-normalised gate, shared with the Kaggle suite; see transcript_gate.
     ok, lines = transcript_gate(entry, actual)
     for ln in lines:
         print(ln)
     if not ok:
         failures += 1
+    if "human_reference_transcript" in entry:
+        _, human_wer = compute_transcript_metrics(entry["human_reference_transcript"], actual)
+        print(f"[human-accuracy/advisory] WER={human_wer:.4f}; upstream parity is a separate gate")
 
     # ----- 2. Diff harness -----
     if skip_diff:
@@ -758,6 +827,18 @@ def dry_run(manifest: dict, backend_filter: str | None = None) -> int:
                   f"{gguf_rev[:8]}::{gguf_file} not found")
             failures += 1
             continue
+
+        if "transcript_reference" in entry:
+            pin = entry["transcript_reference"]["vocab"]
+            try:
+                vocab_ok = api.file_exists(repo_id=pin["repo"], repo_type="model",
+                                           revision=pin["revision"], filename=pin["file"])
+            except HfHubHTTPError as exc:
+                vocab_ok = False
+                print(f"  {exc}")
+            if not vocab_ok:
+                print(f"  FAIL {name}: pinned transcript-reference vocabulary missing")
+                failures += 1
 
         dg = entry.get("diff_gguf")
         if dg and not entry.get("skip_diff", False):

@@ -52,6 +52,9 @@ crispasr -m auto --backend whisper -f de.wav --translate
 # Live mic
 crispasr --mic -m auto --backend parakeet
 
+# Live mic, transcribed AND translated sentence by sentence (German -> English)
+crispasr --live-translate -l de --tr-tl en -m auto --backend parakeet --translate-backend marian
+
 # Text LID — auto-routes by GGUF arch, auto-downloads on first use
 crispasr-lid -m auto --text "Bonjour le monde"           # cstr/cld3-GGUF (default)
 crispasr-lid -m auto:glotlid --text "Bonjour le monde"   # 2102 ISO 639-3 + script
@@ -230,7 +233,7 @@ document (issue #228).
 | `--lcs-dedup auto\|on\|off` | NeMo-style sub-word LCS dedup across chunk boundaries (default `auto` — fires when chunking with overlap) |
 | `--lcs-min-length N` | Minimum LCS length to act on (default 1; raise to 3-4 on long-silence audio where blank tokens dominate boundaries) |
 | `--parakeet-decoder ctc\|tdt\|maes` | Select decode strategy: `ctc` (CTC head), `tdt` (TDT greedy/beam, default), `maes` (MAES beam search — requires `-bs N` with N>1) |
-| `-bs N`, `--beam-size N` | Parakeet TDT/RNNT beam search width (default: unset = greedy). `2`–`4` recommended with hotwords or MAES. CTC decode is frame-synchronous and always greedy. `dolphin`: CTC prefix-beam + attention-rescoring width (default 10, upstream's) |
+| `-bs N`, `--beam-size N` | Phonon-2 (shared Parakeet runtime), Parakeet TDT/RNNT beam search width (default: unset = greedy). `2`–`4` recommended with hotwords or MAES. CTC decode is frame-synchronous and always greedy. `dolphin`: CTC prefix-beam + attention-rescoring width (default 10, upstream's) |
 | `--sensitivity conservative\|balanced\|aggressive` | Named bundle of the four whisper fallback thresholds (`-et`, `-lpt`, `-nth`, temperature step). `balanced` is the shipped default and always a no-op. See below |
 
 #### `--sensitivity` — the four decode thresholds as one knob
@@ -861,6 +864,32 @@ Granularity is controlled by `--align-granularity`:
 | `segment` | one output entry per input SRT cue / JSON segment / non-empty `.txt` line, re-timed from the word alignment; JSON nests the per-word timings under each segment |
 | `word` | one output entry per aligned word (the pre-0.8.9 behaviour, also for `.srt` input) |
 
+#### Character timestamps with wav2vec2 CTC (#490)
+
+For wav2vec2/ HuBERT/ data2vec character-vocabulary aligners, `--align-only
+--align-format json` includes a `characters` array inside each aligned word,
+in both word and segment output. Each item has `char`, `start` and `end`
+(seconds). These are the first and last frames assigned to that individual
+CTC label occurrence, including distinct occurrences of repeated letters.
+They are not an equal division of the word duration.
+
+The loaded vocabulary determines the labels: an Arabic vocabulary keeps Arabic
+text, while a Latin-only aligner can still use the existing romanization
+fallback. Punctuation, spaces and unsupported codepoints have no invented
+character timestamp. A diacritic is included only if the model has its own
+label for it. Romanized words and other aligner families have no measured
+original-codepoint array. Boundaries have the model's frame resolution, commonly
+20 ms; this does not establish human phonetic boundary accuracy. Impossible
+complete CTC paths fail rather than returning partial zero-timed words.
+
+The C ABI exposes character count/text/start/end accessors on its existing
+alignment-result handle. Python, Dart, Rust, Go, Java, C# and Ruby alignment
+results expose `characters` / `Characters` in their existing time units.
+Python/Dart/Rust/C# use seconds; Go/Java/Ruby use centiseconds. Clearing or
+freeing a result keeps the existing ownership rules. Older Python libraries
+without the new symbols still return an empty character list.
+
+
 ### Aligner model options
 
 Any of these resolves via `-am <name> --auto-download`. All are
@@ -903,6 +932,21 @@ causing `--max-len` to silently have no effect.
 > segment splitting is not available with that backend.
 
 ## Sampling / decoding (whisper + LLM backends)
+
+`index-echo` produces bilingual subtitle cues: transcript followed by translation.
+Set `--target-lang en`, `ja` or `es` (default `en`). Its released recipe uses
+Chinese input; English JFK output matches the Python blueprint on CPU. `--prompt` accepts
+comma/newline-separated glossary entries (`name:translation`), and `--ask`
+overrides the instruction. Custom instructions should preserve the timestamp,
+transcript, translation three-line format. It supports greedy or temperature
+sampling, seed and explicit `--max-new-tokens` (default 2000), with its own
+bounded windows and context history. The tower GGUF needs the decoder named
+in its metadata beside it; a Silero companion enables speech-boundary windows.
+The 9B F16 pair needs 17.914 GiB of weight storage. Select it explicitly with
+`-m index-echo-9b-f16.gguf --auto-download`; `-m auto --backend index-echo`
+selects the smaller 2B Q8 pair. Silero currently executes on CPU even when the
+speech encoder and decoder use CUDA. The validated 9B publication contains F16 only; Q8 experiments that change
+exact decoded output remain private.
 
 | Flag | Meaning |
 |---|---|
@@ -1288,7 +1332,7 @@ otherwise they are pyannote-local track IDs.
 
 ## Multi-language / translation
 
-There are **three distinct translation paths**, each with its own
+There are **four distinct translation paths**, each with its own
 flags. Pick by what you have for input and what you need out:
 
 | You have | You want | Use |
@@ -1296,6 +1340,7 @@ flags. Pick by what you have for input and what you need out:
 | Audio in language X | Translated text in English | `-tr` / `--translate` (audio→EN-text on whisper, canary, granite, voxtral, qwen3) |
 | Audio in language X | Translated text in language Y | `-sl X -tl Y` (audio AST on canary, granite-4.1, qwen3) |
 | Plain text in language X | Translated text in language Y | `--text "..." -sl X -tl Y --backend m2m100` (text→text only) |
+| Live audio in language X | Transcript **and** its translation into Y, sentence by sentence | `--live-translate -l X --tr-tl Y` (streaming recogniser + text translator; see [below](#live-transcribe--translate---live-translate)) |
 
 ### Audio-side translate (`--translate`, `-sl`/`-tl`)
 
@@ -1320,15 +1365,16 @@ whether to switch to cross-lingual synthesis. See
 | `--truecase-model FNAME` | Truecaser: `auto` (German) or a path to a `.bin` |
 | `--flush-after N` | Flush SRT to stdout every N segments (`0` = all at the end, the default) |
 
-### Text-to-text translate (m2m100, WMT21, MADLAD-400)
+### Text-to-text translate (m2m100, WMT21, Opus-MT, MADLAD-400)
 
-Three text-to-text translation backends, all driven by `--text "..."
+Four text-to-text translation backends, all driven by `--text "..."
 -sl <src> -tl <tgt>`:
 
 | Backend | Model | Languages | Status |
 |---|---|---|---|
 | `m2m100` | [`facebook/m2m100_418M`](https://huggingface.co/cstr/m2m100-418m-GGUF) — 12L+12L transformer, ~502 MB Q8_0 | 100, any-to-any | ✓ production-ready (en→de exact match to Python ref) |
 | `m2m100-wmt21` | [`facebook/wmt21-dense-24-wide-en-x`](https://huggingface.co/cstr/wmt21-dense-24-wide-en-x-GGUF) + [`facebook/wmt21-dense-24-wide-x-en`](https://huggingface.co/cstr/wmt21-dense-24-wide-x-en-GGUF) — 24L+24L wider, ~2.5 GB Q4_K each | English ↔ 7 languages (separate `en-x` / `x-en` checkpoints) | ✓ runs on m2m100 runtime; vocab fix in 7f48bad |
+| `marian` (alias `opus-mt`) | [`Helsinki-NLP/opus-mt-de-en`](https://huggingface.co/Helsinki-NLP/opus-mt-de-en) / [`opus-mt-en-de`](https://huggingface.co/Helsinki-NLP/opus-mt-en-de) — MarianMT 6L+6L, d=512, ~75M parameters, 84 MB Q8_0 / 153 MB F16 ([`cstr/opus-mt-de-en-GGUF`](https://huggingface.co/cstr/opus-mt-de-en-GGUF), [`cstr/opus-mt-en-de-GGUF`](https://huggingface.co/cstr/opus-mt-en-de-GGUF)). `-m auto` = de→en; `-m opus-mt-<src>-<tgt>` for any of the 24 hosted directions (de↔en, fr↔de, fr↔en, ar↔de, ar↔en, it↔de, it↔en, es↔de, es↔en, he↔de, en→he, he→en, tr→en, en→tr; see docs/streaming.md); other pairs: `models/convert-marian-to-gguf.py` | one direction per checkpoint | ✓ F16: token ids and output equal to Hugging Face, greedy and beam 4 (14/14 de→en, 8/8 en→de). Q8_0: 12/14 and 8/8 greedy (`tools/marian_parity.py`) |
 | `madlad` (alias `t5`) | [`google/madlad400-3b-mt`](https://huggingface.co/cstr/madlad400-3b-mt-GGUF) — T5 12L+12L, ~1.9 GB Q4_K | 419 | ✓ tokens match Python SP bit-by-bit; outputs match HF reference |
 
 ```bash
@@ -1343,6 +1389,12 @@ Three text-to-text translation backends, all driven by `--text "..."
     --text "The president said he would not attend." \
     -sl en -tl de
 
+# Opus-MT de→en (a single-pair model: -sl/-tl must name its own direction;
+# another pair is ignored with a warning)
+./build/bin/crispasr --backend marian -m auto \
+    --text "Die Konferenz findet am 3. Oktober in Berlin statt." \
+    -sl de -tl en
+
 # MADLAD-400 (419 languages — output matches Python SP)
 ./build/bin/crispasr --backend madlad -m auto \
     --text "Hello world." \
@@ -1352,7 +1404,9 @@ Three text-to-text translation backends, all driven by `--text "..."
 For MADLAD-400 the source-language tag is informational (T5 encoders
 are language-agnostic); the adapter synthesises the `<2xx>` target-
 language prefix from `-tl` automatically. m2m100 / WMT21 use both
-`-sl` and `-tl`.
+`-sl` and `-tl`. An Opus-MT model has its direction built in; `-sl` / `-tl`
+are checked against it. Unset, `--beam-size` is the checkpoint's own
+`num_beams` (4); `--beam-size 1` is greedy.
 
 | Flag | Meaning |
 |---|---|
@@ -1360,6 +1414,45 @@ language prefix from `-tl` automatically. m2m100 / WMT21 use both
 | `-sl LANG`, `-tl LANG` | Source / target — same flags as audio AST; ISO-639-1 codes. |
 | `--translate-max-tokens N` | Max output tokens (default 256). |
 | `--tr-sl LANG`, `--tr-tl LANG` (long: `--translate-source-lang` / `--translate-target-lang`) | Translator-stage source/target. Falls back to `-sl`/`-tl`. Only matters in 2-stage pipelines where the primary backend's `-sl`/`-tl` mean something else (the primary's AST source/target). 2-stage piping (ASR → m2m100) needs `--translate-model PATH` — that's a follow-up; the override flags are plumbed but the standalone path is what's exercised today. |
+
+### Live transcribe + translate (`--live-translate`)
+
+A streaming recogniser with a text translator behind it: each sentence is
+translated as soon as the recogniser has committed to it. The mechanism,
+the model comparison and the JSON events are in
+[`streaming.md`](streaming.md#live-transcription--translation---live-translate).
+
+```bash
+# Microphone, German -> English
+crispasr --live-translate -l de --tr-tl en \
+    -m auto --backend parakeet --translate-model hy-mt2
+
+# Any real-time PCM source instead of the microphone
+ffmpeg -re -i talk.wav -f s16le -ar 16000 -ac 1 - 2>/dev/null \
+  | crispasr --stream --stream-realtime -l de --tr-tl en \
+      -m auto --backend parakeet --translate-model hy-mt2
+```
+
+| Flag | Meaning |
+|---|---|
+| `--live-translate` | Preset: `--mic --stream --vad --stream-realtime`, 500 ms step, and the translator below. Needs `-l` (the spoken language). |
+| `--translate-model NAME\|FILE` | The translator. `auto` = m2m100-418M; `opus-mt-de-en` / `opus-mt-en-de` = Opus-MT (fastest); `hy-mt2` / `index-translate` = translation LLMs; or a GGUF path. Setting it on a plain `--stream` / `--mic` run turns translation on there too. |
+| `--translate-backend NAME` | `m2m100`, `marian`, `madlad` or `llm`. Default: detected from the model file; a GGUF that is none of the translation backends is run as a translation chat LLM. Given without `--translate-model`, it picks that kind's default: `marian` the Opus-MT model for the language pair, `llm` Hy-MT2. |
+| `--translate-prompt TEXT` | LLM translators only: `hy-mt2`, `index-translate`, or a template with `{src}` `{tgt}` `{text}` (`\n` = newline). Default: by model. |
+| `--translate-revise MODEL` | Slow pass for live translation: re-translate each finished paragraph with this translation LLM (`hy-mt2`, `index-translate` or a GGUF) and emit it as a `revision` that replaces the fast translations of those sentences (see docs/streaming.md). Off by default. |
+| `--translate-revise-asr MODEL` | With `--translate-revise`: a slower recogniser (a GGUF or a registry name such as `canary`) re-transcribes each finished utterance from its audio before it is re-translated; the revision then carries the new source text (`source_revised`). |
+| `--translate-view inplace\|scroll` | Terminal view for live translation. `inplace` (default with `--translate-revise`) redraws the transcript so revisions replace text where it stands; `scroll` appends. |
+| `--translate-revise-backlog N` | Paragraphs that may wait for the slow pass before the oldest is dropped (`revision_skipped`). Default 3. |
+| `--translate-beam N` | Beam for m2m100 / madlad. Default `1` (greedy): beam search costs several greedy decodes per sentence (Opus-MT beam 4: median ~400 ms against ~45 ms). `0` = the translator's own default. |
+| `--no-translate-drafts` | Translate committed sentences only; no draft of the sentence still being spoken. |
+| `--tr-tl LANG`, `--tr-sl LANG` | Translation target (default `en`, or `de` for English speech) / source (default `-l`). |
+| `--stream-realtime` | The input is live: when decoding falls behind, read the whole backlog in one step. Implied by `--live-translate`. |
+| `--stream-session` | Drive the recogniser's own incremental session (nemotron, qwen3, vibevoice-streaming) instead of re-decoding the open speech each step. |
+
+Output is a two-line pair per sentence on a terminal (the open sentence is
+redrawn below, dimmed), `[de] …` / `[en] …` lines when piped, and
+`sentence` / `translation` / `translation_partial` JSON events with
+`--stream-json`. The first Ctrl+C ends the stream cleanly.
 
 ## Threading / processors
 

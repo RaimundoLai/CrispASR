@@ -33,6 +33,7 @@ add_executable(${TARGET}
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
     crispasr_backend_canary_qwen.cpp
+    crispasr_backend_index_echo.cpp
     crispasr_backend_lfm2_audio.cpp
     crispasr_backend_mini_omni2.cpp
     crispasr_backend_cohere.cpp
@@ -73,6 +74,8 @@ add_executable(${TARGET}
     crispasr_backend_piper.cpp
     crispasr_backend_melotts.cpp
     crispasr_backend_m2m100.cpp
+    crispasr_backend_hikari.cpp
+    crispasr_backend_marian.cpp
     crispasr_backend_t5.cpp
     crispasr_backend_glm_asr.cpp
     crispasr_backend_htdemucs.cpp
@@ -264,6 +267,7 @@ target_link_libraries(crispasr-diff PRIVATE
     tada-encoder
     indextts
     m2m100
+    hikari
     gemma4_e2b
     mimo_tokenizer
     mimo_asr
@@ -409,6 +413,7 @@ target_link_libraries(${TARGET} PRIVATE
     csm-tts
     voxcpm2_tts
     m2m100
+    hikari
     t5_translate
     canary_ctc
     wav2vec2-ggml
@@ -527,3 +532,8 @@ if (NOT GGML_BACKEND_DL)
     target_link_libraries(crispasr-repack-probe PRIVATE ggml ggml-base ggml-cpu)
 endif()
 include(DefaultTargetOptions)
+
+if(TARGET moonshine_onnx)
+    target_sources(${TARGET} PRIVATE crispasr_backend_moonshine_onnx.cpp)
+    target_link_libraries(${TARGET} PRIVATE moonshine_onnx)
+endif()

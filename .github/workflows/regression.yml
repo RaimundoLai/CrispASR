@@ -44,27 +44,48 @@ on:
     paths:
       - 'tests/regression/**'
       - 'tests/test_python_diarize_turns.py'
+      - 'tests/test_python_audio_resample.py'
+      - 'tests/test_python_helpers.py'
       - 'python/crispasr/**'
       - '.github/workflows/regression.yml'
       - 'src/**'
       - 'examples/cli/**'
       - 'models/**'
+      - 'tests/test_phonon2_container.py'
       - 'CMakeLists.txt'
       - 'ggml'
       - 'tools/regression_select.py'
+      - 'tools/reference_backends/phonon2/**'
+      - 'tools/reference_backends/parakeet_hf.py'
+      - 'tools/reference_backends/index_echo.py'
+      - 'tools/index_echo_acceptance.py'
+      - 'tests/test_index_echo_acceptance.py'
+      - 'tools/index_echo_9b_acceptance.py'
+      - 'tests/test_index_echo_9b_acceptance.py'
   # Push to main: the backends the change can touch run right away instead of
   # waiting for the nightly - e.g. #470's legacy canary load break would have
   # shown on the push, not the next morning.
   push:
     branches: [main]
     paths:
+      - 'python/crispasr/**'
+      - 'tests/test_python_audio_resample.py'
+      - 'tests/test_python_helpers.py'
       - 'src/**'
       - 'examples/cli/**'
       - 'models/**'
+      - 'tests/test_phonon2_container.py'
       - 'CMakeLists.txt'
       - 'ggml'
       - 'tests/regression/**'
       - 'tools/regression_select.py'
+      - 'tools/reference_backends/phonon2/**'
+      - 'tools/reference_backends/parakeet_hf.py'
+      - 'tools/reference_backends/index_echo.py'
+      - 'tools/index_echo_acceptance.py'
+      - 'tests/test_index_echo_acceptance.py'
+      - 'tools/index_echo_9b_acceptance.py'
+      - 'tests/test_index_echo_9b_acceptance.py'
       - '.github/workflows/regression.yml'
 
 permissions:
@@ -111,6 +132,10 @@ jobs:
         run: |
           python -m pytest tests/test_backend_config.py -v || \
           python -m unittest tests/test_backend_config.py -v
+      - name: Phonon-2 container format tests
+        run: python -m unittest discover -s tests -p test_phonon2_container.py -v
+      - name: Index-Echo numerical acceptance bounds
+        run: python -m unittest discover -s tests -p 'test_index_echo*acceptance.py' -v
       # Chat binding (#362). 891 lines of tests that nothing invoked: this file
       # is not named by any workflow and regression.yml pytests two files by
       # name rather than a directory, so it could only ever run by hand. With
@@ -121,6 +146,10 @@ jobs:
         run: |
           python -m pytest tests/test_python_chat.py -v || \
           python -m unittest tests/test_python_chat.py -v
+      - name: Run Python constructor helper discovery tests
+        run: python -m unittest discover -s tests -p test_python_helpers.py -v
+      - name: Run Python array resampling and native ABI tests
+        run: python -m unittest discover -s tests -p test_python_audio_resample.py -v
       - name: Run Python diarization ABI tests
         run: |
           python -m pytest tests/test_python_diarize_turns.py -v || \
@@ -242,7 +271,7 @@ jobs:
 
       - name: Install build + runtime deps
         run: |
-          sudo apt-get update
+          bash tools/ci-apt.sh update
           # libespeak-ng-dev: provides espeak-ng/speak_lib.h + libespeak-ng.so
           # + espeak-ng-data, so CMake's `CRISPASR_WITH_ESPEAK_NG=AUTO` detects
           # the library and compiles kokoro with `CRISPASR_HAVE_ESPEAK_NG=1`.
@@ -253,13 +282,13 @@ jobs:
           # so we also keep the `espeak-ng` binary installed for belt-and-
           # braces coverage. See src/kokoro.cpp `phonemize_espeak_lib` /
           # `phonemize_popen` and src/CMakeLists.txt `CRISPASR_WITH_ESPEAK_NG`.
-          sudo apt-get install -y cmake g++ ninja-build libopenblas-dev jq \
+          bash tools/ci-apt.sh install -y cmake g++ ninja-build libopenblas-dev jq \
               libespeak-ng-dev espeak-ng pkg-config
           # huggingface_hub for hf_hub_download; no transformers / nemo
           # needed on the CI side because reference dumps are pre-baked
           # and stored in HF, not regenerated.
           python -m pip install --upgrade pip
-          pip install huggingface_hub
+          pip install huggingface_hub numpy gguf
       - name: Authenticate HuggingFace (avoids 429 rate limit)
         if: env.HF_TOKEN != ''
         env:
@@ -281,7 +310,7 @@ jobs:
           # Also build crispasr-diff unconditionally — the binary is
           # tiny and building it costs <10 s, much less than adding
           # conditional logic per matrix backend.
-          cmake --build build-regression --target crispasr-cli crispasr-diff -j$(nproc)
+          cmake --build build-regression --target crispasr-cli crispasr-diff -j"$(nproc)"
 
       - name: Run regression for ${{ matrix.backend }}
         env:

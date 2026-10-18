@@ -871,6 +871,14 @@ CRISPASR_API struct whisper_vad_context* whisper_vad_init_with_params(struct whi
                                                                       struct whisper_vad_context_params params);
 
 CRISPASR_API bool whisper_vad_detect_speech(struct whisper_vad_context* vctx, const float* samples, int n_samples);
+// Like whisper_vad_detect_speech, but keeps the recurrent state and the
+// waveform context from the previous call, so a stream can be scored one
+// chunk at a time. The probabilities cover only the samples of THIS call.
+CRISPASR_API bool whisper_vad_detect_speech_continue(struct whisper_vad_context* vctx, const float* samples,
+                                                     int n_samples);
+// Replaces the context's per-frame probabilities, for
+// whisper_vad_segments_from_probs over probabilities kept by the caller.
+CRISPASR_API void whisper_vad_set_probs(struct whisper_vad_context* vctx, const float* probs, int n_probs);
 
 CRISPASR_API int whisper_vad_n_probs(struct whisper_vad_context* vctx);
 CRISPASR_API float* whisper_vad_probs(struct whisper_vad_context* vctx);
@@ -1022,6 +1030,15 @@ CRISPASR_API int crispasr_audio_load(const char* path, float** out_pcm, int* out
 // avoids the quality-degrading down-then-up path for non-16 kHz backends.
 CRISPASR_API int crispasr_audio_load_at_rate(const char* path, int target_rate, float** out_pcm, int* out_samples,
                                              int* out_sample_rate);
+
+// Resample mono float PCM in memory with the CLI's Kaiser polyphase
+// filter. Rates must be positive and <= 384000 Hz; maximum expansion is 64x.
+// Returns 0, -1 for invalid input/size, or -2 for allocation failure. Success
+// returns ceil(n_samples * target_rate / source_rate) samples, malloc-owned
+// (free with crispasr_audio_free). Empty input succeeds with NULL/0. Errors
+// reset non-NULL output arguments to NULL/0. Input is never modified.
+CRISPASR_API int crispasr_audio_resample(const float* pcm, int n_samples, int source_rate, int target_rate,
+                                         float** out_pcm, int* out_samples);
 
 CRISPASR_API void crispasr_audio_free(float* pcm);
 

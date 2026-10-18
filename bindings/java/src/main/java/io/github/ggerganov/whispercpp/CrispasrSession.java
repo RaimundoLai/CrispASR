@@ -1,6 +1,10 @@
 package io.github.ggerganov.whispercpp;
 
 import com.sun.jna.Callback;
+import com.sun.jna.DefaultTypeMapper;
+import com.sun.jna.Memory;
+import com.sun.jna.ToNativeContext;
+import com.sun.jna.ToNativeConverter;
 import com.sun.jna.Library;
 import com.sun.jna.Native;
 import com.sun.jna.Pointer;
@@ -28,8 +32,31 @@ import com.sun.jna.ptr.PointerByReference;
  */
 public final class CrispasrSession implements AutoCloseable {
 
+    private static java.util.Map<String, Object> nativeOptions() {
+        DefaultTypeMapper mapper = new DefaultTypeMapper();
+        // JNA 5.13 applies OPTION_STRING_ENCODING to returned strings, but
+        // scalar String arguments still use the global jna.encoding default.
+        // Convert inputs explicitly without changing the host's global setting.
+        mapper.addToNativeConverter(String.class, new ToNativeConverter() {
+            @Override public Object toNative(Object value, ToNativeContext context) {
+                if (value == null) return null;
+                byte[] utf8 = ((String) value).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                Memory memory = new Memory((long) utf8.length + 1);
+                memory.write(0, utf8, 0, utf8.length);
+                memory.setByte(utf8.length, (byte) 0);
+                return memory;
+            }
+            @Override public Class<?> nativeType() { return Pointer.class; }
+        });
+        java.util.Map<String, Object> options = new java.util.HashMap<>();
+        options.put(Library.OPTION_STRING_ENCODING, "UTF-8");
+        options.put(Library.OPTION_TYPE_MAPPER, mapper);
+        return options;
+    }
+
     public interface Lib extends Library {
-        Lib INSTANCE = Native.load("crispasr", Lib.class);
+        // The session C ABI uses UTF-8 regardless of the host/JNA default.
+        Lib INSTANCE = Native.load("crispasr", Lib.class, nativeOptions());
 
         Pointer crispasr_session_open(String modelPath, int nThreads);
         void    crispasr_session_close(Pointer session);
@@ -150,6 +177,10 @@ public final class CrispasrSession implements AutoCloseable {
         String crispasr_align_result_word_text(Pointer result, int i);
         long   crispasr_align_result_word_t0(Pointer result, int i);
         long   crispasr_align_result_word_t1(Pointer result, int i);
+        int crispasr_align_result_n_characters(Pointer result, int word);
+        String crispasr_align_result_character_text(Pointer result, int word, int i);
+        long crispasr_align_result_character_t0(Pointer result, int word, int i);
+        long crispasr_align_result_character_t1(Pointer result, int word, int i);
         void   crispasr_align_result_free(Pointer result);
 
         // --- Standalone LID (PLAN #59) ---
@@ -185,6 +216,7 @@ public final class CrispasrSession implements AutoCloseable {
         int crispasr_cache_dir_abi(String cacheDirOverride, byte[] outBuf, int outCap);
 
         // --- Streaming (PLAN #62b) — rolling-window decoder, whisper-only today.
+        int crispasr_session_stream_kind(Pointer session);
         Pointer crispasr_session_stream_open(Pointer session, int nThreads, int stepMs,
                                              int lengthMs, int keepMs, String language, int translate);
         int     crispasr_stream_feed(Pointer stream, float[] pcm, int nSamples);
@@ -763,7 +795,7 @@ public final class CrispasrSession implements AutoCloseable {
     }
 
     /**
-     * Synthesise {@code text} to 24 kHz mono PCM. Requires a TTS-capable
+     * Synthesise {@code text} to mono PCM at {@link #outputSampleRate()}. Requires a TTS-capable
      * backend (kokoro / vibevoice / qwen3-tts / orpheus).
      */
     public float[] synthesize(String text) {
@@ -954,10 +986,16 @@ public final class CrispasrSession implements AutoCloseable {
         return Lib.INSTANCE.crispasr_session_output_channels(handle);
     }
 
+    /** Streaming mode: 0 unavailable, 1 rolling windows, 2 persistent
+     * model caches, 3 text-prefix streaming. */
+    public int streamKind() {
+        return Lib.INSTANCE.crispasr_session_stream_kind(handle);
+    }
+
     /**
      * Open a rolling-window streaming decoder for this session. Mirrors
      * Go's {@code Session.StreamOpen} and the Python {@code Session.stream_open}.
-     * Currently whisper-only at the C-ABI level (PLAN #62b).
+     * Call streamKind() to query the loaded model's streaming implementation.
      *
      * @param stepMs   commit interval — how often to emit a partial transcript (default 3000)
      * @param lengthMs rolling window in ms (default 10000)
@@ -971,7 +1009,7 @@ public final class CrispasrSession implements AutoCloseable {
                 handle, 4, stepMs, lengthMs, keepMs, language == null ? "" : language, translate ? 1 : 0);
         if (p == null) {
             throw new IllegalStateException(
-                    "crispasr_session_stream_open failed (whisper-only today)");
+                    "crispasr_session_stream_open failed");
         }
         return new Stream(p);
     }
@@ -1266,12 +1304,23 @@ public final class CrispasrSession implements AutoCloseable {
     // Forced alignment (PLAN #59)
     // -----------------------------------------------------------------
 
+    /** One measured original codepoint; times are centiseconds. */
+    public static final class AlignedCharacter {
+        public final String text;
+        public final long t0, t1;
+        AlignedCharacter(String text, long t0, long t1) {
+            this.text = text; this.t0 = t0; this.t1 = t1;
+        }
+    }
+
     /** One aligned word with timing. */
     public static final class AlignedWord {
         public final String text;
         public final long t0, t1; // centiseconds
-        AlignedWord(String text, long t0, long t1) {
-            this.text = text; this.t0 = t0; this.t1 = t1;
+        public final AlignedCharacter[] characters;
+        AlignedWord(String text, long t0, long t1) { this(text, t0, t1, new AlignedCharacter[0]); }
+        AlignedWord(String text, long t0, long t1, AlignedCharacter[] characters) {
+            this.text = text; this.t0 = t0; this.t1 = t1; this.characters = characters;
         }
     }
 
@@ -1285,10 +1334,17 @@ public final class CrispasrSession implements AutoCloseable {
             int n = Lib.INSTANCE.crispasr_align_result_n_words(r);
             AlignedWord[] words = new AlignedWord[n];
             for (int i = 0; i < n; i++) {
+                int nc = Lib.INSTANCE.crispasr_align_result_n_characters(r, i);
+                AlignedCharacter[] characters = new AlignedCharacter[nc];
+                for (int j = 0; j < nc; j++)
+                    characters[j] = new AlignedCharacter(
+                        Lib.INSTANCE.crispasr_align_result_character_text(r, i, j),
+                        Lib.INSTANCE.crispasr_align_result_character_t0(r, i, j),
+                        Lib.INSTANCE.crispasr_align_result_character_t1(r, i, j));
                 words[i] = new AlignedWord(
                     Lib.INSTANCE.crispasr_align_result_word_text(r, i),
                     Lib.INSTANCE.crispasr_align_result_word_t0(r, i),
-                    Lib.INSTANCE.crispasr_align_result_word_t1(r, i));
+                    Lib.INSTANCE.crispasr_align_result_word_t1(r, i), characters);
             }
             return words;
         } finally {

@@ -26,6 +26,23 @@ TEST_CASE("registry: lookup unknown backend returns false", "[unit][registry]") 
     REQUIRE_FALSE(found);
 }
 
+TEST_CASE("registry: Phonon-2 selects Q8 and resolves alternate GGUF quants", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("phonon2", e));
+    REQUIRE(e.filename == "phonon2-q8_0.gguf");
+    REQUIRE(e.approx_size == "~674 MB");
+    REQUIRE(e.license.find("CC-BY-4.0") != std::string::npos);
+    REQUIRE(crispasr_registry_lookup("phonon2", e, "f16"));
+    REQUIRE(e.filename == "phonon2-f16.gguf");
+    REQUIRE(e.url.find("phonon2-f16.gguf") != std::string::npos);
+    REQUIRE(e.approx_size.empty());
+    REQUIRE(crispasr_registry_lookup("phonon2", e, "q4_k"));
+    REQUIRE(e.backend == "phonon2");
+    REQUIRE(e.filename == "phonon2-q4_k.gguf");
+    REQUIRE(crispasr_registry_lookup_by_filename("phonon2-q8_0.gguf", e));
+    REQUIRE(e.backend == "phonon2");
+}
+
 TEST_CASE("registry: default bundle reports the exact canonical artifacts", "[unit][registry]") {
     CrispasrRegistryBundle bundle;
     REQUIRE(crispasr_registry_default_bundle("omnivoice", bundle));
@@ -573,4 +590,44 @@ TEST_CASE("registry: paraformer has entry", "[unit][registry]") {
 TEST_CASE("registry: outetts has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("outetts", e));
+}
+
+TEST_CASE("registry: Index-Echo downloads a matching pair and source VAD", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE(crispasr_registry_default_bundle("index-echo", bundle));
+    REQUIRE_FALSE(bundle.requires_license_acceptance);
+    REQUIRE(bundle.artifacts.size() == 3);
+    REQUIRE(bundle.artifacts[0].filename == "index-echo-2b-q8_0.gguf");
+    REQUIRE(bundle.artifacts[1].filename == "index-echo-2b-decoder-q8_0.gguf");
+    REQUIRE(bundle.artifacts[2].filename == "ggml-silero-v6.2.0.bin");
+    CrispasrRegistryEntry entry;
+    REQUIRE(crispasr_registry_lookup("index-echo", entry, "f16"));
+    REQUIRE(entry.filename == "index-echo-2b-f16.gguf");
+    REQUIRE(entry.companion_filename == "index-echo-2b-decoder-f16.gguf");
+    REQUIRE(crispasr_registry_lookup_by_filename("index-echo-9b-f16.gguf", entry));
+    REQUIRE(entry.backend == "index-echo");
+    REQUIRE(entry.filename == "index-echo-9b-f16.gguf");
+    REQUIRE(entry.companion_filename == "index-echo-9b-decoder-f16.gguf");
+    REQUIRE(entry.url.find("/index-echo-9b-GGUF/") != std::string::npos);
+    REQUIRE(entry.companion_url.find("/index-echo-9b-GGUF/") != std::string::npos);
+    REQUIRE_FALSE(crispasr_license_requires_acceptance(entry.license));
+}
+
+TEST_CASE("registry: German Moonshine bundles own every companion", "[unit][registry]") {
+    for (const auto& key : {"moonshine-streaming-tiny-de-onnx", "moonshine-streaming-small-de-onnx",
+                            "moonshine-streaming-tiny-de-onnx-f32", "moonshine-streaming-small-de-onnx-f32"}) {
+        CAPTURE(key);
+        CrispasrRegistryBundle bundle;
+        REQUIRE(crispasr_registry_default_bundle(key, bundle));
+        REQUIRE(bundle.backend == key);
+        REQUIRE(bundle.artifacts.size() == 8);
+        REQUIRE(bundle.license == "MIT");
+        REQUIRE_FALSE(bundle.requires_license_acceptance);
+        for (const auto& artifact : bundle.artifacts) {
+            REQUIRE(artifact.filename.find(std::string(key) + "/") == 0);
+            REQUIRE(artifact.url.find("/resolve/main/") == std::string::npos);
+        }
+        const bool f32 = std::string(key).find("-f32") != std::string::npos;
+        REQUIRE(bundle.artifacts.front().filename == std::string(key) + (f32 ? "/encoder.onnx" : "/encoder_int8.onnx"));
+    }
 }

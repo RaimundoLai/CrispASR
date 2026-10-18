@@ -14,7 +14,7 @@
 //   set_tts_phonemes(handle, ipa)              # kokoro/piper: skip the G2P
 //   is_custom_voice(handle) -> Boolean         # qwen3-tts variant detect
 //   is_voice_design(handle) -> Boolean         # qwen3-tts variant detect
-//   synthesize(handle, text) -> Array<Float>   # 24 kHz mono PCM
+//   synthesize(handle, text) -> Array<Float>   # mono PCM at output_sample_rate(handle)
 //
 // And a singleton method:
 //   CrispASR::Session.kokoro_resolve_for_lang(model_path, lang)
@@ -161,10 +161,15 @@ extern int crispasr_align_result_n_words(struct crispasr_align_result* r);
 extern const char* crispasr_align_result_word_text(struct crispasr_align_result* r, int i);
 extern int64_t crispasr_align_result_word_t0(struct crispasr_align_result* r, int i);
 extern int64_t crispasr_align_result_word_t1(struct crispasr_align_result* r, int i);
+extern int crispasr_align_result_n_characters(struct crispasr_align_result* r, int word);
+extern const char* crispasr_align_result_character_text(struct crispasr_align_result* r, int word, int i);
+extern long long crispasr_align_result_character_t0(struct crispasr_align_result* r, int word, int i);
+extern long long crispasr_align_result_character_t1(struct crispasr_align_result* r, int word, int i);
 extern void crispasr_align_result_free(struct crispasr_align_result* r);
 
 // --- Streaming (PLAN #62b): rolling-window decoder. Whisper-only at the C-ABI today.
 struct CrispasrStream;
+extern int crispasr_session_stream_kind(struct CrispasrSession* s);
 extern struct CrispasrStream* crispasr_session_stream_open(struct CrispasrSession* s, int n_threads, int step_ms,
                                                            int length_ms, int keep_ms, const char* language,
                                                            int translate);
@@ -806,7 +811,7 @@ static VALUE rb_session_synthesize(VALUE self, VALUE handle, VALUE text) {
 
 // UNMARKED synthesis — no audible/inaudible watermark. Hard-refused unless
 // accept_marking_responsibility was called first on the session. Otherwise
-// identical to synthesize; returns 24 kHz mono PCM as Array<Float>.
+// identical to synthesize; returns mono PCM at output_sample_rate(handle).
 static VALUE rb_session_synthesize_raw(VALUE self, VALUE handle, VALUE text) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     int n = 0;
@@ -1225,6 +1230,17 @@ static VALUE rb_session_align_words(VALUE self, VALUE aligner_model, VALUE trans
         rb_hash_aset(w, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(wt ? wt : ""));
         rb_hash_aset(w, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_align_result_word_t0(r, i)));
         rb_hash_aset(w, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_align_result_word_t1(r, i)));
+        int nc = crispasr_align_result_n_characters(r, i);
+        VALUE characters = rb_ary_new_capa(nc);
+        for (int j = 0; j < nc; j++) {
+            VALUE ch = rb_hash_new();
+            const char* cp = crispasr_align_result_character_text(r, i, j);
+            rb_hash_aset(ch, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(cp ? cp : ""));
+            rb_hash_aset(ch, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_align_result_character_t0(r, i, j)));
+            rb_hash_aset(ch, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_align_result_character_t1(r, i, j)));
+            rb_ary_push(characters, ch);
+        }
+        rb_hash_aset(w, ID2SYM(rb_intern("characters")), characters);
         rb_ary_push(result, w);
     }
     crispasr_align_result_free(r);
@@ -1262,6 +1278,10 @@ static VALUE rb_kokoro_resolve_for_lang(VALUE self, VALUE model_path, VALUE lang
 // Streaming (PLAN #62b) — rolling-window decoder. Whisper-only at the C-ABI today.
 // =====================================================================
 
+static VALUE rb_session_stream_kind(VALUE self, VALUE session_h) {
+    return INT2NUM(crispasr_session_stream_kind((struct CrispasrSession*)NUM2ULL(session_h)));
+}
+
 static VALUE rb_stream_open(VALUE self, VALUE session_h, VALUE step_ms, VALUE length_ms, VALUE keep_ms, VALUE language,
                             VALUE translate) {
     struct CrispasrSession* sess = (struct CrispasrSession*)NUM2ULL(session_h);
@@ -1269,7 +1289,7 @@ static VALUE rb_stream_open(VALUE self, VALUE session_h, VALUE step_ms, VALUE le
     struct CrispasrStream* st = crispasr_session_stream_open(sess, 4, NUM2INT(step_ms), NUM2INT(length_ms),
                                                              NUM2INT(keep_ms), lang, RTEST(translate) ? 1 : 0);
     if (!st) {
-        rb_raise(rb_eRuntimeError, "crispasr_session_stream_open failed (whisper-only today)");
+        rb_raise(rb_eRuntimeError, "crispasr_session_stream_open failed");
     }
     return ULL2NUM((uintptr_t)st);
 }
@@ -1940,6 +1960,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
 
     // Streaming (PLAN #62b) — CrispASR::Session::Stream.{open, feed, get_text, flush, close}.
     mStream = rb_define_module_under(mSession, "Stream");
+    rb_define_singleton_method(mSession, "stream_kind", rb_session_stream_kind, 1);
     rb_define_singleton_method(mStream, "open", rb_stream_open, 6);
     rb_define_singleton_method(mStream, "feed", rb_stream_feed, 2);
     rb_define_singleton_method(mStream, "get_text", rb_stream_get_text, 1);

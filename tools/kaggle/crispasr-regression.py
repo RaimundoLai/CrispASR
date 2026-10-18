@@ -548,6 +548,7 @@ if MODE == "rebake":
         "qwen-asr",         # qwen3-asr-0.6b
         "fireredasr",       # firered-asr2-aed, firered-lid
         "modelscope",       # funasr/sensevoice model resolution
+        "zstandard",        # phonon2 transport archive
     ]
     for _dep in OPTIONAL_REF_DEPS:
         with build_heartbeat(f"pip.install.optional.{_dep}"):
@@ -745,6 +746,18 @@ def run_validate() -> list[dict]:
                 filename=entry["gguf"]["file"],
                 revision=entry["gguf"]["revision"],
             ))
+            # `gguf.companion_files` (moonshine's tokenizer.bin, index-echo's
+            # decoder GGUF, …) must sit next to the model. Same repo + revision
+            # lands them in the same snapshot directory. run_one.py has always
+            # fetched them; this script did not, so every backend with a
+            # companion died here with "failed to initialise backend" (exit 13)
+            # — which read as a backend regression and was a missing download.
+            for companion in entry["gguf"].get("companion_files", []):
+                hf_hub_download(
+                    repo_id=entry["gguf"]["repo"],
+                    filename=companion,
+                    revision=entry["gguf"]["revision"],
+                )
             # `skip_diff: true` entries are transcript-only and carry no
             # reference dump — 38 of 45 backends. Downloading a fixture for them
             # raised KeyError: 'fixture_ref_path' and failed the backend before it
@@ -769,7 +782,11 @@ def run_validate() -> list[dict]:
             crispasr_bin = BUILD / "bin" / "crispasr"
             diff_bin = BUILD / "bin" / "crispasr-diff"
 
-            actual = run_one.run_transcript(crispasr_bin, gguf_local, sample)
+            # `transcript_format: srt` (index-echo's bilingual cues): the same
+            # cue-joining run_one.py does. Without it only the last stdout line
+            # was compared and index-echo could never pass here.
+            actual = run_one.run_transcript(crispasr_bin, gguf_local, sample,
+                                            srt=entry.get("transcript_format") == "srt")
             # Same rule as GH (run_one.transcript_gate): WER-normalised, not
             # byte-exact, honouring transcript_tolerance.
             transcript_ok, _tlines = run_one.transcript_gate(entry, actual)
@@ -880,7 +897,9 @@ def run_rebake() -> list[dict]:
         name = entry["name"]
         print(f"\n========== rebake :: {name} ==========")
         t0 = time.time()
-        # `backend_id` is the registered name in tools/dump_reference.py;
+        # `reference_backend` may differ from the runtime backend for HF
+        # variants such as Phonon-2, which runs on Parakeet but is not a .nemo.
+        reference_backend = entry.get("reference_backend", entry["backend_id"])
         # `fixture_ref_path` is what `manifest.json` says we'll ship.
         # Default for never-done entries (no fixture_ref_path field yet):
         # use `<name>/ref.gguf`. When skip_diff flips to false the
@@ -963,7 +982,7 @@ def run_rebake() -> list[dict]:
             subprocess.call([sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "moshi"])
         cmd = [
             sys.executable, "-u", str(REPO / "tools" / "dump_reference.py"),
-            "--backend", entry["backend_id"],
+            "--backend", reference_backend,
             "--model-dir", model_dir,
             "--audio", str(sample),
             "--output", str(out_path),

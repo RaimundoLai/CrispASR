@@ -92,6 +92,7 @@ import numpy as np
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
 REGISTERED_BACKENDS: Dict[str, str] = {
+    "index-echo": "reference_backends.index_echo",
     # Dolphin (DataoceanAI) E-Branchformer + Transformer decoder + CTC (#436).
     # model_dir holds <name>.pt + train.yaml + units.txt + global_cmvn;
     # DOLPHIN_MODEL_NAME picks the registry name (default small.cn.streaming).
@@ -144,6 +145,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # transformers-format ParakeetForTDT (#454: moondream parakeet-ultra / -redux);
     # same stage names as the NeMo "parakeet" dumper.
     "parakeet-hf": "reference_backends.parakeet_hf",
+    "phonon2":    "reference_backends.parakeet_hf",  # #481, independent upstream container reader
     # Supertonic-3 (#434): ONNX-only distribution — the reference IS the
     # onnxruntime pipeline (standalone script; run it directly, not via this
     # dispatcher). Kept here for discoverability.
@@ -260,11 +262,15 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # per-layer, encoder_output and the CTC log-prob grid (canary_ctc runtime).
     "fastconformer-ctc": "reference_backends.fastconformer_ctc",
     "moonshine":       "reference_backends.moonshine",
+    # Hikari (sbintuitions/hikari-medium) simultaneous S2TT: replays the
+    # upstream server's per-80ms policy; HIKARI_SRC = hikari repo src/.
+    "hikari":          "reference_backends.hikari",
     "moonshine-base":  "reference_backends.moonshine",
     # Moonshine-Streaming (ONNX variant from usefulsensors/moonshine).
     # model_dir = root of the cloned repo (onnx/tiny/{preprocess,encode}.onnx).
     # Captures encoder_output (T, 288) matching moonshine_encode() streaming path.
     "moonshine-streaming": "reference_backends.moonshine_streaming",
+    "moonshine-onnx": "reference_backends.moonshine_onnx",
     # GLM-ASR (GGUF-direct, no PyTorch). model_dir = path to an F32 GLM-ASR GGUF
     # (e.g. cstr/glm-asr-nano-GGUF / glm-asr-nano.gguf) or a directory containing
     # it. Captures mel_spectrogram (128, T_mel) and encoder_output (T_proj, 2048).

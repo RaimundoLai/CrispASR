@@ -77,8 +77,9 @@ and unzip it:
 | Platform | Download | Notes |
 |---|---|---|
 | **Windows** | `crispasr-windows-x86_64-cpu.zip` | Needs AVX2 (2013+ Intel / 2015+ AMD). Older CPU → `…-cpu-legacy.zip` |
-| **Windows + NVIDIA** | `crispasr-windows-x86_64-cuda.zip` | Self-contained; a CUDA Toolkit install is **not** required. CUDA-13-native build: `…-cuda13.zip` (Turing+) |
-| **macOS** | `crispasr-macos.tar.gz` | Metal GPU support built in |
+| **Windows + NVIDIA** | `crispasr-windows-x86_64-cuda.zip` | Self-contained; a CUDA Toolkit install is **not** required. CUDA 12.6 legacy build: `…-cuda126.zip` (Pascal/Volta and newer, through Hopper); CUDA-13-native build: `…-cuda13.zip` (Turing+) |
+| **macOS, Apple Silicon** | `crispasr-macos-arm64.tar.gz` | Metal GPU + Accelerate; `crispasr-macos.tar.gz` is the arm64 compatibility alias |
+| **macOS, Intel** | `crispasr-macos-x86_64.tar.gz` | CPU + Accelerate; requires AVX2/FMA/F16C (Haswell or newer). Older Intel Mac → `crispasr-macos-x86_64-cpu-legacy.tar.gz` |
 | **Linux** | `crispasr-linux-x86_64.tar.gz` | `…-cuda.tar.gz` / `…-vulkan.tar.gz` for GPU |
 
 Prefer to build it yourself? See [Install & build](#install--build). The `-hip`
@@ -93,6 +94,14 @@ crispasr --version          # Windows: .\crispasr.exe --version
 
 CUDA builds also print `cuda toolkit` and `cuda runtime ABI`, so this command
 distinguishes the CUDA 12 and CUDA 13 packages without inspecting DLLs.
+
+Windows CUDA packages bundle the runtime they were built against. The CUDA 12.6
+legacy CLI and library assets use the `-cuda126` suffix; their split packages
+require `cuda126-runtime.zip` from the same release. Use the included SHA-256
+manifest when reusing runtime DLLs. Do not mix CUDA 12.8 binaries with CUDA 12.6
+DLLs. The standard `-cuda` build retains CUDA 12.8 and native Blackwell support.
+CUDA 12.8 also supports Pascal and Volta in CrispASR; PyTorch's wheel architecture
+selection is a separate policy ([NVIDIA architecture support](https://developer.nvidia.com/blog/navigating-gpu-architecture-support-a-guide-for-nvidia-cuda-developers/)).
 
 ### 2. Make it speak
 
@@ -163,6 +172,7 @@ from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the 
 | **parakeet** | [`oruk/orukeet`](https://huggingface.co/cstr/orukeet-GGUF) (`-m orukeet`) | parakeet-tdt-0.6b-v3 fine-tune, half the encoder's depthwise kernels replaced by fitted Gabor functions | 25 EU (auto-detect) | CC-BY-SA-4.0 |
 | **parakeet** | [`moondream/parakeet-ultra`](https://huggingface.co/cstr/parakeet-ultra-GGUF) (`-m parakeet-ultra`) | parakeet-tdt-0.6b-v3 architecture shipped in transformers format; converted with `--hf` | 25 EU (auto-detect) | CC-BY-4.0 |
 | **parakeet** | [`moondream/parakeet-redux`](https://huggingface.co/cstr/parakeet-redux-GGUF) (`-m parakeet-redux`) | parakeet-tdt-0.6b-v3 with a ternary (base-3 packed) encoder, dequantised exactly by the converter | 25 EU (auto-detect) | CC-BY-4.0 |
+| **phonon2** | [`FermionResearch/Phonon-2`](https://huggingface.co/cstr/phonon2-GGUF) (`-m phonon2`) | Parakeet TDT v3 with retrained five-value encoder weights; [conversion and validation](docs/phonon2.md), [architecture](docs/architecture.md#phonon2) | English | CC-BY-4.0 |
 | **parakeet** | [`nvidia/parakeet-tdt-0.6b-v2`](https://huggingface.co/cstr/parakeet-tdt-0.6b-v2-GGUF) | FastConformer + TDT, original Open ASR Leaderboard topper | en (mixed-case + punct) | CC-BY-4.0 |
 | **parakeet** | [`nvidia/parakeet-tdt-1.1b`](https://huggingface.co/cstr/parakeet-tdt-1.1b-GGUF) | 42L FastConformer + TDT, larger English variant | en (lowercase) | CC-BY-4.0 |
 | **parakeet** | [`nvidia/parakeet-tdt_ctc-110m`](https://huggingface.co/cstr/parakeet-tdt_ctc-110m-GGUF) | 17L FastConformer + TDT+CTC hybrid; smallest variant, auto-CTC decode | en | CC-BY-4.0 |
@@ -175,6 +185,7 @@ from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the 
 | **canary** | [`nvidia/canary-1b-v2`](https://huggingface.co/nvidia/canary-1b-v2) | FastConformer + Transformer decoder | 25 EU (explicit `-sl/-tl`) | CC-BY-4.0 |
 | **canary** | [`handy-computer/canary-180m-flash-gguf`](https://huggingface.co/handy-computer/canary-180m-flash-gguf) (base [`nvidia/canary-180m-flash`](https://huggingface.co/nvidia/canary-180m-flash)) | 17L FastConformer (d=512) + trained 512→1024 projection + 4L Transformer decoder; existing transcribe.cpp GGUFs load directly ([more](docs/architecture.md#canary)) | en, de, es, fr (explicit); EN↔DE/ES/FR translation | CC-BY-4.0 |
 | **canary-qwen** | [`nvidia/canary-qwen-2.5b`](https://huggingface.co/nvidia/canary-qwen-2.5b) | FastConformer + Qwen3-1.7B SALM | en | CC-BY-4.0 |
+| **index-echo** | [`2B`](https://huggingface.co/IndexTeam/Index-Echo-S2TT-2B), [`9B`](https://huggingface.co/IndexTeam/Index-Echo-S2TT-9B) | AuT + Qwen3.5; bilingual timestamped subtitles ([details](docs/architecture.md#index-echo)); 2B F16/Q8 and 9B F16 CPU/CUDA validated; pairs 2.589 GiB (2B Q8), 17.914 GiB (9B F16) | upstream recipe: zh → en/ja/es | Apache-2.0 |
 | **lfm2-audio** | [`LiquidAI/LFM2.5-Audio-1.5B`](https://huggingface.co/cstr/lfm2-audio-1.5b-GGUF) | FastConformer + LFM2 hybrid conv+attention backbone (ASR+TTS) | en | LFM Open v1.0 |
 | **lfm2-audio** | [`LiquidAI/LFM2.5-Audio-1.5B-JP`](https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF) | FastConformer + LFM2 hybrid conv+attention backbone (ASR+TTS) | ja | LFM Open v1.0 |
 | **mini-omni2** | [`gpt-omni/mini-omni2`](https://huggingface.co/gpt-omni/mini-omni2) | Whisper-small + Qwen2-0.5B (ASR+TTS+S2S) | en | MIT |
@@ -198,6 +209,7 @@ from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the 
 | **wav2vec2** | [`facebook/data2vec-audio-base-960h`](https://huggingface.co/cstr/data2vec-audio-960h-GGUF) | Data2Vec Audio (79 MB Q4_K) | English | Apache-2.0 |
 | **wav2vec2** | [`facebook/hubert-large-ls960-ft`](https://huggingface.co/cstr/hubert-large-ls960-ft-GGUF) | HuBERT Large (212 MB Q4_K) | English | Apache-2.0 |
 | **glm-asr** | [`zai-org/GLM-ASR-Nano-2512`](https://huggingface.co/zai-org/GLM-ASR-Nano-2512) | Whisper encoder + 4-frame projector + Llama 1.5B (GQA) | Mandarin (+ Chinese dialects), English, Cantonese | MIT |
+| **hikari** | [`sbintuitions/hikari-medium`](https://huggingface.co/sbintuitions/hikari-medium) — hosted as [`cstr/hikari-medium-GGUF`](https://huggingface.co/cstr/hikari-medium-GGUF) (f16 + q8_0 + Silero; `-m auto`) | Whisper-medium enc-dec with a causal encoder; one token (or WAIT) per 80 ms — simultaneous translation, `--stream` emits while the speaker talks ([more](docs/architecture.md#hikari)) | English speech → DE / JA / RU text, or English ASR (`--tr-tl de`) | MIT |
 | **kyutai-stt** | [`kyutai/stt-1b-en_fr`](https://huggingface.co/kyutai/stt-1b-en_fr) | Mimi codec (SEANet + RVQ) + 16L causal LM | en, fr | MIT |
 | **kyutai-stt** | [`kyutai/stt-2.6b-en`](https://huggingface.co/kyutai/stt-2.6b-en) | Mimi codec + 48L causal LM (2.6B, English-only; 3.5 s lookahead) | en | MIT |
 | **firered-asr** | [`FireRedTeam/FireRedASR2-AED`](https://huggingface.co/FireRedTeam/FireRedASR2-AED) | Conformer + CTC + beam search; also LID (120 langs) | Mandarin, English, 20+ Chinese dialects | Apache-2.0 |
@@ -205,6 +217,8 @@ from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the 
 | **moonshine&#8209;de** | [`fidoriel/moonshine-base-de`](https://huggingface.co/cstr/moonshine-base-de-fidoriel-GGUF) | German fine-tune of moonshine-base (6.9% WER CV22) | German | CC&#8209;BY&#8209;NC&#8209;SA&#8209;4.0 |
 | **moonshine&#8209;tiny&#8209;de** | [`fidoriel/moonshine-tiny-de`](https://huggingface.co/cstr/moonshine-tiny-de-fidoriel-GGUF) | German fine-tune of moonshine-tiny (11.4% WER CV22) | German | CC&#8209;BY&#8209;NC&#8209;SA&#8209;4.0 |
 | **moonshine-streaming** | [`UsefulSensors/moonshine-streaming-{tiny,small,medium}`](https://huggingface.co/cstr/moonshine-streaming-tiny-GGUF) | Streaming: sliding-window encoder + AR decoder (34–245M) | English | MIT |
+| **moonshine-streaming-de-onnx** | [Official Tiny/Small exports](docs/architecture.md#moonshine-onnx) | Optional CPU ONNX Runtime; int8 or f32 five-graph streaming | German | MIT |
+| **moonshine-tiny-de-dattazigzag** | [dattazigzag/moonshine-tiny-de](https://huggingface.co/dattazigzag/moonshine-tiny-de) | Tiny German checkpoint; GGUF or legacy two-graph ONNX export | German | MIT |
 | **gemma4-e2b** | [`google/gemma-4-E2B-it`](https://huggingface.co/cstr/gemma4-e2b-it-GGUF) | USM Conformer 12L + Gemma4 LLM 35L (GQA, PLE) | 140+ langs | Apache-2.0 |
 | **gemma4-e4b** | [`google/gemma-4-E4B-it`](https://huggingface.co/cstr/gemma4-e4b-it-GGUF) | Same USM Conformer 12L + larger Gemma4 LLM 42L (GQA, PLE); runs on `--backend gemma4-e2b` | 140+ langs | Apache-2.0 |
 | **omniasr** | [`omniASR-CTC-1B-v2`](https://huggingface.co/cstr/omniASR-CTC-1B-v2-GGUF) | wav2vec2 CNN + 48L transformer + CTC ([more](docs/architecture.md#omniasr-ctc--llm--unlimited)) | **1600+** | Apache-2.0 |
@@ -338,6 +352,7 @@ Driven by `--text "..." -sl <src> -tl <tgt>`.
 |---|---|---|---|---|
 | **m2m100** | [`facebook/m2m100_418M`](https://huggingface.co/cstr/m2m100-418m-GGUF) | 12L enc + 12L dec transformer, SentencePiece 128K ([more](docs/architecture.md#m2m100--wmt21)) | 100 langs, any-to-any | MIT |
 | **m2m100-wmt21** | [`facebook/wmt21-dense-24-wide-en-x`](https://huggingface.co/cstr/wmt21-dense-24-wide-en-x-GGUF) + [`facebook/wmt21-dense-24-wide-x-en`](https://huggingface.co/cstr/wmt21-dense-24-wide-x-en-GGUF) | Same as m2m100, scaled to 4.7B (24L enc) ([more](docs/architecture.md#m2m100--wmt21)) | English ↔ 7 langs (separate `en-x` / `x-en` checkpoints) | MIT |
+| **marian** | [`Helsinki-NLP/opus-mt-de-en`](https://huggingface.co/Helsinki-NLP/opus-mt-de-en), [`opus-mt-en-de`](https://huggingface.co/Helsinki-NLP/opus-mt-en-de) — hosted as `cstr/opus-mt-<src>-<tgt>-GGUF` (f16 + q8_0) for 24 directions: de↔en, fr↔de, fr↔en, ar↔de, ar↔en, it↔de, it↔en, es↔de, es↔en, he↔de, en→he, he→en, tr→en, en→tr (he→en and en→tr are the larger `tc-big` models); other pairs via `models/convert-marian-to-gguf.py` | MarianMT 6L enc + 6L dec transformer, d=512, ~75M parameters, SentencePiece unigram + 58K joint vocab ([more](docs/architecture.md#marian)) | one direction per checkpoint (de→en, en→de) | CC-BY-4.0 (OPUS-MT; attribution required) |
 | **madlad** | [`google/madlad400-3b-mt`](https://huggingface.co/cstr/madlad400-3b-mt-GGUF) | T5 enc-dec (12L+12L, d=2048, gated-GELU, RMSNorm) ([more](docs/architecture.md#madlad)) | 419 languages | Apache-2.0 |
 
 ```bash
@@ -359,6 +374,13 @@ Driven by `--text "..." -sl <src> -tl <tgt>`.
     -m models/wmt21-dense-24-wide-x-en-q4_k.gguf \
     --text "Le président a dit qu'il ne serait pas présent." \
     -sl fr -tl en   # uses wmt21-dense-24-wide-x-en
+
+# Opus-MT / MarianMT (one small model per direction: `-m auto` is de→en,
+# `-m opus-mt-en-de` the other way; ~84 MB, CC-BY-4.0)
+./build/bin/crispasr --backend marian -m auto \
+    --text "Die Konferenz findet am 3. Oktober in Berlin statt." \
+    -sl de -tl en --beam-size 1
+# → The conference will take place on 3 October in Berlin.
 
 # MADLAD-400 3B (419 languages, bit-token-identical to Python SP)
 ./build/bin/crispasr --backend madlad -m auto \
@@ -458,7 +480,7 @@ The static table below is a curated subset focusing on the ASR backends and the 
 | CTC timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
 | Word-level timing | ✔ | ✔ | ✔ | ✔ | `-am` | ✔† | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | ✔ | `-am` | `-am` | `-am` | `-am` | `-am` | | `-am` | `-am` | `-am` | | `-am` |
 | Per-token confidence | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | | |
-| Language auto-detect | ✔ | ✔ | LID | LID | LID | LID | LID | LID | ✔ | LID | LID | ✔ | LID | LID | LID | LID | LID | LID | LID | ✔ | LID | LID | LID | ✔ |
+| Language auto-detect | ✔ | ✔ | LID | LID | LID | LID | LID | LID | ✔ | LID | LID | ✔ | LID | LID | LID | LID | LID | LID | LID | ✔ | ✔ | LID | LID | ✔ |
 | Speech translation | ✔ | | ✔ | | ✔ | ✔ | ✔ | | ✔ | | | | | | | | | | | | | | | |
 | Speaker diarization | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
 | Grammar (GBNF) | ✔ | | | | | | | | | | | | | | | | | | | | | | | |
@@ -893,7 +915,9 @@ python models/convert-wav2vec2-to-gguf.py \
 CrispASR has three feature areas that warrant their own docs pages:
 
 - **[Streaming & live transcription](docs/streaming.md)** — `--stream`,
-  `--mic`, `--live`, sliding-window chunking, per-token confidence.
+  `--mic`, `--live`, sliding-window chunking, per-token confidence, and
+  **live translation** (`--live-translate`: transcript plus its translation,
+  sentence by sentence, with m2m100 or a translation LLM such as Hy-MT2).
 - **[Text-to-Speech (TTS)](docs/tts.md)** — Kokoro (multilingual,
   smallest), Qwen3-TTS (highest fidelity, voice cloning), VibeVoice
   (lowest-latency streaming), Orpheus (3 B Llama + SNAC), Chatterbox
@@ -923,6 +947,9 @@ Quickest taste of each:
 ```bash
 # Streaming from microphone
 crispasr --mic -m model.gguf
+
+# Microphone, transcribed and translated live (German -> English)
+crispasr --live-translate -l de --tr-tl en -m auto --backend parakeet --translate-model hy-mt2
 
 # TTS via auto-downloaded VibeVoice (~636 MB on first run)
 crispasr --backend vibevoice-tts -m auto --tts "Hello world" --tts-output hello.wav
@@ -1113,6 +1140,7 @@ reference (see [Debug a new backend against PyTorch ground truth](docs/contribut
 | `FIRERED_BENCH=1` | Per-stage timings for the FireRedASR backend. |
 | `FIREREDPUNC_DEBUG=1` | Per-step diagnostics for the FireRed punctuation post-step. |
 | `MOONSHINE_STREAMING_BENCH=1` | Per-stage timings for moonshine-streaming. |
+| `MOONSHINE_ONNX_BENCH=1` | Per-graph CPU wall time for Moonshine ONNX frontend, encoder, adapter, cross-KV and decoder. |
 | `OMNIASR_BENCH=1` / `OMNIASR_DEBUG=1` / `OMNIASR_DUMP_DIR=` | OmniASR per-stage timings, diagnostics, and stage dumps. |
 | `PARAKEET_DEBUG=1` | Parakeet TDT per-step diagnostics (joint network, blank-id sanity). |
 | `QWEN3_TTS_BENCH=1` / `QWEN3_TTS_DEBUG=1` / `QWEN3_TTS_DUMP_DIR=` | Qwen3-TTS per-stage timings, diagnostics, and stage dumps. |

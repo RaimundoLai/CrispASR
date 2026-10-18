@@ -8,6 +8,8 @@ push / pull_request          -> only the nightly backends the change can affect:
   * shared code (src/core/, src/CMakeLists.txt, CMakeLists.txt, ggml, the CLI
     dispatcher/output code, the regression driver) selects the CORE set - a few
     cheap backends spanning the main code paths;
+  * changed manifest entries also select their own nightly backends;
+    an unavailable manifest diff or changed nightly list selects all nightly;
   * nothing relevant -> an empty matrix (the regression job is skipped).
 
     python tools/regression_select.py --event push --base <sha> [--head HEAD]
@@ -27,6 +29,15 @@ ALIASES = {
     "bark": ["bark_tts"], "csm": ["csm_tts"], "speecht5": ["speecht5_tts"], "piper": ["piper_tts"],
     "pocket-tts": ["pocket_tts"], "mini-omni2": ["mini_omni2"], "firered-asr": ["firered_asr"],
     "glm-asr": ["glm_asr"], "kyutai-stt": ["kyutai_stt"], "granite": ["granite_speech"],
+}
+# Model-specific importers/reference readers do not share the runtime's stem.
+MODEL_SOURCES = {
+    "index-echo-2b": ("models/convert-index-echo-to-gguf.py", "tools/reference_backends/index_echo.py",
+                      "tools/ci-heavy/index_echo_", "tools/index_echo_acceptance.py",
+                      "tests/test_index_echo_acceptance.py", "examples/talk-llama/qwen35",
+                      "examples/talk-llama/models/qwen35"),
+    "phonon2": ("models/phonon2_container.py", "tools/reference_backends/phonon2/",
+                "tools/reference_backends/parakeet_hf.py"),
 }
 SHARED_PREFIXES = ("src/core/", "src/CMakeLists.txt", "CMakeLists.txt", "ggml", "cmake/",
                    "examples/cli/crispasr_run", "examples/cli/crispasr_output", "examples/cli/cli.cpp",
@@ -48,12 +59,42 @@ def stems_for(backend_id):
     return [base] + ALIASES.get(backend_id, [])
 
 
-def select(changed, nightly):
+def changed_entries(before, after):
+    """Return names whose complete ASR/TTS manifest entry changed."""
+    def entries(manifest):
+        return {e["name"]: e for group in ("backends", "tts_backends")
+                for e in manifest.get(group, [])}
+    old, new = entries(before), entries(after)
+    return {name for name in old.keys() | new.keys() if old.get(name) != new.get(name)}
+
+
+def manifest_changes(base, head):
+    """Read both immutable Git snapshots; None means comparison unavailable."""
+    try:
+        snapshots = []
+        for rev in (base, head):
+            out = subprocess.run(["git", "show", f"{rev}:tests/regression/manifest.json"],
+                                 cwd=ROOT, capture_output=True, text=True, check=True)
+            snapshots.append(json.loads(out.stdout))
+        return changed_entries(*snapshots)
+    except (subprocess.CalledProcessError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def select(changed, nightly, changed_manifest=None):
     ids = manifest_ids()
     picked = []
+    if "tests/regression/nightly_matrix.json" in changed:
+        return list(nightly)
+    if "tests/regression/manifest.json" in changed:
+        if changed_manifest is None:
+            return list(nightly)
+        picked += [n for n in nightly if n in changed_manifest]
     if any(f.startswith(SHARED_PREFIXES) for f in changed):
         picked += [n for n in CORE if n in nightly]
     for name in nightly:
+        if name in MODEL_SOURCES and any(f.startswith(MODEL_SOURCES[name]) for f in changed):
+            picked.append(name)
         bid = ids.get(name, name)
         for stem in stems_for(bid):
             if any(f.startswith((f"src/{stem}", f"examples/cli/crispasr_backend_{stem}", f"models/convert-{stem}",
@@ -85,7 +126,10 @@ def main():
             print(json.dumps([n for n in CORE if n in nightly]))
             return
         changed = [l for l in out.stdout.splitlines() if l]
-    print(json.dumps(select(changed, nightly)))
+    affected = None
+    if "tests/regression/manifest.json" in changed and a.base and set(a.base) != {"0"}:
+        affected = manifest_changes(a.base, a.head)
+    print(json.dumps(select(changed, nightly, affected)))
 
 
 if __name__ == "__main__":

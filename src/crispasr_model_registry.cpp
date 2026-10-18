@@ -177,6 +177,21 @@ constexpr Entry k_registry[] = {
     {"granite-4.1-nar", "granite-speech-4.1-2b-nar-q4_k.gguf",
      "https://huggingface.co/cstr/granite-speech-4.1-2b-nar-GGUF/resolve/main/granite-speech-4.1-2b-nar-q4_k.gguf",
      "~3.2 GB", nullptr, nullptr},
+    // Index-Echo S2TT 2B (#485): paired audio tower + hybrid Qwen3.5 decoder.
+    // Q8 passes the independent stage/cache/direct-output checks; Q4 is rejected.
+    {"index-echo", "index-echo-2b-q8_0.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-q8_0.gguf", "~670 MiB",
+     "index-echo-2b-decoder-q8_0.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-decoder-q8_0.gguf", "~1.93 GiB"},
+    {"index-echo", "index-echo-2b-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-f16.gguf", "~1.22 GiB",
+     "index-echo-2b-decoder-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-2b-GGUF/resolve/main/index-echo-2b-decoder-f16.gguf", "~3.63 GiB"},
+    {"index-echo", "index-echo-9b-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-9b-GGUF/resolve/main/index-echo-9b-f16.gguf", "~1.22 GiB",
+     "index-echo-9b-decoder-f16.gguf",
+     "https://huggingface.co/cstr/index-echo-9b-GGUF/resolve/main/index-echo-9b-decoder-f16.gguf", "~16.69 GiB"},
+
     {"qwen3", "qwen3-asr-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-q4_k.gguf", "~500 MB", nullptr, nullptr},
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
@@ -558,6 +573,13 @@ constexpr Entry k_registry[] = {
     {"wav2vec2-aligner-de", "wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-german-GGUF/resolve/main/wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "~222 MB", nullptr, nullptr},
+    {"moonshine-streaming-tiny-de-onnx", "moonshine-streaming-tiny-de-onnx/encoder_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/encoder_int8.onnx", "~8 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-onnx", "moonshine-streaming-small-de-onnx/encoder_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/encoder_int8.onnx", "~43 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-streaming-small-de-onnx", "moonshine-streaming-small-de-onnx/encoder_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/encoder_int8.onnx", "~43 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-tiny-de-dattazigzag", "moonshine-tiny-de-dattazigzag-q4_k/moonshine-tiny-de-dattazigzag-q4_k.gguf", "https://huggingface.co/cstr/moonshine-tiny-de-dattazigzag-GGUF/resolve/c5d7964c5284893b35fa937536b7187fe78a3f9e/moonshine-tiny-de-dattazigzag-q4_k.gguf", "~17 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-tiny-de-phreak87-onnx", "moonshine-tiny-de-phreak87-onnx/onnx/encoder_model.onnx", "https://huggingface.co/Phreak87/moonshine-tiny-de-onnx/resolve/ed7433af42952f66cc03a966c3571166c3e50013/onnx/encoder_model.onnx", "~30 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-streaming-tiny-de-onnx-f32", "moonshine-streaming-tiny-de-onnx-f32/encoder.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/encoder.onnx", "~29 MB", nullptr, nullptr, nullptr, "MIT"},
+    {"moonshine-streaming-small-de-onnx-f32", "moonshine-streaming-small-de-onnx-f32/encoder.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/encoder.onnx", "~167 MB", nullptr, nullptr, nullptr, "MIT"},
     {"moonshine-streaming", "moonshine-streaming-tiny-q4_k.gguf",
      "https://huggingface.co/cstr/moonshine-streaming-tiny-GGUF/resolve/main/moonshine-streaming-tiny-q4_k.gguf", "~31 MB",
      "tokenizer.bin", "https://huggingface.co/cstr/moonshine-streaming-tiny-GGUF/resolve/main/tokenizer.bin",
@@ -735,6 +757,11 @@ constexpr Entry k_registry[] = {
     {"parakeet-redux", "parakeet-redux-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-redux-GGUF/resolve/main/parakeet-redux-q4_k.gguf", "~402 MB", nullptr,
      nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/moondream/parakeet-redux)"},
+    // Phonon-2 (#481) — exact five-value/int6 expansion, existing Parakeet TDT
+    // runtime. Q8_0 is the fidelity/size default; Q4_K has more text drift.
+    {"phonon2", "phonon2-q8_0.gguf",
+     "https://huggingface.co/cstr/phonon2-GGUF/resolve/main/phonon2-q8_0.gguf", "~674 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/FermionResearch/Phonon-2)"},
     // orukeet (#445) — oruk/orukeet r3, a fine-tune of parakeet-tdt-0.6b-v3
     // with the architecture unchanged (half of the encoder's depthwise conv
     // kernels replaced by fitted Gabor functions, then re-adapted). Same 25
@@ -822,11 +849,12 @@ constexpr Entry k_registry[] = {
     {"miocodec", "miocodec-v2-44k-q8_0.gguf",
      "https://huggingface.co/cstr/miocodec-v2-44k-GGUF/resolve/main/miocodec-v2-44k-q8_0.gguf",
      "~155 MB"},
-    // MioTTS-0.6B (Qwen3 LLM + MioCodec-25Hz-24kHz, Apache-2.0).
+    // MioTTS-0.6B (Qwen3 LLM + MioCodec-v2, 44.1 kHz, Apache-2.0).
     // Single GGUF, tokenizer.json loaded at runtime.
     {"miotts", "miotts-0.6b-q8_0.gguf",
      "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/miotts-0.6b-q8_0.gguf",
-     "~723 MB"},
+     "~793 MB", "tokenizer.json",
+     "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/tokenizer.json", "~14 MB"},
     // Onsets & Frames (Hawthorne et al. 2018, MIT): piano note events, from
     // the ddPn08/onsets-and-frames checkpoint's ONNX export. q8_0 rather than
     // f16 or q4_0 deliberately — measured on all ten MusicNet test pieces it
@@ -1361,6 +1389,107 @@ constexpr Entry k_registry[] = {
     {"madlad", "madlad400-3b-mt-q4_k.gguf",
      "https://huggingface.co/cstr/madlad400-3b-mt-GGUF/resolve/main/madlad400-3b-mt-q4_k.gguf",
      "~1.9 GB", nullptr, nullptr},
+    // hikari (sbintuitions/hikari-medium, MIT): simultaneous speech translation
+    // EN -> DE/JA/RU + English ASR. f16 is the default: it equals the reference
+    // and gives the same text on CPU and Metal; q8_0 (-m auto:q8_0) changed one
+    // German sentence of a 27 s clip on Metal. Silero rides along (k_extras).
+    {"hikari", "hikari-medium-f16.gguf",
+     "https://huggingface.co/cstr/hikari-medium-GGUF/resolve/main/hikari-medium-f16.gguf", "~1.5 GB", nullptr,
+     nullptr, nullptr, "MIT (https://huggingface.co/sbintuitions/hikari-medium)"},
+    // Opus-MT / MarianMT (Helsinki-NLP, CC-BY-4.0): one ~75M model per language
+    // pair, the fastest translator for live translation. `marian` is the
+    // `-m auto` default (de->en); `--translate-model auto --translate-backend
+    // marian` picks the row for the language pair. q8_0: 84 MB, near-parity
+    // with the reference (12/14 de->en, 8/8 en->de greedy); f16 is exact.
+    {"marian", "opus-mt-de-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-en-GGUF/resolve/main/opus-mt-de-en-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-en", "opus-mt-de-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-en-GGUF/resolve/main/opus-mt-de-en-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-de", "opus-mt-en-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-de-GGUF/resolve/main/opus-mt-en-de-q8_0.gguf", "~84 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    // --- generated: further Opus-MT pairs (tools: scratch batch) ---
+    {"opus-mt-ar-de", "opus-mt-ar-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-ar-de-GGUF/resolve/main/opus-mt-ar-de-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-ar-en", "opus-mt-ar-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-ar-en-GGUF/resolve/main/opus-mt-ar-en-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-ar", "opus-mt-de-ar-f16.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-ar-GGUF/resolve/main/opus-mt-de-ar-f16.gguf", "~159 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-es", "opus-mt-de-es-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-es-GGUF/resolve/main/opus-mt-de-es-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-fr", "opus-mt-de-fr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-fr-GGUF/resolve/main/opus-mt-de-fr-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-he", "opus-mt-de-he-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-he-GGUF/resolve/main/opus-mt-de-he-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-de-it", "opus-mt-de-it-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-de-it-GGUF/resolve/main/opus-mt-de-it-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-ar", "opus-mt-en-ar-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-ar-GGUF/resolve/main/opus-mt-en-ar-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-es", "opus-mt-en-es-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-es-GGUF/resolve/main/opus-mt-en-es-q8_0.gguf", "~88 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-fr", "opus-mt-en-fr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-fr-GGUF/resolve/main/opus-mt-en-fr-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-he", "opus-mt-en-he-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-he-GGUF/resolve/main/opus-mt-en-he-q8_0.gguf", "~89 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-it", "opus-mt-en-it-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-en-it-GGUF/resolve/main/opus-mt-en-it-q8_0.gguf", "~97 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-en-tr", "opus-mt-tc-big-en-tr-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tc-big-en-tr-GGUF/resolve/main/opus-mt-tc-big-en-tr-q8_0.gguf", "~262 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-es-de", "opus-mt-es-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-es-de-GGUF/resolve/main/opus-mt-es-de-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-es-en", "opus-mt-es-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-es-en-GGUF/resolve/main/opus-mt-es-en-q8_0.gguf", "~88 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-fr-de", "opus-mt-fr-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-fr-de-GGUF/resolve/main/opus-mt-fr-de-q8_0.gguf", "~86 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-fr-en", "opus-mt-fr-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-fr-en-GGUF/resolve/main/opus-mt-fr-en-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-he-de", "opus-mt-he-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-he-de-GGUF/resolve/main/opus-mt-he-de-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-he-en", "opus-mt-tc-big-he-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tc-big-he-en-GGUF/resolve/main/opus-mt-tc-big-he-en-q8_0.gguf", "~265 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-it-de", "opus-mt-it-de-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-it-de-GGUF/resolve/main/opus-mt-it-de-q8_0.gguf", "~85 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-it-en", "opus-mt-it-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-it-en-GGUF/resolve/main/opus-mt-it-en-q8_0.gguf", "~97 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    {"opus-mt-tr-en", "opus-mt-tr-en-q8_0.gguf",
+     "https://huggingface.co/cstr/opus-mt-tr-en-GGUF/resolve/main/opus-mt-tr-en-q8_0.gguf", "~87 MB", nullptr,
+     nullptr, nullptr, "CC-BY-4.0 (attribution required; OPUS-MT project, https://github.com/Helsinki-NLP/Opus-MT)"},
+    // --- end generated Opus-MT pairs ---
+    // Translation chat LLMs for live translation (`--translate-model hy-mt2`
+    // / `index-translate`, see docs/streaming.md). NOT backends: they run in
+    // the vendored LLM runtime behind the crispasr_chat_* ABI and are listed
+    // here only so the names resolve and auto-download. Both are the
+    // publishers' own GGUFs, Apache-2.0. Each needs its own instruction
+    // wording — examples/cli/crispasr_run.cpp picks it by these names.
+    {"hy-mt2", "Hy-MT2-1.8B-Q4_K_M.gguf",
+     "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf",
+     "~1.1 GB", nullptr, nullptr},
+    {"index-translate", "Index-Translate-2B.Q4_K_M.gguf",
+     "https://huggingface.co/IndexTeam/Index-Translate-2B-GGUF/resolve/main/Index-Translate-2B.Q4_K_M.gguf",
+     "~1.3 GB", nullptr, nullptr},
     // Kokoro-82M: official baseline + English default voice. The German
     // backbone + German default voice ride along via k_extras (see below)
     // so users running `-m auto --backend kokoro` get a working multilingual
@@ -1649,7 +1778,85 @@ constexpr ExtraCompanion k_confucius4_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// Source full-file recipe requires Silero's speech-boundary windows.
+constexpr ExtraCompanion k_index_echo_extras[] = {
+    {"ggml-silero-v6.2.0.bin",
+     "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin"},
+    {nullptr, nullptr},
+};
+
+// hikari: its streaming policy's wait penalty is driven by Silero's speech
+// probability; without it the model hardly ever emits (jfk 0-4 s: 48/48 WAIT).
+constexpr ExtraCompanion k_hikari_extras[] = {
+    {"ggml-silero-v6.2.0.bin",
+     "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_moonshine_streaming_tiny_de_onnx_extras[] = {
+    {"moonshine-streaming-tiny-de-onnx/frontend.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/frontend.onnx"},
+    {"moonshine-streaming-tiny-de-onnx/adapter_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/adapter_int8.onnx"},
+    {"moonshine-streaming-tiny-de-onnx/cross_kv_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/cross_kv_int8.onnx"},
+    {"moonshine-streaming-tiny-de-onnx/decoder_kv_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/decoder_kv_int8.onnx"},
+    {"moonshine-streaming-tiny-de-onnx/streaming_config.json", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/streaming_config.json"},
+    {"moonshine-streaming-tiny-de-onnx/tokenizer.json", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/tokenizer.json"},
+    {"moonshine-streaming-tiny-de-onnx/LICENSE", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/LICENSE"},
+    {nullptr, nullptr},
+};
+constexpr ExtraCompanion k_moonshine_streaming_small_de_onnx_extras[] = {
+    {"moonshine-streaming-small-de-onnx/frontend.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/frontend.onnx"},
+    {"moonshine-streaming-small-de-onnx/adapter_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/adapter_int8.onnx"},
+    {"moonshine-streaming-small-de-onnx/cross_kv_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/cross_kv_int8.onnx"},
+    {"moonshine-streaming-small-de-onnx/decoder_kv_int8.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/decoder_kv_int8.onnx"},
+    {"moonshine-streaming-small-de-onnx/streaming_config.json", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/streaming_config.json"},
+    {"moonshine-streaming-small-de-onnx/tokenizer.json", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/tokenizer.json"},
+    {"moonshine-streaming-small-de-onnx/LICENSE", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/LICENSE"},
+    {nullptr, nullptr},
+};
+constexpr ExtraCompanion k_moonshine_tiny_de_dattazigzag_q4_k_extras[] = {
+    {"moonshine-tiny-de-dattazigzag-q4_k/tokenizer.bin", "https://huggingface.co/cstr/moonshine-tiny-de-dattazigzag-GGUF/resolve/c5d7964c5284893b35fa937536b7187fe78a3f9e/tokenizer.bin"},
+    {nullptr, nullptr},
+};
+constexpr ExtraCompanion k_moonshine_tiny_de_phreak87_onnx_extras[] = {
+    {"moonshine-tiny-de-phreak87-onnx/onnx/decoder_model_merged.onnx", "https://huggingface.co/Phreak87/moonshine-tiny-de-onnx/resolve/ed7433af42952f66cc03a966c3571166c3e50013/onnx/decoder_model_merged.onnx"},
+    {"moonshine-tiny-de-phreak87-onnx/config.json", "https://huggingface.co/Phreak87/moonshine-tiny-de-onnx/resolve/ed7433af42952f66cc03a966c3571166c3e50013/config.json"},
+    {"moonshine-tiny-de-phreak87-onnx/tokenizer.json", "https://huggingface.co/Phreak87/moonshine-tiny-de-onnx/resolve/ed7433af42952f66cc03a966c3571166c3e50013/tokenizer.json"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_moonshine_streaming_tiny_de_onnx_f32_extras[] = {
+    {"moonshine-streaming-tiny-de-onnx-f32/frontend.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/frontend.onnx"},
+    {"moonshine-streaming-tiny-de-onnx-f32/adapter.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/adapter.onnx"},
+    {"moonshine-streaming-tiny-de-onnx-f32/cross_kv.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/cross_kv.onnx"},
+    {"moonshine-streaming-tiny-de-onnx-f32/decoder_kv.onnx", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/decoder_kv.onnx"},
+    {"moonshine-streaming-tiny-de-onnx-f32/streaming_config.json", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/streaming_config.json"},
+    {"moonshine-streaming-tiny-de-onnx-f32/tokenizer.json", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/tokenizer.json"},
+    {"moonshine-streaming-tiny-de-onnx-f32/LICENSE", "https://huggingface.co/Masterx/moonshine-streaming-tiny-de-ONNX/resolve/67a2c78a3a7d3494dd7952863a18db515e6fb64a/LICENSE"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_moonshine_streaming_small_de_onnx_f32_extras[] = {
+    {"moonshine-streaming-small-de-onnx-f32/frontend.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/frontend.onnx"},
+    {"moonshine-streaming-small-de-onnx-f32/adapter.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/adapter.onnx"},
+    {"moonshine-streaming-small-de-onnx-f32/cross_kv.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/cross_kv.onnx"},
+    {"moonshine-streaming-small-de-onnx-f32/decoder_kv.onnx", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/decoder_kv.onnx"},
+    {"moonshine-streaming-small-de-onnx-f32/streaming_config.json", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/streaming_config.json"},
+    {"moonshine-streaming-small-de-onnx-f32/tokenizer.json", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/tokenizer.json"},
+    {"moonshine-streaming-small-de-onnx-f32/LICENSE", "https://huggingface.co/Masterx/moonshine-streaming-small-de-ONNX/resolve/5d6dadcd2d3b9a53fcde00a8793950d2b222cac3/LICENSE"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
+    {"moonshine-streaming-small-de-onnx-f32", k_moonshine_streaming_small_de_onnx_f32_extras},
+    {"moonshine-streaming-tiny-de-onnx-f32", k_moonshine_streaming_tiny_de_onnx_f32_extras},
+    {"moonshine-streaming-tiny-de-onnx", k_moonshine_streaming_tiny_de_onnx_extras},
+    {"moonshine-onnx", k_moonshine_streaming_small_de_onnx_extras},
+    {"moonshine-streaming-small-de-onnx", k_moonshine_streaming_small_de_onnx_extras},
+    {"moonshine-tiny-de-dattazigzag", k_moonshine_tiny_de_dattazigzag_q4_k_extras},
+    {"moonshine-tiny-de-phreak87-onnx", k_moonshine_tiny_de_phreak87_onnx_extras},
+
+    {"index-echo", k_index_echo_extras},
+    {"hikari", k_hikari_extras},
     {"kokoro", k_kokoro_extras},
     {"dots-tts", k_dots_tts_extras},
     {"confucius4-tts", k_confucius4_tts_extras},
@@ -1844,15 +2051,6 @@ const ExtraCompanion* find_extras(const char* backend) {
             return x.items;
     }
     return nullptr;
-}
-
-void download_extras(const Entry& e, bool quiet, const std::string& cache_dir_override) {
-    const ExtraCompanion* extras = find_extras(e.backend);
-    if (!extras)
-        return;
-    for (const ExtraCompanion* it = extras; it->file && it->url; ++it) {
-        crispasr_cache::ensure_cached_file(it->file, it->url, quiet, "crispasr", cache_dir_override);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2084,6 +2282,26 @@ bool crispasr_find_cached_model(CrispasrRegistryEntry& out, const std::string& c
 std::string crispasr_resolve_model(const std::string& model_arg, const std::string& backend_name, bool quiet,
                                    const std::string& cache_dir_override, bool allow_download,
                                    const std::string& preferred_quant, const std::string& accepted_license) {
+    // Companions belong to the matched registry variant, which can differ
+    // from the runtime backend (e.g. German Tiny versus Small ONNX bundles).
+    auto ensure_companions = [&](const CrispasrRegistryEntry& entry) {
+        auto fetch = [&](const std::string& filename, const std::string& url) {
+            if (!crispasr_cache::file_present(crispasr_cache::dir(cache_dir_override) + "/" + filename) &&
+                !license_gate_allows_download(entry, accepted_license))
+                return false;
+            return !crispasr_cache::ensure_cached_file(filename, url, quiet, "crispasr", cache_dir_override).empty();
+        };
+        if (!entry.companion_filename.empty() && !entry.companion_url.empty() &&
+            !fetch(entry.companion_filename, entry.companion_url))
+            return false;
+        if (const ExtraCompanion* extras = find_extras(entry.backend.c_str())) {
+            for (const ExtraCompanion* it = extras; it->file && it->url; ++it)
+                if (!fetch(it->file, it->url))
+                    return false;
+        }
+        return true;
+    };
+
     // Concrete path that exists on disk — pass through.
     if (model_arg != "auto" && model_arg != "default") {
         FILE* f = fopen(model_arg.c_str(), "rb");
@@ -2121,6 +2339,8 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
                 // A previously-downloaded restricted model used to load in
                 // total silence — state the licence on every load, not just
                 // the one where it happened to be fetched.
+                if (allow_download && !ensure_companions(match))
+                    return "";
                 print_license_note(match, quiet);
                 return cached;
             }
@@ -2136,13 +2356,9 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
             }
             std::string dl =
                 crispasr_cache::ensure_cached_file(match.filename, match.url, quiet, "crispasr", cache_dir_override);
-            if (!dl.empty() && !match.companion_filename.empty() && !match.companion_url.empty())
-                crispasr_cache::ensure_cached_file(match.companion_filename, match.companion_url, quiet, "crispasr",
-                                                   cache_dir_override);
             if (!dl.empty()) {
-                if (const Entry* match_entry =
-                        !backend_name.empty() ? find_by_backend(backend_name) : find_by_filename(model_arg))
-                    download_extras(*match_entry, quiet, cache_dir_override);
+                if (!ensure_companions(match))
+                    return "";
                 print_license_note(match, quiet);
             }
             return dl;
@@ -2170,16 +2386,9 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
         fprintf(stderr, "crispasr: resolving %s (%s) via -m auto\n", e.filename.c_str(), e.approx_size.c_str());
     std::string result = crispasr_cache::ensure_cached_file(e.filename, e.url, quiet, "crispasr", cache_dir_override);
 
-    // Download companion file (e.g. tokenizer.bin for moonshine) if needed
-    if (!result.empty() && !e.companion_filename.empty() && !e.companion_url.empty()) {
-        crispasr_cache::ensure_cached_file(e.companion_filename, e.companion_url, quiet, "crispasr",
-                                           cache_dir_override);
-    }
-    // Backend-specific extras (e.g. kokoro German backbone + voice) — opt-in
-    // per backend via k_extras.
     if (!result.empty()) {
-        if (const Entry* entry = find_by_backend(backend_name))
-            download_extras(*entry, quiet, cache_dir_override);
+        if (!ensure_companions(e))
+            return "";
         print_license_note(e, quiet);
     }
 
