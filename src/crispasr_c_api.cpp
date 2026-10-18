@@ -7032,7 +7032,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             }
         }
         std::string text = core_qwen3_prompt::build(N_enc, sys_instruction, s->ask, assistant_prefill,
-                                                    qwen3_system_hotwords ? s->hotwords : "");
+                                                    "");
         if (raon) { // RaonPipeline.stt; --ask replaces the instruction
             const std::string eff_lang = lang_set ? lang : s->source_language;
             static bool warned = false;
